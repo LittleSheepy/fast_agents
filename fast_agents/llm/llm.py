@@ -2,6 +2,7 @@ import os
 from typing import Optional
 
 from .openai_client import OpenAIClient
+from ..messages.message import Message
 
 
 
@@ -14,7 +15,6 @@ class LLM:
         provider: str = "openai",
         timeout: Optional[int] = None,
     ):
-        super().__init__(model, api_key, base_url, provider, timeout)
         self.model = model or os.getenv("LLM_MODEL_ID")
         self.api_key = api_key or os.getenv("LLM_API_KEY")
         self.base_url = base_url or os.getenv("LLM_BASE_URL")
@@ -29,8 +29,8 @@ class LLM:
         else:
             return OpenAIClient(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout)
 
-    def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
-        self._client.invoke(messages=messages, **kwargs)
+    def invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Message:
+        return self._client.invoke(messages=messages, tools=tools, **kwargs)
 
-    def stream_invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
-        self._client.stream_invoke(messages=messages, **kwargs)
+    def stream_invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> str:
+        return self._client.stream_invoke(messages=messages, tools=tools, **kwargs)

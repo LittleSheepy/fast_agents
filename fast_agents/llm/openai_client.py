@@ -2,7 +2,7 @@ import os
 from typing import Optional, Iterator
 
 from openai import OpenAI
-
+from ..messages.message import Message, MsgToolCall
 
 
 class OpenAIClient(OpenAI):
@@ -22,7 +22,7 @@ class OpenAIClient(OpenAI):
         self.temperature = kwargs.get("temperature", 0.2)
         self.max_tokens = kwargs.get("max_tokens", 1024)
 
-    def invoke(self, messages: list[dict[str, str]], **kwargs) -> str:
+    def invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Message:
         """
         非流式调用LLM，返回完整响应。
         适用于不需要流式输出的场景。
@@ -31,17 +31,25 @@ class OpenAIClient(OpenAI):
             response = self.chat.completions.create(
                 model=self.model,
                 messages=messages,
+                tools=tools,
                 temperature=kwargs.get('temperature', self.temperature),
                 max_tokens=kwargs.get('max_tokens', self.max_tokens),
                 stream=False,
                 **{k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']},
                 extra_body={"enable_thinking": False}
             )
-            return response.choices[0].message.content
+            message = response.choices[0].message
+            response_msg = Message(role="assistant", content=message.content)
+            if response.choices[0].finish_reason == "tool_calls":
+                for tool in message.tool_calls:
+                    msg_tool_call = MsgToolCall(name=tool.function.name, arguments=tool.function.arguments, id=tool.id)
+                    response_msg.tool_calls.append(msg_tool_call)
+
+            return response_msg
         except Exception as e:
             raise Exception(f"LLM调用失败: {str(e)}")
 
-    def stream_invoke(self, messages: list[dict[str, str]], **kwargs) -> Iterator[str]:
+    def stream_invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Iterator[str]:
         """
         调用大语言模型进行思考，并返回流式响应。
         这是主要的调用方法，默认使用流式响应以获得更好的用户体验。
@@ -58,6 +66,7 @@ class OpenAIClient(OpenAI):
             response = self.chat.completions.create(
                 model=self.model,
                 messages=messages,
+                tools=tools,
                 temperature=kwargs.get('temperature', self.temperature),
                 max_tokens=self.max_tokens,
                 stream=True,

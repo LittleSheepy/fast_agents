@@ -119,6 +119,7 @@ class ToolBase(ABC):
         }
 
     def _get_param_description(self, param_name):
+        import inspect
         # 方式一：从子类属性里取
         descriptions = getattr(self, "param_descriptions", {})
         if param_name in descriptions:
@@ -204,11 +205,14 @@ class ToolBase(ABC):
     def __repr__(self) -> str:
         return self.__str__()
 
-    def __or__(self, other):
+    def __add__(self, other):
         # 类型不对要返回 NotImplemented，交给 Python 去试 other.__ror__
-        if not isinstance(other, ToolBase):
-            return NotImplemented
-        return self.build_openai_like_tool() | other.build_openai_like_tool()
+        if isinstance(other, ToolBase):
+            return [self.build_openai_like_tool()] + [other.build_openai_like_tool()]
+        if isinstance(other, list):
+            return [self.build_openai_like_tool()] + other
+        return NotImplemented
+
 
 
 

@@ -1,5 +1,5 @@
 """工具注册表"""
-
+import json
 from typing import Optional, Any, Callable
 from .tool_base import ToolBase
 
@@ -79,12 +79,13 @@ class ToolRegistry:
         Returns:
             工具执行结果
         """
+        args = json.loads(input_text)
         # 优先查找Tool对象
         if name in self._tools:
             tool = self._tools[name]
             try:
                 # 简化参数传递，直接传入字符串
-                return tool.run({"input": input_text})
+                return tool.run(**args)
             except Exception as e:
                 return f"错误：执行工具 '{name}' 时发生异常: {str(e)}"
 
@@ -92,7 +93,7 @@ class ToolRegistry:
         elif name in self._functions:
             func = self._functions[name]["func"]
             try:
-                return func(input_text)
+                return func(**args)
             except Exception as e:
                 return f"错误：执行工具 '{name}' 时发生异常: {str(e)}"
 
@@ -125,6 +126,12 @@ class ToolRegistry:
     def get_all_tools(self) -> list[ToolBase]:
         """获取所有Tool对象"""
         return list(self._tools.values())
+
+    def to_openai_tools(self) -> dict[Any]:
+        tools = []
+        for name, tool in self._tools.items():
+            tools = tool + tools
+        return tools
 
     def clear(self):
         """清空所有工具"""
