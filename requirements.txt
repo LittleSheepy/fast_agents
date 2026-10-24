@@ -1,0 +1,7 @@
+OpenAI>=2.44.0
+python-dotenv>=1.0.0
+tavily>=0.7.26
+google-search-results>=2.4.2
+agentscope[full]>=1.0.21,<2.0
+sqlalchemy[asyncio]>=2.1.6
+
