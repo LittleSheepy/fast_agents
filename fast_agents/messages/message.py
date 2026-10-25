@@ -84,3 +84,5 @@ if __name__ == '__main__':
     message = Message(role="user", content="test_content", tool_calls=[tool_call])
     message_openai = message.to_openai_message()
     print(message_openai)
+    tool_msg = Message("tool", "14", metadata={"tool_call_id": "call_1", "name": "calc"})
+    print(tool_msg.to_openai_message())
