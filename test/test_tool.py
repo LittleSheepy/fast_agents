@@ -13,7 +13,7 @@ def test_calculate():
 def test_tool_or_tool():
     calculator_tool = CalculatorTool()
     terminal_tool = TerminalTool()
-    tools = calculator_tool | terminal_tool
+    tools = calculator_tool + terminal_tool
     print(tools)
 
 

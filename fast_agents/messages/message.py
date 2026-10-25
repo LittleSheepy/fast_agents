@@ -43,25 +43,38 @@ class Message(BaseModel):
             "content": self.content
         }
 
-    def to_openai_message(self) -> Dict[str, Any]:
+    def to_openai_message(self) -> List[Dict[str, Any]]:
         """转换为字典格式（OpenAI API格式）"""
-        message = {
-            "role": self.role,
-            "content": self.content
-        }
-        if self.tool_calls:
-            message["tool_calls"] = []
-            for tool_call in self.tool_calls:
-                tool_call_openai = {
-                    "id": tool_call.id,
-                    "type": "function",
-                    "function": {
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments
+        messages = []
+        if self.role in ["user","system", "assistant"]:
+            message = {
+                "role": self.role,
+                "content": self.content
+            }
+            if self.tool_calls:
+                message["tool_calls"] = []
+                for tool_call in self.tool_calls:
+                    tool_call_openai = {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments
+                        }
                     }
-                }
-                message["tool_calls"].append(tool_call_openai)
-        return message
+                    message["tool_calls"].append(tool_call_openai)
+            messages.append(message)
+        if self.role == "tool":
+            if self.tool_calls:
+                for tool_call in self.tool_calls:
+                    message = {
+                        "role": self.role,
+                        "content": self.content,
+                        "tool_call_id": tool_call.id
+                    }
+                    messages.append(message)
+
+        return messages
     
     def __str__(self) -> str:
         return f"[{self.role}] {self.content}"
