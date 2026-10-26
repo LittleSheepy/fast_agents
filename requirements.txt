@@ -1,7 +1,24 @@
-OpenAI>=2.44.0
-python-dotenv>=1.0.0
-tavily>=0.7.26
-google-search-results>=2.4.2
-agentscope[full]>=1.0.21,<2.0
-sqlalchemy[asyncio]>=2.1.6
+# ============================================================
+# FastAgents 依赖清单
+# 项目：fast_agents —— 简单、灵活、可扩展的多智能体框架
+# 仓库：https://github.com/LittleSheepy/fast_agents
+# Python 版本要求：>= 3.10
+# ============================================================
+
+# ---------- 核心依赖（框架运行必需） ----------
+openai>=3.37.0
+pydantic>=2.14.1
+python-dotenv>=1.2.4
+docstring-parser>=0.18.0
+
+# ---------- 可选依赖（内置 SearchTool 的搜索 provider，按需安装） ----------
+# 默认 provider：免费、无需 API Key（源码按旧包名 duckduckgo_search 导入）
+duckduckgo-search>=8.1.1
+# 生产级 provider：需要配置 TAVILY_API_KEY
+tavily-python>=0.8.5
+
+
+# OpenAI>=2.44.0
+# python-dotenv>=1.0.0
+# tavily>=0.7.26
 
