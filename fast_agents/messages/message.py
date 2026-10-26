@@ -73,6 +73,16 @@ class Message(BaseModel):
                         "tool_call_id": tool_call.id
                     }
                     messages.append(message)
+            else:
+                # 兜底：ReActAgent 通过 metadata 挂载 tool_call_id / name，
+                # 没有 tool_calls 时从 metadata 里取，避免 tool 消息被静默丢弃
+                tool_call_id = (self.metadata or {}).get("tool_call_id", "")
+                message = {
+                    "role": self.role,
+                    "content": self.content,
+                    "tool_call_id": tool_call_id
+                }
+                messages.append(message)
 
         return messages
     

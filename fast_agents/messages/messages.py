@@ -19,7 +19,8 @@ class Messages:
         """转换为OpenAI列表格式"""
         messages = []
         for message in self._messages:
-            messages.append(message.to_openai_message())
+            # to_openai_message 返回「一条 Message 展开后的多条消息」，用 extend 拉平
+            messages.extend(message.to_openai_message())
         return messages
 
     def append(self, message):

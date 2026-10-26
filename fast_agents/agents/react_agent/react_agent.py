@@ -20,6 +20,7 @@
   status（success/error/truncated）注入不同的观察文本，让模型知道错误/截断并决定重试。
 """
 
+from pathlib import Path
 from typing import List, Optional
 
 from .prompt import DEFAULT_REACT_PROMPT
@@ -28,8 +29,17 @@ from ...llm import LLM
 from ...memory.manager import MemoryManager
 from ...messages import Messages
 from ...messages.message import Message
+from ...skills import SkillMiddleware, SkillRegistry
+from ...tools.structured_tool import StructuredTool
 from ...tools.tool_registry import ToolRegistry
 from ...tools.tool_result import ToolStatus
+
+# 默认技能扫描目录：包根目录 fast_agents/.skills 与项目根目录 .skills
+# （react_agent.py 位于 fast_agents/agents/react_agent/，parents[2] 为包根，parents[3] 为项目根）
+_PROJECT_SKILLS_DIRS = [
+    Path(__file__).resolve().parents[2] / ".skills",
+    Path(__file__).resolve().parents[3] / ".skills",
+]
 
 
 class ReActAgent(AgentBase):
@@ -57,6 +67,9 @@ class ReActAgent(AgentBase):
         memory: Optional[MemoryManager] = None,
         enable_memory: bool = True,
         memory_limit: int = 5,
+        skill_registry: Optional[SkillRegistry] = None,
+        skill_paths: Optional[List] = None,
+        enable_skills: bool = True,
     ):
         """
         初始化ReActAgent
@@ -71,6 +84,10 @@ class ReActAgent(AgentBase):
             memory: 记忆管理器（可选；enable_memory=True 且不传时，使用纯内存默认实例）
             enable_memory: 是否启用记忆，False 则完全跳过记忆的检索与写回
             memory_limit: 每次注入的长期记忆条数上限
+            skill_registry: 技能注册表（可选；enable_skills=True 且不传时自动创建，
+                默认额外扫描项目根目录下的 .skills/）
+            skill_paths: 额外的文件型技能扫描目录列表（可选）
+            enable_skills: 是否启用技能系统，False 则不注入技能索引、不注册技能工具
         """
         super().__init__(name, llm, system_prompt)
         self.tool_registry = tool_registry or ToolRegistry()
@@ -79,6 +96,14 @@ class ReActAgent(AgentBase):
 
         # 设置提示词模板：用户自定义优先，否则使用默认模板
         self.system_prompt_template = custom_prompt if custom_prompt else DEFAULT_REACT_PROMPT
+
+        # 技能系统：复用 skills 模块的 SkillRegistry + SkillMiddleware（渐进式加载），
+        # 需在 refresh_system_prompt 之前就位，因为系统提示词里要注入技能索引
+        self.enable_skills = enable_skills
+        self.skill_middleware: Optional[SkillMiddleware] = None
+        if enable_skills:
+            self._init_skills(skill_registry, skill_paths)
+
         # 构建系统提示词，全程只注入这一次
         self.refresh_system_prompt()
 
@@ -99,6 +124,9 @@ class ReActAgent(AgentBase):
         """
         tools_desc = self.tool_registry.get_tools_description()
         prompt = self.system_prompt_template.format(tools=tools_desc)
+        # 追加技能索引（Level 1）与已加载技能详情（Level 2）
+        if self.skill_middleware is not None:
+            prompt = self.skill_middleware.before_agent_run(prompt)
         for message in self.messages.get_messages():
             if message.role == "system":
                 message.content = prompt
@@ -129,6 +157,42 @@ class ReActAgent(AgentBase):
                 return
         self.tool_registry.register_tool(tool)
         self.refresh_system_prompt()
+
+    # ---------- 技能 ----------
+
+    def _init_skills(
+        self,
+        skill_registry: Optional[SkillRegistry],
+        skill_paths: Optional[List],
+    ) -> None:
+        """初始化技能系统：
+
+        1. 构建/复用 SkillRegistry，默认把项目根目录下的 .skills/ 加入扫描路径；
+        2. 创建 SkillMiddleware（负责技能索引注入与已加载技能的生命周期管理）；
+        3. 把技能内置的 3 个工具（load_skill / read_skill_reference / run_skill_script）
+           包装成 StructuredTool 注册进 tool_registry。
+        """
+        registry = skill_registry or SkillRegistry()
+        # 默认扫描项目级 .skills 目录（显式传 registry 时也补充该路径）
+        for skills_dir in _PROJECT_SKILLS_DIRS:
+            if skills_dir.exists():
+                registry.add_skill_path(skills_dir, source="project")
+        for p in skill_paths or []:
+            registry.add_skill_path(p, source="custom")
+        registry.scan()
+
+        self.skill_registry = registry
+        self.skill_middleware = SkillMiddleware(registry=registry)
+
+        # 注册技能内置工具（registry.get_tools 返回裸函数，需包装成 StructuredTool）
+        for fn in registry.get_tools():
+            wrapped = StructuredTool.from_function(fn, name=fn.__name__)
+            self.tool_registry.register_tool(wrapped)
+
+        skills = registry.list_skills()
+        if skills:
+            names = ", ".join(s["name"] for s in skills)
+            print(f"🧩 技能系统已启用，发现 {len(skills)} 个技能: {names}")
 
     # ---------- 记忆 ----------
 
@@ -249,16 +313,27 @@ class ReActAgent(AgentBase):
                         )
                         # 给不同 status 加上显式前缀，帮助模型理解结果性质
                         observation = _render_observation(result)
+                        # 通知技能中间件：捕获 load_skill 事件，记录已加载技能
+                        if self.skill_middleware is not None:
+                            observation = self.skill_middleware.after_tool_call(
+                                tool_call.name, tool_call.arguments or {}, observation,
+                            )
                         tool_msg = Message("tool", observation)
                         # OpenAI 要求 tool 消息带 tool_call_id；通过 metadata 挂载，
                         # to_openai_message 里会用到
                         tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
                         self.messages.append(tool_msg)
+                    # 本轮可能有新加载的技能，同步到 system 提示词（Level 2 详情）
+                    if self.skill_middleware is not None:
+                        self.refresh_system_prompt()
                     continue
                 else:
                     final_answer = response.content
                     break
         finally:
+            # 每轮结束通知技能中间件（unload_after_turn 开启时会自动卸载已加载技能）
+            if self.skill_middleware is not None:
+                self.skill_middleware.after_agent_turn()
             # 不管成功还是超步，都把这一轮沉淀回记忆
             if final_answer is not None:
                 self._remember(input_text, final_answer)
