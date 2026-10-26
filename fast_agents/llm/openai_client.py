@@ -101,7 +101,9 @@ class OpenAIClient(OpenAI):
 
 if __name__ == '__main__':
     from dotenv import load_dotenv
-    load_dotenv("D:/00sheepy/.env")
+
+    # load_dotenv("D:/00sheepy/.env")
+    load_dotenv()  # 自动向上查找 .env，不再硬编码绝对路径
     openai_client = OpenAIClient()
     result = openai_client.stream_invoke(messages=[{"role": "user", "content": "1+1=?"}])
     for content in result:
