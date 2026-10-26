@@ -17,7 +17,10 @@ from .tool_registry import ToolRegistry, global_registry
 from . import builtin
 
 __all__ = [
+    # 基础工具系统
     "ToolBase", "StructuredTool", "tool",
+
+    # 工具响应协议
     "ToolResult", "ToolStatus",
     "ToolException", "ToolInitializationError", "ToolPermissionError",
     "ToolRegistry", "global_registry",
