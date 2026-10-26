@@ -15,7 +15,9 @@
 - **system 只注入一次**：在 __init__ 里构建，run() 循环里不重建；
 - **tool 链路不进 buffer**：tool_calls / tool 结果只活在工作区，
   避免 buffer 裁剪时把 tool 配对拆坏导致 API 报错；
-- **记忆是参考信息**：长期记忆随本轮用户输入一起送进 LLM，不提升为系统指令。
+- **记忆是参考信息**：长期记忆随本轮用户输入一起送进 LLM，不提升为系统指令；
+- **工具返回结构化结果**：registry.invoke_tool 返回 ToolResult，Agent 会根据
+  status（success/error/truncated）注入不同的观察文本，让模型知道错误/截断并决定重试。
 """
 
 from typing import List, Optional
@@ -25,8 +27,9 @@ from ...agents.agent_base import AgentBase
 from ...llm import LLM
 from ...memory.manager import MemoryManager
 from ...messages import Messages
-from ...messages.message import Message, MsgToolResult
+from ...messages.message import Message
 from ...tools.tool_registry import ToolRegistry
+from ...tools.tool_result import ToolStatus
 
 
 class ReActAgent(AgentBase):
@@ -105,34 +108,26 @@ class ReActAgent(AgentBase):
     # ---------- 工具 ----------
 
     def add_tool(self, tool):
-        """
-        添加工具到工具注册表
-        支持MCP工具的自动展开
-
-        Args:
-            tool: 工具实例(可以是普通Tool或MCPTool)
-        """
-        # 检查是否是MCP工具
-        if hasattr(tool, 'auto_expand') and tool.auto_expand:
-            # MCP工具会自动展开为多个工具
-            if hasattr(tool, '_available_tools') and tool._available_tools:
-                for mcp_tool in tool._available_tools:
-                    # 创建包装工具
-                    name = f"{tool.name}_{mcp_tool['name']}"
-                    description = mcp_tool.get('description', '')
-                    func = lambda input_text, t=tool, tn=mcp_tool['name']: t.run({
-                        "action": "call_tool",
-                        "tool_name": tn,
-                        "arguments": {"input": input_text}
-                    })
-                    self.tool_registry.register_function(name, description, func)
-                print(f"✅ MCP工具 '{tool.name}' 已展开为 {len(tool._available_tools)} 个独立工具")
-            else:
-                self.tool_registry.register_tool(tool)
-        else:
-            self.tool_registry.register_tool(tool)
-
-        # 工具变了，同步系统提示词里的工具清单
+        """添加工具到工具注册表（支持 ToolBase 实例、裸函数、MCP 自动展开）"""
+        if getattr(tool, "auto_expand", False) and hasattr(tool, "_available_tools"):
+            from ...tools.structured_tool import StructuredTool
+            available = tool._available_tools or []
+            for mcp_info in available:
+                sub_name = f"{tool.name}_{mcp_info['name']}"
+                sub_desc = mcp_info.get("description", "")
+                def _make_call(t=tool, tn=mcp_info["name"]):
+                    def _call(input_text: str = "") -> str:
+                        return t.run({"action": "call_tool", "tool_name": tn, "arguments": {"input": input_text}})
+                    _call.__name__ = sub_name
+                    _call.__doc__ = sub_desc
+                    return _call
+                wrapped = StructuredTool.from_function(_make_call(), name=sub_name, description=sub_desc)
+                self.tool_registry.register_tool(wrapped)
+            if available:
+                print(f"✅ MCP工具 '{tool.name}' 已展开为 {len(available)} 个独立工具")
+                self.refresh_system_prompt()
+                return
+        self.tool_registry.register_tool(tool)
         self.refresh_system_prompt()
 
     # ---------- 记忆 ----------
@@ -247,12 +242,14 @@ class ReActAgent(AgentBase):
 
                 # 判断是否执行工具
                 if response.tool_calls:
-                    # 每个 tool result 必须是独立的 role=tool 消息（OpenAI 强校验）
                     for tool_call in response.tool_calls:
-                        tool_result = self.tool_registry.execute_tool(
-                            tool_call.name, tool_call.arguments
+                        # 统一通过 invoke_tool 获取 ToolResult（含参数校验 / 错误捕获 / 截断）
+                        result = self.tool_registry.invoke_tool(
+                            tool_call.name, tool_call.arguments,
                         )
-                        tool_msg = Message("tool", str(tool_result))
+                        # 给不同 status 加上显式前缀，帮助模型理解结果性质
+                        observation = _render_observation(result)
+                        tool_msg = Message("tool", observation)
                         # OpenAI 要求 tool 消息带 tool_call_id；通过 metadata 挂载，
                         # to_openai_message 里会用到
                         tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
@@ -260,8 +257,6 @@ class ReActAgent(AgentBase):
                     continue
                 else:
                     final_answer = response.content
-                    # 修复：旧代码这里又 append_ai 一次，导致答案重复；
-                    # response 本身已是 assistant 消息，无需再 append。
                     break
         finally:
             # 不管成功还是超步，都把这一轮沉淀回记忆
@@ -273,3 +268,16 @@ class ReActAgent(AgentBase):
 
         print(f"🎉 最终答案: {final_answer}")
         return final_answer
+
+
+def _render_observation(result) -> str:
+    """根据 ToolResult.status 给观察文本加前缀，便于模型判断是继续/换思路/缩小查询。"""
+    if not hasattr(result, "status"):
+        return str(result)
+    if result.status == ToolStatus.SUCCESS:
+        return result.output
+    if result.status == ToolStatus.ERROR:
+        return f"[工具执行错误] {result.error or result.output}\n请检查参数或换一个工具/查询方式重试。"
+    if result.status == ToolStatus.TRUNCATED:
+        return result.output  # ToolResult.truncated 已自带截断提示语
+    return str(result)

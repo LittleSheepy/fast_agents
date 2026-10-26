@@ -1,15 +1,25 @@
-"""内置工具模块
+"""Tools 模块
 
-FastAgents框架的内置工具集合，包括：
-- SearchTool: 网页搜索工具
-- TerminalTool: 命令行工具
+参考 LangChain / CrewAI / LlamaIndex / Anthropic 工具设计，核心组件：
+- ToolBase：工具抽象基类
+- StructuredTool / @tool：函数式工具
+- ToolResult / ToolStatus：结构化执行结果
+- ToolException：可恢复错误
+- ToolRegistry：工具注册表
+- builtin：内置工具集合（计算器/终端/搜索/文件读取）
 """
 
-from .calculator_tool import CalculatorTool, calculate
-from .terminal_tool import TerminalTool
+from .tool_base import ToolBase
+from .structured_tool import StructuredTool, tool
+from .tool_result import ToolResult, ToolStatus
+from .tool_exception import ToolException, ToolInitializationError, ToolPermissionError
+from .tool_registry import ToolRegistry, global_registry
+from . import builtin
 
 __all__ = [
-    "CalculatorTool",
-    "calculate",
-    "TerminalTool",
+    "ToolBase", "StructuredTool", "tool",
+    "ToolResult", "ToolStatus",
+    "ToolException", "ToolInitializationError", "ToolPermissionError",
+    "ToolRegistry", "global_registry",
+    "builtin",
 ]
