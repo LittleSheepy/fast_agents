@@ -13,9 +13,16 @@ from .tools import (
 from .memory import MemoryManager
 
 __all__ = [
+    # 版本信息
     "__version__", "__author__", "__email__", "__description__",
+
+    # Agent范式
     "LLM", "ReActAgent",
+
+    # 工具系统
     "ToolBase", "StructuredTool", "tool", "ToolResult", "ToolStatus",
     "ToolException", "ToolRegistry", "global_registry", "builtin",
+
+    # 记忆系统
     "MemoryManager",
 ]
