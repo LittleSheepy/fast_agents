@@ -7,7 +7,7 @@
 4. 检索是否按相关度召回
 5. 修订（revise）是否保留历史
 6. MemoryManager 的 retrieve / record / render_context
-7. MemoryTool 的三个动作
+7. 记忆工具（remember / recall / forget）三件套
 8. 记忆作用域隔离（不同 user_id 互不可见）
 """
 
@@ -22,7 +22,9 @@ from fast_agents.memory import (
     InMemoryStore,
     MemoryManager,
     MemoryRecord,
-    MemoryTool,
+    RememberTool,
+    RecallTool,
+    ForgetTool,
     SQLiteMemoryStore,
     lexical_score,
 )
@@ -184,18 +186,18 @@ def test_dedup():
 
 def test_memory_tool():
     mgr = MemoryManager(long_term_store=InMemoryStore(), llm=FakeLLM())
-    remember_tool = MemoryTool(mgr, "remember")
-    recall_tool = MemoryTool(mgr, "recall")
-    forget_tool = MemoryTool(mgr, "forget")
+    remember_tool = RememberTool(mgr)
+    recall_tool = RecallTool(mgr)
+    forget_tool = ForgetTool(mgr)
 
-    out = remember_tool.run(content="用户住在上海", kind="fact", importance=0.7)
+    out = remember_tool.invoke(content="用户住在上海", kind="fact", importance=0.7).output
     assert "已记住" in out, out
 
-    out = recall_tool.run(query="用户住在哪")
+    out = recall_tool.invoke(query="用户住在哪").output
     assert "上海" in out, out
 
     record = mgr.long_term.all()[0]
-    out = forget_tool.run(memory_id=record.memory_id[:8])
+    out = forget_tool.invoke(memory_id=record.memory_id[:8]).output
     assert "已撤回" in out, out
     assert len(mgr.long_term.all()) == 0
     print("✅ test_memory_tool 通过")
@@ -204,8 +206,8 @@ def test_memory_tool():
 def test_tool_schema():
     """确认记忆工具能正确生成 OpenAI function calling schema"""
     mgr = MemoryManager(long_term_store=InMemoryStore(), llm=FakeLLM())
-    tool = MemoryTool(mgr, "remember")
-    schema = tool.build_openai_like_tool()
+    tool = RememberTool(mgr)
+    schema = tool.to_openai_tool()
     assert schema["function"]["name"] == "remember_memory"
     props = schema["function"]["parameters"]["properties"]
     assert set(props.keys()) == {"content", "kind", "importance"}, props

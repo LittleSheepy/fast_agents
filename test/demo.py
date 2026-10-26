@@ -1,29 +1,40 @@
+from __future__ import annotations
+
+import asyncio
+import enum
+import functools
+import inspect
+import logging
+from abc import ABC, abstractmethod
+from typing import (Any, Callable, Dict, List, Literal, Optional, Sequence,
+                    Type, Union, get_args, get_origin, get_type_hints)
+
+from pydantic import BaseModel, Field, create_model, ValidationError
+
 from typing import get_origin, get_args, Union, List, Dict, Literal, Optional
 import enum
 
 
-def _annotation_to_openai_type(annotation) -> str:
-    """把 Python 类型注解转成 OpenAI JSON Schema 类型字符串"""
-    origin = get_origin(annotation)
 
+_PY_TYPE_TO_JSON: Dict[Any, str] = {
+    str: "string", int: "integer", float: "number", bool: "boolean",
+    list: "array", dict: "object", type(None): "null",
+}
+
+
+def _annotation_to_json_type(annotation: Any) -> str:
+    origin = get_origin(annotation)
     # 处理 Optional[T] -> 实际是 Union[T, None]
     if origin is Union:
         args = get_args(annotation)
-        # 去掉 NoneType 拿到真实类型
-        non_none = [a for a in args if a is not type(None)]
+        non_none = [a for a in args if a is not type(None)]     # 去掉 NoneType 拿到真实类型
         if non_none:
-            return _annotation_to_openai_type(non_none[0])
+            return _annotation_to_json_type(non_none[0])
         return "string"
-
-    # 处理 List[T] / list[T]
     if origin in (list, List):
         return "array"
-
-    # 处理 Dict[K, V] / dict[K, V]
     if origin in (dict, Dict):
         return "object"
-
-    # 处理 Literal["a", "b"] -> 转成 enum
     if origin is Literal:
         values = list(get_args(annotation))
         # 判断 enum 里所有值是不是同一种类型
@@ -37,30 +48,70 @@ def _annotation_to_openai_type(annotation) -> str:
         elif types == {type(None)}:
             return "null"
         else:
-            # 混合类型，OpenAI 里不太稳
             return "string"
-
-    # 基本类型映射
-    type_map = {
-        str: "string", int: "integer", float: "number", bool: "boolean",
-        list: "array", dict: "object", set: "array", tuple: "array", type(None): "null",
-    }
-
-    if annotation in type_map:
-        return type_map[annotation]
-
-    # 如果是 enum 类
+    if annotation in _PY_TYPE_TO_JSON:
+        return _PY_TYPE_TO_JSON[annotation]
     if inspect.isclass(annotation) and issubclass(annotation, enum.Enum):
         return "string"
-
-    # 兜底
+    if inspect.isclass(annotation) and issubclass(annotation, BaseModel):
+        return "object"
     return "string"
+
+
+def _infer_param_schema_from_signature(func: Callable, skip: Sequence[str] = ("self",)) -> Dict[str, Any]:
+    sig = inspect.signature(func)
+    hints = get_type_hints(func)
+    doc = inspect.getdoc(func) or ""
+    arg_descriptions: Dict[str, str] = {}
+    try:
+        from docstring_parser import parse as _parse_doc
+        parsed = _parse_doc(doc)
+        for p in parsed.params:
+            if p.description:
+                arg_descriptions[p.arg_name] = p.description.strip()
+    except ImportError:
+        in_args = False
+        for line in doc.splitlines():
+            stripped = line.strip()
+            if stripped.lower().startswith("args:"):
+                in_args = True
+                continue
+            if in_args:
+                if stripped and ":" not in stripped:
+                    in_args = False
+                    continue
+                if ":" in stripped:
+                    name, _, desc = stripped.lstrip("-").partition(":")
+                    arg_descriptions[name.strip()] = desc.strip()
+
+    properties: Dict[str, Any] = {}
+    required: List[str] = []
+    for param_name, param in sig.parameters.items():
+        if param_name in skip:
+            continue
+        annotation = hints.get(param_name, param.annotation)
+        if annotation is inspect.Parameter.empty:
+            annotation = str
+        prop: Dict[str, Any] = {"type": _annotation_to_json_type(annotation)}
+        origin = get_origin(annotation)
+        if origin is Literal:
+            prop["enum"] = list(get_args(annotation))
+        desc = arg_descriptions.get(param_name, "")
+        if desc:
+            prop["description"] = desc
+        if param.default is inspect.Parameter.empty:
+            required.append(param_name)
+        else:
+            prop["default"] = param.default
+        properties[param_name] = prop
+    return {"type": "object", "properties": properties, "required": required}
+
 
 def _build_param(annotation, default):
     param = {"type": "string", "description": ""}
     origin = get_origin(annotation)
 
-    param["type"] = _annotation_to_openai_type(annotation)
+    param["type"] = _annotation_to_json_type(annotation)
     if origin is Literal:
         values = list(get_args(annotation))
         param["enum"] = values
@@ -114,9 +165,6 @@ class Demo:
             if param_name == "self":
                 continue
 
-            # 获取注解的实际类型字符串
-            ptype = _annotation_to_openai_type(param.annotation)
-
             # 构建参数描述
             parameter = _build_param(param.annotation, param.default)
             parameter["description"] = self._get_param_description(param_name)
@@ -134,11 +182,11 @@ class Demo:
 
 class Demo2(Demo):
     def fun(        self,
-        query: str,
+        # query: str,
+        mode_int: Literal[1, 5] = 1,
+        mode: Literal["fast", "slow"] = "fast",
         tags: List[int] = None,
         config: Dict[str, int] = None,
-        mode: Literal["fast", "slow"] = "fast",
-        mode_int: Literal[1, 5] = 1,
         count: Optional[int] = 10):
         """
         hanshu
@@ -156,7 +204,7 @@ if __name__ == '__main__':
     import inspect
 
     demo2 = Demo2()
-    parameters = demo2.para()
+    parameters = _infer_param_schema_from_signature(demo2.fun)
     print(parameters)
 
 

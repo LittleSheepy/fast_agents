@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fast_agents.messages.message import Message, MsgToolCall
 from fast_agents.memory import MemoryManager
 from fast_agents.tools.tool_registry import ToolRegistry
-from fast_agents.tools.calculator_tool import CalculatorTool
+from fast_agents.tools.builtin import CalculatorTool
 from fast_agents.agents.react_agent.react_agent import ReActAgent
 
 
