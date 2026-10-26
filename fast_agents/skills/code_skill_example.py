@@ -145,9 +145,7 @@ def setup_skills():
     
     # 扫描文件型Skill（自动扫描./skills/和~/.fast_agents/skills/）
     registry.scan()
-    tools = registry.get_tools()
-    skils = registry.list_skills()
-    prompts = registry.get_index_prompt()
+    
     # 添加自定义Skill路径
     # registry.add_skill_path("D:/my-custom-skills")
     

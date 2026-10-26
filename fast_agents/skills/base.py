@@ -48,7 +48,7 @@ class BaseSkill:
     compatibility: Optional[str] = None
     allowed_tools: List[str] = []
     tags: List[str] = []
-    extra_metadata: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = {}
     
     def __init__(self):
         if not self.name:
@@ -65,7 +65,7 @@ class BaseSkill:
             compatibility=self.compatibility,
             allowed_tools=self.allowed_tools,
             tags=self.tags,
-            metadata=self.extra_metadata,
+            metadata=self.metadata,
             skill_type="code",
             source="code",
         )
@@ -152,7 +152,7 @@ def skill(
                 self.version = version
                 self.tags = tags or []
                 self.allowed_tools = allowed_tools or []
-                self.extra_metadata = extra_metadata
+                self.metadata = extra_metadata
                 super().__init__()
                 
                 self._func = func
