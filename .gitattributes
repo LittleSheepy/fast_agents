@@ -1,0 +1,52 @@
+# ===== 换行符统一规范 (fast_agents) =====
+# 规则：仓库内一律以 LF 存储；在 Windows 上检出(checkout)时自动转为 CRLF。
+# 这样本地看着是 CRLF，提交到 GitHub 后仍是干净的 LF，不会产生假 diff。
+# 首次启用或改规则后，执行一次规整：
+#   git add --renormalize .
+#   git commit -m "chore: 统一换行符(LF 入库 / Windows 检出 CRLF)"
+
+# 默认：由 git 自动识别文本文件，入库统一为 LF
+* text=auto
+
+# ---------- Windows 下需要 CRLF 的 ----------
+*.py        text eol=crlf
+*.pyi       text eol=crlf
+*.md        text eol=crlf
+*.txt       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+*.psm1      text eol=crlf
+
+# ---------- 必须保持 LF 的 ----------
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.zsh       text eol=lf
+*.json      text eol=lf
+*.toml      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.cfg       text eol=lf
+*.ini       text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf
+
+# ---------- 二进制文件：禁止任何换行符处理 ----------
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.bmp   binary
+*.webp  binary
+*.pdf   binary
+*.zip   binary
+*.whl   binary
+*.tar   binary
+*.gz    binary
+*.so    binary
+*.pyd   binary
+*.pyc   binary
+*.db    binary
+*.sqlite binary
+*.sqlite3 binary

@@ -11,6 +11,12 @@ from .tools import (
     ToolException, ToolRegistry, global_registry, builtin,
 )
 from .memory import MemoryManager
+from .mcp import (
+    MCPRegistry, MCPClient, MCPToolAdapter, MCPServerTool,
+    MCPError, MCPConnectionError, MCPProtocolError, MCPCallError,
+    StdioTransport, SSETransport, make_stdio,
+    MCPConfig,
+)
 
 __all__ = [
     # 版本信息
@@ -25,4 +31,9 @@ __all__ = [
 
     # 记忆系统
     "MemoryManager",
+
+    # MCP
+    "MCPRegistry", "MCPClient", "MCPToolAdapter", "MCPServerTool",
+    "MCPError", "MCPConnectionError", "MCPProtocolError", "MCPCallError",
+    "StdioTransport", "SSETransport", "make_stdio", "MCPConfig",
 ]
