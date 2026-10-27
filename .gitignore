@@ -1,6 +1,3 @@
 */__pycache__/*
 *.pyc
-.idea/04fast_agents.iml
-.idea/inspectionProfiles/profiles_settings.xml
-.idea/inspectionProfiles/Project_Default.xml
-.idea/modules.xml
+/.idea
