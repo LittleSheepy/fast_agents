@@ -31,6 +31,10 @@ from typing import List, Optional
 
 from .prompt import DEFAULT_REACT_PROMPT
 from ...agents.agent_base import AgentBase
+from ...context.builder import ContextBuilder
+from ...context.offload import ContextOffloader
+from ...context.tokens import TokenBudget, TokenCounter
+from ...context.tools import build_context_tools
 from ...llm import LLM
 from ...mcp import MCPRegistry
 from ...mcp.models import MCPConfig
@@ -38,11 +42,11 @@ from ...memory.manager import MemoryManager
 from ...messages import Messages
 from ...messages.message import Message
 from ...skills import SkillMiddleware, SkillRegistry
+from ...tools.builtin.mcp_tool import build_mcp_tools
 from ...tools.structured_tool import StructuredTool
 from ...tools.tool_base import ToolBase
 from ...tools.tool_registry import ToolRegistry
 from ...tools.tool_result import ToolStatus
-from ...tools.builtin.mcp_tool import build_mcp_tools
 
 # 默认技能扫描目录：包根目录 fast_agents/.skills 与项目根目录 .skills
 # （react_agent.py 位于 fast_agents/agents/react_agent/，parents[2] 为包根，parents[3] 为项目根）
@@ -86,6 +90,10 @@ class ReActAgent(AgentBase):
         mcp_configs: Optional[List[MCPConfig]] = None,
         enable_mcp: bool = False,
         mcp_expand_mode: str = "fine",
+        ctx: Optional["ContextBuilder"] = None,
+        enable_context: bool = False,
+        context_budget: Optional[int] = None,
+        context_offload_threshold: int = 4_000,
     ):
         """
         初始化ReActAgent
@@ -111,6 +119,12 @@ class ReActAgent(AgentBase):
                 MCP 管理工具（默认 False，避免默认开子进程/网络）
             mcp_expand_mode: MCP 工具展开模式，"fine"（默认，细粒度：每个远端工具独立
                 可见，推荐生产使用）或 "coarse"（粗粒度：每个 server 一个门脸工具）
+            ctx: 上下文构建器（可选；enable_context=True 且不传时自动创建，
+                默认工作目录为当前目录、窗口 128k）
+            enable_context: 是否启用上下文工程，True 时每轮按 token 预算拼装上下文、
+                超长工具结果自动卸载到磁盘（默认 False，保持既有行为不变）
+            context_budget: 上下文 token 预算（可选，覆盖 ctx 自带的预算）
+            context_offload_threshold: 触发工具结果卸载的字符数阈值
         """
         super().__init__(name, llm, system_prompt)
         self.tool_registry = tool_registry or ToolRegistry()
@@ -144,6 +158,14 @@ class ReActAgent(AgentBase):
             (memory or MemoryManager(llm=llm)) if enable_memory else None
         )
         self.memory_limit = memory_limit
+
+        # 上下文工程：默认关闭，打开后才按 token 预算拼装 / 卸载超长结果。
+        # 放在记忆之后就位，因为 build_context 要用到 memory 的短期历史与长期记忆。
+        self.enable_context = enable_context
+        if enable_context:
+            self._init_context(ctx, context_budget, context_offload_threshold)
+        else:
+            self.ctx: Optional["ContextBuilder"] = ctx
 
         # 注册退出时自动 close（防子进程僵尸）
         atexit.register(self._safe_close)
@@ -353,6 +375,115 @@ class ReActAgent(AgentBase):
             if m.role in ("user", "assistant"):
                 self.messages.append(m)
 
+    # ---------- 上下文工程 ----------
+
+    def _init_context(
+        self,
+        ctx: Optional["ContextBuilder"],
+        budget: Optional[int],
+        offload_threshold: int,
+    ) -> None:
+        """初始化上下文工程：
+
+        1. 构建/复用 ContextBuilder（分层拼装 + token 预算 + 三级压缩）；
+        2. 如果开了记忆，把记忆的短期历史接进 builder（单一数据源仍是 buffer）；
+        3. 注册 context 自带工具：read_offloaded（回读卸载内容）+ 文件三件套；
+        4. 工具名与 system 提示词同步刷新，保证模型知道这些工具存在。
+        """
+        if ctx is None:
+            token_budget = (
+                TokenBudget(max_context_tokens=budget) if budget else TokenBudget()
+            )
+            ctx = ContextBuilder(
+                workspace=".",
+                budget=token_budget,
+                counter=TokenCounter(model=getattr(self.llm, "model", None) or "gpt-4o-mini"),
+                offloader=ContextOffloader(workspace=".", threshold=offload_threshold),
+                llm=self.llm,
+            )
+        self.ctx = ctx
+
+        # 注册 context 自带工具（read_offloaded 需要 offloader，一定传得上）
+        for t in build_context_tools(workspace=".", offloader=ctx.offloader):
+            self.tool_registry.register_tool(t)
+        self.refresh_system_prompt()
+
+        print(
+            f"🧭 上下文工程已启用：预算 {ctx.budget.available} token / "
+            f"计数后端 {ctx.counter.backend} / 卸载阈值 {ctx.offloader.threshold} 字符"
+        )
+
+    def _collect_context_packets(self, query: str):
+        """把记忆层的「长期记忆 + 会话摘要」整理成 ContextPacket 列表
+
+        注意：**buffer 的历史不由这里渲染**（避免和 history 层重复注入），
+        这里只负责「记忆类」的补充信息——长期记忆 + 已有摘要。
+        """
+        packets = []
+        if not self.memory:
+            return packets
+        try:
+            records = self.memory.retrieve(query, limit=self.memory_limit)
+            for r in records:
+                packets.append(f"[{r.kind}] {r.content}")
+        except Exception as e:  # noqa: BLE001 —— 记忆检索失败不能中断对话
+            print(f"⚠️ 长期记忆检索失败，本轮跳过注入：{e}")
+        summary = self.memory.buffer.get_summary()
+        if summary:
+            packets.append(f"[历史摘要] {summary}")
+        return packets
+
+    def _fit_context(self, input_text: str) -> None:
+        """用 ContextBuilder 重建本轮工作区（只在开启 context 时生效）
+
+        与 `_seed_workspace` 的区别：这里走的是「按 token 预算分层拼装 + 压缩」的路径，
+        而不是「按消息条数直接搬运」。最终产出的仍是同一批 Message，写回 self.messages。
+        """
+        if self.ctx is None:
+            return
+
+        system_prompt = next(
+            (m.content for m in self.messages.get_messages() if m.role == "system"), None
+        )
+        history = self.memory.buffer.get_messages() if self.memory else []
+        packets = self._collect_context_packets(input_text)
+
+        self.ctx.reset_turn()
+        window = self.ctx.build(
+            system_prompt=system_prompt,
+            history=history,
+            user_input=input_text,
+            memory_packets=packets,
+        )
+
+        self.messages.clear()
+        for message in window.flatten():
+            self.messages.append(message)
+
+        report = self.ctx.last_report
+        if report is not None:
+            tokens = report.tokens
+            print(f"🧭 {self.ctx.budget.describe(tokens)}")
+            if report.compression is not None and (
+                report.compression.offloaded or report.compression.trimmed
+            ):
+                print(f"🧭 {report.compression.summary_line()}")
+            for w in report.warnings:
+                print(f"⚠️ {w}")
+
+    def _offload_observation(self, tool_name: str, observation: str) -> str:
+        """工具结果超长时卸载到磁盘，返回「引用文本」替代原文
+
+        未开启 context 时原样返回，所以调用点可以无脑调用。
+        """
+        if self.ctx is None or not observation:
+            return observation
+        try:
+            return self.ctx.observe(tool_name, observation)
+        except Exception as e:  # noqa: BLE001 —— 卸载失败必须退回原文，不能让工具链断掉
+            print(f"⚠️ 工具结果卸载失败，保留原文：{e}")
+            return observation
+
     # ---------- 主循环 ----------
 
     def run(self, input_text: str, **kwargs) -> str:
@@ -381,6 +512,12 @@ class ReActAgent(AgentBase):
             print(f"🧠 已注入长期记忆:\n{memory_text}")
         user_input = self._merge_memory(input_text, memory_text)
 
+        # 开启 context 时，用「按 token 预算分层拼装」的方式重建工作区，
+        # 覆盖上面的简单 seed —— 此时长期记忆由 memory 层统一承载，不再重复拼进 user
+        if self.enable_context and self.ctx is not None:
+            self._fit_context(input_text)
+            user_input = input_text
+
         final_answer: Optional[str] = None
         try:
             while current_step < self.max_steps:
@@ -390,7 +527,8 @@ class ReActAgent(AgentBase):
                 tools = self.tool_registry.to_openai_tools()
 
                 # 系统提示词已在构造/seed 时就位，这里只追加本轮用户输入（仅第 1 步追加）
-                if current_step == 1:
+                # 开启 context 时，本轮用户输入已由 _fit_context 放进 user 层，无需重复追加
+                if current_step == 1 and not (self.enable_context and self.ctx is not None):
                     self.messages.append_user(user_input)
                 messages = self.messages.to_openai_messages()
                 response: Message = self.llm.invoke(messages, tools=tools, **kwargs)
@@ -405,6 +543,8 @@ class ReActAgent(AgentBase):
                         )
                         # 给不同 status 加上显式前缀，帮助模型理解结果性质
                         observation = _render_observation(result)
+                        # 超长结果先卸载到磁盘：上下文里只留引用，模型可按需 read_offloaded 回读
+                        observation = self._offload_observation(tool_call.name, observation)
                         # 通知技能中间件：捕获 load_skill 事件，记录已加载技能
                         if self.skill_middleware is not None:
                             observation = self.skill_middleware.after_tool_call(

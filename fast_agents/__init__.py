@@ -11,6 +11,14 @@ from .tools import (
     ToolException, ToolRegistry, global_registry, builtin,
 )
 from .memory import MemoryManager
+from .context import (
+    ContextBuilder, BuildReport,
+    TokenCounter, TokenBudget, estimate_text_tokens,
+    ContextWindow, ContextLayer,
+    ContextCompressor, ContextOffloader,
+    ReadOffloadedTool, WriteFileTool, EditFileTool, ListFilesTool,
+    build_context_tools,
+)
 from .mcp import (
     MCPRegistry, MCPClient, MCPToolAdapter, MCPServerTool,
     MCPError, MCPConnectionError, MCPProtocolError, MCPCallError,
@@ -31,6 +39,14 @@ __all__ = [
 
     # 记忆系统
     "MemoryManager",
+
+    # 上下文工程
+    "ContextBuilder", "BuildReport",
+    "TokenCounter", "TokenBudget", "estimate_text_tokens",
+    "ContextWindow", "ContextLayer",
+    "ContextCompressor", "ContextOffloader",
+    "ReadOffloadedTool", "WriteFileTool", "EditFileTool", "ListFilesTool",
+    "build_context_tools",
 
     # MCP
     "MCPRegistry", "MCPClient", "MCPToolAdapter", "MCPServerTool",

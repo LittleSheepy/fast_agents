@@ -263,6 +263,48 @@ def test_skills_enabled_registers_tools_and_index():
     print("✅ test_skills_enabled_registers_tools_and_index passed")
 
 
+def test_context_enabled_builds_and_registers_tools():
+    """【context 同步】enable_context=True：注册文件系统工具、按预算拼装上下文"""
+    llm = MockLLM([Message("assistant", "ok")])
+    agent = ReActAgent("上下文助手", llm, memory=MemoryManager(llm=llm),
+                       enable_skills=False, enable_context=True)
+
+    # 1) context 已就绪
+    assert agent.ctx is not None, "开启 context 后 agent.ctx 不应为 None"
+
+    # 2) 文件系统 / 回读工具已注册
+    tool_names = {t["function"]["name"] for t in agent.tool_registry.to_openai_tools()}
+    for expected in ("read_offloaded", "write_file", "edit_file", "list_files"):
+        assert expected in tool_names, f"context 工具 {expected} 未注册"
+
+    # 3) 跑一轮后仍只有一条 system，且本轮 user 只出现一次
+    out = agent.run("你好")
+    assert out == "ok"
+    calls = llm.calls[0]
+    systems = [m for m in calls if m.get("role") == "system"]
+    users = [m for m in calls if m.get("role") == "user"]
+    assert len(systems) == 1, "system 应只注入一次"
+    assert len(users) == 1, f"本轮 user 输入应只出现一次，实际 {len(users)} 次"
+    print("✅ test_context_enabled_builds_and_registers_tools passed")
+
+
+def test_context_user_input_not_duplicated():
+    """【context 同步】多工具步场景下，user 输入也只注入一次（不随步数累积）"""
+    llm = MockLLM([
+        Message("assistant", "", tool_calls=[MsgToolCall(name="list_files", arguments="{}", id="c1")]),
+        Message("assistant", "done"),
+    ])
+    agent = ReActAgent("上下文助手", llm, memory=MemoryManager(llm=llm),
+                       enable_skills=False, enable_context=True)
+    agent.run("看看有哪些文件")
+
+    # 每一步的调用里 user 都应恰好一次
+    for i, call in enumerate(llm.calls):
+        users = [m for m in call if m.get("role") == "user"]
+        assert len(users) == 1, f"第 {i + 1} 次调用 user 出现 {len(users)} 次"
+    print("✅ test_context_user_input_not_duplicated passed")
+
+
 def test_skills_disabled():
     """【技能同步】enable_skills=False：不注册技能工具、不注入技能索引"""
     llm = MockLLM([Message("assistant", "ok")])
@@ -288,4 +330,6 @@ if __name__ == "__main__":
     test_default_memory_enabled()
     test_skills_enabled_registers_tools_and_index()
     test_skills_disabled()
+    test_context_enabled_builds_and_registers_tools()
+    test_context_user_input_not_duplicated()
     print("\n🎉 全部测试通过")
