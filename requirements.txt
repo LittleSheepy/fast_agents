@@ -10,6 +10,7 @@ openai>=3.37.0
 pydantic>=2.14.1
 python-dotenv>=1.2.4
 docstring-parser>=0.18.0
+PyYAML>=6.0.3
 
 # ---------- 可选依赖（内置 SearchTool 的搜索 provider，按需安装） ----------
 # 默认 provider：免费、无需 API Key（源码按旧包名 duckduckgo_search 导入）
