@@ -79,10 +79,33 @@ def _is_binary_ext(path: Path) -> bool:
 def _sha256_hex(content: bytes, short: bool = True) -> str:
     h = hashlib.sha256(content).hexdigest()
     return h[:16] if short else h
+def _normalize_newlines(text: str) -> str:
+    """把各种换行符（\\r\\n / \\r / \\n）统一成 \\n。
+    乐观锁的 hash 必须基于"归一化后的内容"计算，否则在 Windows 下
+    编辑器/Path.write_text 默认把 \\n 写成 \\r\\n，会让 hash 在内容
+    未变时仍然不匹配，出现误报冲突。
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+def _sha256_text(text: str, short: bool = True, encoding: str = "utf-8") -> str:
+    """对归一化后的文本算 hash——乐观锁唯一可信的计算口径。"""
+    normalized = _normalize_newlines(text)
+    return _sha256_hex(normalized.encode(encoding), short=short)
+def _sha256_bytes(raw: bytes, *, encoding: str = "utf-8", short: bool = True) -> str:
+    """对原始字节算"归一化文本"的 hash：先解码、再归一化换行、再编码。
+    用于在没有现成 str 时（_stat_file 只读 bytes）保持与 _sha256_text 一致。
+    """
+    try:
+        text = raw.decode(encoding, errors="replace")
+    except Exception:
+        return _sha256_hex(raw, short=short)  # 编码异常时退化为字节 hash（二进制兜底）
+    return _sha256_text(text, short=short, encoding=encoding)
 
 
-def _stat_file(abs_path: Path, rel_path: str, *, read_content: bool = False) -> FileMeta:
-    """读取文件元数据；read_content=True 时额外计算 hash 与行数。"""
+def _stat_file(abs_path: Path, rel_path: str, *, read_content: bool = False,
+               encoding: str = "utf-8") -> FileMeta:
+    """读取文件元数据；read_content=True 时额外计算 hash 与行数。
+    hash 统一按"归一化换行后的文本"计算，跨平台稳定。
+    """
     if not abs_path.exists():
         return FileMeta(path=rel_path, abs_path=str(abs_path), exists=False)
     st = abs_path.stat()
@@ -96,9 +119,9 @@ def _stat_file(abs_path: Path, rel_path: str, *, read_content: bool = False) -> 
     if read_content:
         try:
             raw = abs_path.read_bytes()
-            meta.content_hash = _sha256_hex(raw)
+            meta.content_hash = _sha256_bytes(raw, encoding=encoding)
             try:
-                meta.line_count = len(raw.decode("utf-8", errors="replace").splitlines())
+                meta.line_count = len(raw.decode(encoding, errors="replace").splitlines())
             except Exception:
                 meta.line_count = 0
         except Exception:
@@ -109,9 +132,10 @@ def _stat_file(abs_path: Path, rel_path: str, *, read_content: bool = False) -> 
 def _check_lock(abs_path: Path, rel_path: str,
                 expected_hash: Optional[str],
                 expected_mtime: Optional[float],
-                expected_size: Optional[int]) -> Tuple[Optional[ToolResult], FileMeta]:
+                expected_size: Optional[int],
+                encoding: str = "utf-8") -> Tuple[Optional[ToolResult], FileMeta]:
     """乐观锁校验。返回 (错误结果或 None, 当前文件元数据)。"""
-    current = _stat_file(abs_path, rel_path, read_content=True)
+    current = _stat_file(abs_path, rel_path, read_content=True, encoding=encoding)
     # 文件不存在时，只有「期望它也不存在」才算通过
     if not current.exists:
         if expected_hash or expected_mtime is not None or expected_size is not None:
@@ -136,15 +160,24 @@ def _check_lock(abs_path: Path, rel_path: str,
     return None, current
 
 
-def _atomic_write(abs_path: Path, content: str, encoding: str = "utf-8") -> None:
-    """原子写入：同目录临时文件 + fsync + os.replace。跨平台安全。"""
+def _atomic_write(abs_path: Path, content: str, encoding: str = "utf-8",
+                  normalize_newlines: bool = True) -> None:
+    """原子写入：同目录临时文件 + fsync + os.replace。跨平台安全。
+
+    normalize_newlines=True（默认）：写入前把所有换行统一为 \\n，且以 binary
+    模式打开 fd，避免 Windows text mode 把 \\n 自动转成 \\r\\n。这样磁盘字节
+    在任何平台上都与"归一化文本"完全一致，乐观锁的 hash + size 才能稳定。
+    """
+    if normalize_newlines:
+        content = _normalize_newlines(content)
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(
         prefix=f".{abs_path.name}.", suffix=".tmp", dir=str(abs_path.parent)
     )
     try:
-        with os.fdopen(fd, "w", encoding=encoding, newline="") as f:
-            f.write(content)
+        # binary 模式打开，绕开 OS newline 转换
+        with os.fdopen(fd, "wb") as f:
+            f.write(content.encode(encoding))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, abs_path)
@@ -210,7 +243,7 @@ class ReadTool(ToolBase):
     def _resolve(self, rel: str) -> Tuple[Optional[ToolResult], Path, str]:
         target = (self.workspace / rel).resolve()
         try:
-            rel = str(target.relative_to(self.workspace))
+            target.relative_to(self.workspace)
         except ValueError:
             return ToolResult.fail(f"不允许访问工作目录外的路径: {target}"), target, rel
         return None, target, rel
@@ -232,12 +265,13 @@ class ReadTool(ToolBase):
             text = target.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             return ToolResult.fail(f"读取失败：{e}")
+        text = _normalize_newlines(text)
         lines = text.splitlines()
         total = len(lines)
 
         # 更新缓存
         st = target.stat()
-        content_hash = _sha256_hex(text.encode("utf-8"))
+        content_hash = _sha256_text(text)
         meta = FileMeta(
             path=rel, abs_path=str(target), exists=True,
             size=st.st_size, mtime=st.st_mtime,
@@ -352,7 +386,7 @@ class WriteTool(ToolBase):
         if target.exists():
             if not overwrite and not (expected_hash or expected_size is not None or expected_mtime is not None):
                 return ToolResult.fail(f"文件 {path} 已存在且 overwrite=False，拒绝覆盖")
-            lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size)
+            lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size, encoding=encoding)
             if lock_err is not None:
                 return lock_err
             if backup:
@@ -378,7 +412,7 @@ class WriteTool(ToolBase):
         if self._read_tool is not None:
             self._read_tool.invalidate(rel)
 
-        new_meta = _stat_file(target, rel, read_content=True)
+        new_meta = _stat_file(target, rel, read_content=True, encoding=encoding)
         action = "覆盖写入" if (target.exists() and backup_note == "" and new_meta.size > 0 and
                               expected_hash is not None) else ("创建" if not backup_note and "备份" not in backup_note else "覆盖写入")
         if backup_note:
@@ -501,7 +535,7 @@ class EditTool(ToolBase):
             return ToolResult.fail(f"{path} 不是文件")
 
         # 乐观锁
-        lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size)
+        lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size, encoding=encoding)
         if lock_err is not None:
             return lock_err
 
@@ -509,8 +543,12 @@ class EditTool(ToolBase):
             original = target.read_text(encoding=encoding, errors="replace")
         except Exception as e:
             return ToolResult.fail(f"读取原文件失败：{e}")
+        # 所有匹配/替换基于归一化后的文本，避免 Windows CRLF 让 old_text 匹配不上
+        original = _normalize_newlines(original)
+        old_text_n = _normalize_newlines(old_text)
+        new_text_n = _normalize_newlines(new_text)
 
-        hits = self._find_all(original, old_text)
+        hits = self._find_all(original, old_text_n)
         if len(hits) == 0:
             if append_if_missing:
                 # 追加：保持换行友好
@@ -524,7 +562,7 @@ class EditTool(ToolBase):
                 action = "追加（old_text 未找到，append_if_missing=True）"
             else:
                 # 为方便排错，返回 old_text 附近内容的提示
-                snippet = old_text[:80].replace("\n", "\\n")
+                snippet = old_text_n[:80].replace("\n", "\\n")
                 return ToolResult.fail(
                     f"编辑失败：old_text 在文件 {path} 中未找到。"
                     f"请用 read_file 重新读取当前内容，确认 old_text 精确匹配（含空格/缩进/换行）。"
@@ -556,7 +594,7 @@ class EditTool(ToolBase):
             )
         else:
             pos = hits[0]
-            new_content = original[:pos] + new_text + original[pos + len(old_text):]
+            new_content = original[:pos] + new_text_n + original[pos + len(old_text_n):]
             action = "替换"
 
         # 备份 + 原子写回
@@ -572,7 +610,7 @@ class EditTool(ToolBase):
         if self._read_tool is not None:
             self._read_tool.invalidate(rel)
 
-        after_meta = _stat_file(target, rel, read_content=True)
+        after_meta = _stat_file(target, rel, read_content=True, encoding=encoding)
         delta = after_meta.size - current.size
         delta_line = after_meta.line_count - (current.line_count or 0)
         backup_note = f"，原文件已备份到 {Path(backup_path).name}" if backup_path else ""
@@ -691,7 +729,7 @@ class MultiEditTool(ToolBase):
             return ToolResult.fail(f"{path} 不是文件")
 
         # 乐观锁
-        lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size)
+        lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size, encoding=encoding)
         if lock_err is not None:
             return lock_err
 
@@ -699,14 +737,18 @@ class MultiEditTool(ToolBase):
             original = target.read_text(encoding=encoding, errors="replace")
         except Exception as e:
             return ToolResult.fail(f"读取原文件失败：{e}")
+        # 跨平台换行归一化
+        original = _normalize_newlines(original)
 
         # 在内存中按顺序模拟全部替换；每步都检查「唯一匹配」
         applied_details: List[str] = []
         current_text = original
         for i, e in enumerate(edits):
-            hits = EditTool._find_all(current_text, e.old_text)
+            e_old = _normalize_newlines(e.old_text)
+            e_new = _normalize_newlines(e.new_text)
+            hits = EditTool._find_all(current_text, e_old)
             if len(hits) == 0:
-                snippet = e.old_text[:60].replace("\n", "\\n")
+                snippet = e_old[:60].replace("\n", "\\n")
                 return ToolResult.fail(
                     f"批量编辑失败：第 {i + 1}/{len(edits)} 条 old_text 在当前内容中未找到"
                     f"（前序替换已改变上下文，或原文不存在）。\n"
@@ -719,11 +761,11 @@ class MultiEditTool(ToolBase):
                     f"请补充更多上下文后重试。整批已回滚，原文件未改动。"
                 )
             pos = hits[0]
-            current_text = current_text[:pos] + e.new_text + current_text[pos + len(e.old_text):]
+            current_text = current_text[:pos] + e_new + current_text[pos + len(e_old):]
             # 粗略行号：基于原始 text 估算（前序替换会让行号漂移，这里显示「替换起始位置」）
             line_no = original.count("\n", 0, pos) + 1
             applied_details.append(
-                f"  #{i + 1} 第 ~{line_no} 行：{len(e.old_text)} 字符 → {len(e.new_text)} 字符"
+                f"  #{i + 1} 第 ~{line_no} 行：{len(e_old)} 字符 → {len(e_new)} 字符"
             )
 
         if dry_run:
@@ -743,7 +785,7 @@ class MultiEditTool(ToolBase):
         if self._read_tool is not None:
             self._read_tool.invalidate(rel)
 
-        after_meta = _stat_file(target, rel, read_content=True)
+        after_meta = _stat_file(target, rel, read_content=True, encoding=encoding)
         delta = after_meta.size - current.size
         backup_note = f"，原文件已备份到 {Path(backup_path).name}" if backup_path else ""
         return ToolResult.ok(
