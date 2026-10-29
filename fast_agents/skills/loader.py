@@ -21,7 +21,7 @@ class SkillLoader:
     Skill加载器：扫描目录，解析SKILL.md，加载技能内容
     
     支持扫描路径:
-        - 项目级: ./skills/
+        - 项目级: ./.fast_agents/skills/
         - 用户级: ~/.fast_agents/skills/
         - 自定义路径: 通过add_skill_path添加
     """
@@ -47,7 +47,7 @@ class SkillLoader:
     def _add_default_paths(self):
         """添加默认扫描路径"""
         # 项目级: 当前工作目录下的skills
-        project_skills = Path.cwd() / "skills"
+        project_skills = Path.cwd() / ".fast_agents" / "skills"
         self.add_skill_path(project_skills, source="project")
         
         # 用户级: ~/.fast_agents/skills/
