@@ -47,7 +47,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 
 | 文档 | 内容 |
 |------|------|
-| [`docs/工具模块编写说明.md`](./docs/工具模块编写说明.md) | 工具的四种定义方式、`ToolBase` 全字段、`ToolResult` 协议、schema 导出、四种内置工具逐行讲解 |
+| [`docs/工具模块编写说明.md`](./docs/工具模块编写说明.md) | 工具的四种定义方式、`ToolBase` 全字段、`ToolResult` 协议、schema 导出、内置工具逐行讲解（含文件四件套的乐观锁与原子写入） |
 | [`docs/记忆模块编写说明.md`](./docs/记忆模块编写说明.md) | 短期 vs 长期两层设计、**记忆注入位置**、打分公式、SQLite 表结构、两个后端的真实差异 |
 | [`docs/Skill模块编写说明.md`](./docs/Skill模块编写说明.md) | `SKILL.md` 标准、三级渐进式加载、`@skill` / `BaseSkill` 两种写法、与 LangChain / Anthropic 的对比 |
 | [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md) | 零依赖 JSON-RPC 实现、**细粒度 vs 粗粒度展开**、`MCPConfig` 声明式配置、Windows 专项 |
@@ -148,7 +148,7 @@ llm = LLM()
 # ② 注册工具
 registry = ToolRegistry()
 registry.register_tool(builtin.CalculatorTool())
-registry.register_tool(builtin.ReadFileTool())
+registry.register_tool(builtin.ReadTool())
 
 # ③ 创建 Agent 并运行
 agent = ReActAgent(
@@ -215,9 +215,12 @@ fast_agents/
 │   │   ├── tool_registry.py      #    ToolRegistry + global_registry
 │   │   └── builtin/              #    内置工具
 │   │       ├── calculator_tool.py    # python_calculator
-│   │       ├── terminal_tool.py      # terminal
+│   │       ├── terminal_tool.py      # terminal（Windows 专用）
+│   │       ├── command_splitter.py   # 终端配套：Windows 分词 / 多命令拆分
+│   │       ├── shell_check.py        # 终端配套：引号感知的 need_shell
+│   │       ├── shell_detector.py     # 终端配套：shell 探测 + 路由执行
 │   │       ├── search_tool.py        # web_search
-│   │       ├── read_file_tool.py     # read_file
+│   │       ├── file_tool.py          # read_file / write_file / edit_file / multi_edit_file
 │   │       ├── memory_tool.py        # remember_memory / recall_memory / forget_memory
 │   │       └── mcp_tool.py           # list_mcp_servers / connect_mcp_server / disconnect_mcp_server
 │   ├── memory/                   # ④ 记忆系统
@@ -436,9 +439,12 @@ registry.register_tool(now)    # 自动包成 StructuredTool
 | 工具 | `name` | 参数 | 说明 |
 |------|--------|------|------|
 | `CalculatorTool` | `python_calculator` | `expression` | 数学表达式，支持 `+-*/` 和 `sqrt/sin/cos/tan/log/exp/abs/round/max/min`。**`^` 是按位异或** |
-| `TerminalTool` | `terminal` | `command` | 执行 shell 命令 |
+| `TerminalTool` | `terminal` | `command` | 执行 Windows shell 命令（`dir` / `type` / `findstr` 等只读白名单，`allow_exec=True` 才放开代码执行） |
 | `SearchTool` | `web_search` | `query` / `max_results` | 联网搜索（provider 见 [配置](#配置)） |
-| `ReadFileTool` | `read_file` | `path` / `start_line` / `end_line` / `max_lines` | 读工作目录内文本文件，自动截断 |
+| `ReadTool` | `read_file` | `path` / `start_line` / `end_line` / `max_lines` / `use_cache` | 读工作目录内文本文件；返回 `size` / `mtime` / `content_hash` 作为乐观锁凭证 |
+| `WriteTool` | `write_file` | `path` / `content` / `overwrite` / `expected_hash` / `expected_size` / `expected_mtime` / `backup` | 原子写入 + 冲突检测（`expected_*` 不匹配即拒绝） |
+| `EditTool` | `edit_file` | `path` / `old_text` / `new_text` / `expected_*` / `backup` / `append_if_missing` | 精确替换，`old_text` 必须唯一；默认先备份 |
+| `MultiEditTool` | `multi_edit_file` | `path` / `edits` / `expected_*` / `backup` / `dry_run` | 批量替换，一处失败整批回滚；`dry_run=True` 只预检不落盘 |
 | `RememberTool` | `remember_memory` | `content` / `kind` / `importance` | 写长期记忆 |
 | `RecallTool` | `recall_memory` | `query` / `limit` | 查长期记忆 |
 | `ForgetTool` | `forget_memory` | `memory_id` | 撤回一条记忆（支持前 8 位简写） |
@@ -448,8 +454,8 @@ from fast_agents import builtin
 
 registry.register_tools(
     builtin.CalculatorTool(),
-    builtin.ReadFileTool(),
-    builtin.SearchTool(),      # 需要 duckduckgo-search 或 tavily-python
+    builtin.SearchTool(),          # 需要 duckduckgo-search 或 tavily-python
+    *builtin.build_file_tools(),   # 一次拿到 read_file / write_file / edit_file / multi_edit_file
 )
 ```
 
@@ -890,7 +896,7 @@ memory = MemoryManager(long_term_store=store, llm=llm, user_id="u1", session_id=
 
 # 工具
 registry = ToolRegistry()
-registry.register_tools(builtin.CalculatorTool(), builtin.ReadFileTool())
+registry.register_tools(builtin.CalculatorTool(), *builtin.build_file_tools())
 for t in build_memory_tools(memory):
     registry.register_tool(t)
 
@@ -1004,7 +1010,7 @@ python test\test_tool.py
 | 测试文件 | 状态 | 说明 |
 |---------|------|------|
 | `test/test_react_agent.py` | ✅ 全过 | 含记忆、技能、`enable_xxx=False` 各分支 |
-| `test/test_tools.py` | ⚠️ 13/14 | `test_calculator` 失败：`2^10` 期望 `1024`，实际 `8`（`^` 是异或） |
+| `test/test_tools.py` | ⚠️ 10/14 | `test_read_file` / `test_registry_batch_and_hook` 仍在引用已删除的 `ReadFileTool`；`test_calculator` 的用例表里 `("2**10","1024")` 与 `("2**10","8")` 自相矛盾；`test_terminal` 是 Windows 专用，非 Windows 环境必失败 |
 | `test/test_memory.py` | ❌ 导入失败 | 写的是 `from fast_agents.memory import RememberTool`，真实位置在 `fast_agents.tools.builtin` |
 | `test/test_skill.py` | ❌ 导入失败 | 用的是 `fast_agents.skill`（单数），真实包名是 `fast_agents.skills` |
 | `test/test_tool.py` | ❌ 导入失败 | 缺 `sys.path` 处理，直接跑找不到 `fast_agents` |
@@ -1023,7 +1029,7 @@ python test\test_tool.py
   ```
 
   其他 4 个测试文件都有这段，它是唯一漏掉的；
-- **`test_tools.py`**：把 `2^10` 的期望值改成 `8`，或者把用例改成 `pow(2, 10)`。
+- **`test_tools.py`**：① 把 `builtin.ReadFileTool(...)` 换成 `builtin.ReadTool(...)`——该工具已随 `read_file_tool.py` 删除；② 用例表里的 `("2**10", "8")` 与 `("2**10", "1024")` 只能留一个。
 
 ---
 
