@@ -2,7 +2,7 @@
 
 本文档面向 fast_agents 的**上下文工程（context engineering）**系统，参考 **LangChain 的 `trim_messages` 与 SummarizationNode**、**LlamaIndex 的 Context 构建与召回**、**CrewAI 的上下文传递**、**Anthropic 的 compaction 与 tool result 截断**、**DeepAgents 的「会话状态外化成文件」** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.0 · 2026-10-27 · 首次交付，落地《演进路线图》模块 F 的 F1–F3，铺好 F4 / F5 的地基
+> 版本：v1.1 · 2026-10-29 · 随仓库最新代码同步（读文件工具名由 `ReadFileTool` 更正为 `ReadTool`），落地《演进路线图》模块 F 的 F1–F3，铺好 F4 / F5 的地基
 > 适用版本：`fast_agents.context`（包内 `__version__ = "1.0.0"`）
 > 配套代码：`fast_agents/context/`（7 个文件）+ `examples/context/context_react_agent_demo.py`（5 个示例）+ `test/test_context.py`（16 项），均已实测通过
 > 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：**零新增三方依赖**（只用标准库；`tiktoken` 为可选增强，未安装时自动降级为启发式估算）
@@ -32,6 +32,7 @@
 
 | 版本 | 日期 | 变更 | 作者 |
 |------|------|------|------|
+| 1.1.0 | 2026-10-29 | 同步最新代码：读文件工具 `ReadFileTool` 已随 `read_file_tool.py` 删除而更名 `ReadTool`（`tools/builtin/file_tool.py`），文档与示例同步更正；确认 `test_context.py` 16/16、`examples/context/context_react_agent_demo.py` 全部跑通 | — |
 | 1.0.0 | 2026-10-27 | 首次编写，逐行对齐 `fast_agents/context/` 真实实现；按《XX 模块编写说明》模版 v2.0 重排章节（开篇 → 一～十三 → 附录） | — |
 
 > **破坏性变更：无。** 模块是**纯新增**：新增 `fast_agents/context/` 目录、1 个示例、1 份测试；对既有文件的修改只有两处「追加式」改动——`fast_agents/__init__.py` 追加导出、`fast_agents/agents/react_agent/react_agent.py` 追加 4 个构造参数与 3 个内部方法。**默认开关全部关闭**（`enable_context=False`），不动既有行为，老代码不改一行也能跑。
@@ -42,7 +43,7 @@
 |---|---|---|
 | **F1** | `TokenCounter` + 上下文预算 | ✅ 已实现（`tokens.py`，三级降级计数 + `TokenBudget`） |
 | **F2** | 工具结果卸载到磁盘 | ✅ 已实现（`offload.py` + `read_offloaded` 工具） |
-| **F3** | 文件系统工具（`ls` / `read` / `write` / `edit`） | ✅ 已实现（`tools.py` 三件套 + `read_offloaded`，`read` 复用既有 `ReadFileTool`） |
+| **F3** | 文件系统工具（`ls` / `read` / `write` / `edit`） | ✅ 已实现（`tools.py` 三件套 + `read_offloaded`，`read` 复用既有 `ReadTool`） |
 | **F4** | 摘要 / 压缩中间件化 | 🟡 部分（三级策略已实现且可开关，但未包成通用中间件，见 [十二章](#十二下一步演进路线)） |
 | **F5** | Prompt caching 友好布局 | 🟡 部分（静态在前、动态在后的顺序已就位，未显式打缓存断点，见 [4.4](#44-与-reactagent-的接入点--职责边界)） |
 
@@ -303,7 +304,7 @@ context 挂在 `ReActAgent` 上，**与 memory 同级**，都是成员变量：
 - `test_react_agent.py::test_context_user_input_not_duplicated` —— 多工具步场景下，user 输入也只注入一次，不随步数累积；
 - `test_react_agent.py::test_context_enabled_builds_and_registers_tools` —— 开启 context 后 4 个工具确实注册、`agent.ctx` 非空。
 
-> **一处已知的粗糙点**：`_init_context()` 里 `workspace="."` 是硬编码（与 `ReadFileTool` 的默认行为一致）。如果你的工作目录不在启动目录，建议用 `ContextBuilder(workspace="D:/code")` 显式构造后通过 `ctx=` 注入。这一点在[第十章](#十设计决策与常见坑)列为坑项。
+> **一处已知的粗糙点**：`_init_context()` 里 `workspace="."` 是硬编码（与 `ReadTool` 的默认行为一致）。如果你的工作目录不在启动目录，建议用 `ContextBuilder(workspace="D:/code")` 显式构造后通过 `ctx=` 注入。这一点在[第十章](#十设计决策与常见坑)列为坑项。
 
 ## 五、核心机制：五层拼装顺序与三级压缩策略
 
@@ -689,7 +690,7 @@ _SAFE_ID = re.compile(r"^[0-9a-f]{6,64}$")     # id 只允许十六进制字符
             raise ValueError("卸载目录必须位于 workspace 内")
 ```
 
-**为什么这么写**：id 用 `uuid4().hex[:16]`（纯十六进制），再用白名单正则卡一道，**从源头杜绝 `../` 路径穿越**；`read()` 里还会再校验一次目标文件是否仍在 `workspace` 内。这套思路与 `ReadFileTool` 的沙箱一致。
+**为什么这么写**：id 用 `uuid4().hex[:16]`（纯十六进制），再用白名单正则卡一道，**从源头杜绝 `../` 路径穿越**；`read()` 里还会再校验一次目标文件是否仍在 `workspace` 内。这套思路与 `ReadTool` 的沙箱一致。
 
 #### 没超阈值 → 零 IO
 
@@ -1033,7 +1034,7 @@ print(window.to_openai_messages())                 # 直接喂 LLM 的格式
 
 ```python
 from fast_agents import LLM, ReActAgent
-from fast_agents.tools.builtin import ReadFileTool
+from fast_agents.tools.builtin import ReadTool
 
 llm = LLM(model="gpt-4o-mini", api_key="sk-xxx", base_url="https://api.openai.com/v1")
 
@@ -1045,7 +1046,7 @@ agent = ReActAgent(
     context_budget=27_000,       # 可选：覆盖默认预算
     context_offload_threshold=4_000,  # 可选：超过 4000 字符的工具结果落盘
 )
-agent.add_tool(ReadFileTool(workspace="."))
+agent.add_tool(ReadTool(workspace="."))
 
 print(agent.run("帮我把 README 里的安装步骤整理成一份清单文件"))
 ```

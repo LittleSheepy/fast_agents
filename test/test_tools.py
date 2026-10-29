@@ -236,28 +236,52 @@ def test_calculator():
 
 
 def test_terminal():
+    """TerminalTool：Windows 专用只读命令白名单 + 沙箱 + cd 校验"""
+    if os.name != "nt":
+        print("⏭️  test_terminal 跳过（TerminalTool 是 Windows 专用，当前非 Windows）")
+        return
     import tempfile
+    from pathlib import Path
     with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "hello.txt").write_text("hello fast_agents\n", encoding="utf-8")
         term = builtin.TerminalTool(workspace=tmp)
 
-        r = term.invoke(command="pwd")
-        assert r.succeeded
-        assert tmp in r.output
+        # 1) 白名单内的只读命令
+        r = term.invoke(command="dir")
+        assert r.succeeded, r.output
+        assert "hello.txt" in r.output
 
-        r = term.invoke(command="ls")
-        assert r.succeeded
+        r = term.invoke(command="type hello.txt")
+        assert r.succeeded, r.output
+        assert "hello fast_agents" in r.output
 
-        # 禁止危险命令
+        r = term.invoke(command="echo hi")
+        assert r.succeeded, r.output
+
+        # 2) 白名单外的命令被拒（pwd / ls / rm 都不是 Windows 白名单命令）
         r = term.invoke(command="rm -rf /")
         assert r.failed
         assert "不允许" in r.output
 
-        # cd
+        # 3) 已从白名单移除的写命令（del / copy / move / ren / md）也被拒
+        r = term.invoke(command="del hello.txt")
+        assert r.failed
+        assert "不允许" in r.output
+
+        # 4) cd 单独执行：持久切换当前目录；越界则拒绝
         (Path(tmp) / "sub").mkdir()
         r = term.invoke(command="cd sub")
-        assert r.succeeded
-        r = term.invoke(command="pwd")
+        assert r.succeeded, r.output
         assert "sub" in r.output
+
+        r = term.invoke(command="cd ..\\..\\..")
+        assert r.failed
+        assert "工作目录外" in r.output
+
+        # 5) cd 与其它命令拼接 → 直接拒绝（防链中 cd 绕过沙箱）
+        r = term.invoke(command="dir && cd sub")
+        assert r.failed
+        assert "拼接" in r.output
     print("✅ TerminalTool 通过")
 
 
@@ -265,7 +289,7 @@ def test_read_file():
     import tempfile
     from pathlib import Path
     with tempfile.TemporaryDirectory() as tmp:
-        rf = builtin.ReadFileTool(workspace=tmp)
+        rf = builtin.ReadTool(workspace=tmp)
 
         # 创建测试文件
         f = Path(tmp) / "test.txt"
@@ -287,7 +311,7 @@ def test_read_file():
         r = rf.invoke(path="../etc/passwd")
         assert r.failed
         assert "工作目录外" in r.output
-    print("✅ ReadFileTool 通过")
+    print("✅ ReadTool 通过")
 
 
 # ─────────────────────────────────────────────────────────
@@ -298,7 +322,7 @@ def test_registry_batch_and_hook():
     reg = ToolRegistry()
     reg.register_tools(
         builtin.CalculatorTool(),
-        builtin.ReadFileTool(workspace="/tmp"),
+        builtin.ReadTool(workspace="/tmp"),
     )
     assert len(reg) == 2
     assert reg.has_tool("python_calculator")

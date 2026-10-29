@@ -22,12 +22,10 @@ from fast_agents.memory import (
     InMemoryStore,
     MemoryManager,
     MemoryRecord,
-    RememberTool,
-    RecallTool,
-    ForgetTool,
     SQLiteMemoryStore,
     lexical_score,
 )
+from fast_agents.tools.builtin import RememberTool, RecallTool, ForgetTool
 from fast_agents.messages.message import Message
 
 

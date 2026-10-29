@@ -10,7 +10,7 @@
 
 FastAgents 是一个从零手写的轻量 Agent 框架，**不依赖 LangChain 等重型编排库**，直接基于 OpenAI 原生 API 实现。
 
-当前包含六大能力：**LLM 客户端、消息系统、工具系统、ReAct Agent、记忆系统、技能系统**，另有一套**零依赖的 MCP 扩展模块**（让 Agent 接入外部工具服务器）。
+当前包含七大能力：**LLM 客户端、消息系统、工具系统、ReAct Agent、记忆系统、技能系统、上下文工程（context）**，另有一套**零依赖的 MCP 扩展模块**（让 Agent 接入外部工具服务器）。
 
 代码全部可读、有测试覆盖，适合作为「理解 Agent 原理」的学习范本，也能直接用于中小型项目。
 
@@ -31,6 +31,7 @@ FastAgents 是一个从零手写的轻量 Agent 框架，**不依赖 LangChain �
   - [Memory（记忆系统）](#5-memory记忆系统)
   - [Skills（技能系统）](#6-skills技能系统)
   - [MCP（外部工具接入）](#7-mcp外部工具接入扩展模块)
+  - [Context（上下文工程）](#8-context上下文工程)
 - [使用示例](#使用示例)
 - [配置](#配置)
 - [测试](#测试)
@@ -51,6 +52,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | [`docs/记忆模块编写说明.md`](./docs/记忆模块编写说明.md) | 短期 vs 长期两层设计、**记忆注入位置**、打分公式、SQLite 表结构、两个后端的真实差异 |
 | [`docs/Skill模块编写说明.md`](./docs/Skill模块编写说明.md) | `SKILL.md` 标准、三级渐进式加载、`@skill` / `BaseSkill` 两种写法、与 LangChain / Anthropic 的对比 |
 | [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md) | 零依赖 JSON-RPC 实现、**细粒度 vs 粗粒度展开**、`MCPConfig` 声明式配置、Windows 专项 |
+| [`docs/context模块编写说明.md`](./docs/context模块编写说明.md) | Token 预算与三级降级计数、五层拼装顺序、三级压缩策略、工具结果卸载与按需回读、与主流框架的取舍 |
 | [`docs/演进路线图.md`](./docs/演进路线图.md) | 按模块（A~G）组织的后续规划，含优先级、依赖、验收标准 |
 
 > 写新模块文档时，骨架参考 [`docs/xx模块编写说明模版.md`](./docs/xx模块编写说明模版.md)。
@@ -68,6 +70,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回，支持 Agent 主动读写 |
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
+| 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
 | 📦 **零重型依赖** | 记忆模块只用标准库（`sqlite3` / `json` / `pathlib`）；MCP 模块不用官方 SDK，只用标准库 + 可选 `requests` |
 
 ---
@@ -109,6 +112,7 @@ openai>=3.37.0             # LLM 客户端
 pydantic>=2.14.1           # 数据模型 / 参数校验
 python-dotenv>=1.2.4       # 读 .env
 docstring-parser>=0.18.0   # 从 docstring 提取参数说明
+PyYAML>=6.0.3              # 技能系统解析 SKILL.md 的 front matter
 ```
 
 **可选**
@@ -119,7 +123,7 @@ tavily-python>=0.8.5       # 内置 SearchTool 的生产级 provider（需要 TA
 requests                   # 只用 MCP 的 SSE 传输时才需要（stdio 不需要）
 ```
 
-> ⚠️ **技能系统需要 `pyyaml`**：`fast_agents/skills/loader.py` 用 `yaml.safe_load` 解析 `SKILL.md` 的 front matter。当前 `requirements.txt` / `pyproject.toml` **尚未列出**它，新环境请手动安装 `pyyaml`（详见 [`docs/演进路线图.md`](./docs/演进路线图.md) 的 H4）。
+> ✅ **技能系统依赖 `pyyaml`**：`fast_agents/skills/loader.py` 用 `yaml.safe_load` 解析 `SKILL.md` 的 front matter。它已列入 `requirements.txt`（`PyYAML>=6.0.3`）与 `pyproject.toml`，按依赖清单安装即可，通常无需手动补装（老环境若缺，`pip install pyyaml`）。
 
 ---
 
@@ -249,23 +253,36 @@ fast_agents/
 │   │   ├── client.py             #    MCPClient：握手 / list_tools / call_tool
 │   │   ├── registry.py           #    MCPRegistry：多 server 管理 + 工具展开
 │   │   └── tool.py               #    MCPToolAdapter（细粒度）/ MCPServerTool（粗粒度）
-│   └── agents/                   # ⑦ 智能体
-│       ├── __init__.py
-│       ├── agent_base.py         #    AgentBase 抽象基类
-│       └── react_agent/
-│           ├── react_agent.py    #    ReActAgent 主实现
-│           └── prompt.py         #    DEFAULT_REACT_PROMPT
+│   ├── agents/                   # ⑦ 智能体
+│   │   ├── __init__.py
+│   │   ├── agent_base.py         #    AgentBase 抽象基类
+│   │   └── react_agent/
+│   │       ├── react_agent.py    #    ReActAgent 主实现
+│   │       └── prompt.py         #    DEFAULT_REACT_PROMPT
+│   ├── context/                  # ⑧ 上下文工程
+│   │   ├── __init__.py           #    模块出口：计量 / 分层 / 治理 + 门面 + 工具
+│   │   ├── tokens.py             #    TokenCounter / TokenBudget / 启发式估算
+│   │   ├── layers.py             #    ContextLayer / ContextWindow / 五层拼装顺序
+│   │   ├── offload.py            #    ContextOffloader：超长结果落盘 + 按需回读
+│   │   ├── compressor.py         #    ContextCompressor：三级压缩策略
+│   │   ├── builder.py            #    ContextBuilder：对 Agent 的门面
+│   │   └── tools.py              #    read_offloaded / write_file / edit_file / list_files
+│   └── utils/                    # ⑨ 通用工具（当前为空占位）
 ├── .skills/                      # 项目级技能目录（默认扫描位置）
-│   └── demo-skill/
+│   └── web-research/
 │       ├── SKILL.md
-│       ├── references/notes.md
-│       └── scripts/hello.py
+│       └── references/
+│           ├── report-template.md
+│           └── source-check.md
 ├── docs/                         # 模块编写说明 + 路线图
-├── examples/mcp/                 # MCP 示例（echo_server / quickstart / agent demo）
+├── examples/
+│   ├── context/                  # context 示例（离线可跑，不需要 API Key）
+│   └── mcp/                      # MCP 示例（echo_server / quickstart / agent demo）
 ├── test/                         # 测试与示例脚本
 ├── pyproject.toml
 ├── requirements.txt
 ├── uv.lock
+├── 第0步uv_安装.bat
 ├── 第1步uv_init.bat
 ├── 第2步uv_venv.bat
 └── 第3步uv_add.bat
@@ -515,6 +532,14 @@ result.text / result.artifact / result.error
 | `skill_registry` | `Optional[SkillRegistry]` | `None` | 技能注册表 |
 | `skill_paths` | `Optional[List]` | `None` | 额外技能扫描目录 |
 | `enable_skills` | `bool` | `True` | `False` 则不注入技能索引、不注册技能工具 |
+| `mcp_registry` | `Optional[MCPRegistry]` | `None` | MCP 注册表 |
+| `mcp_configs` | `Optional[List[MCPConfig]]` | `None` | 声明式 MCP server 配置（不传也可以运行时动态连接） |
+| `enable_mcp` | `bool` | `False` | `True` 则连接 MCP server、注册 MCP 管理工具（默认关，避免开子进程 / 网络） |
+| `mcp_expand_mode` | `str` | `"fine"` | MCP 工具展开：`"fine"` 细粒度 / `"coarse"` 粗粒度 |
+| `ctx` | `Optional[ContextBuilder]` | `None` | 上下文构建器（`enable_context=True` 不传则自动创建） |
+| `enable_context` | `bool` | `False` | `True` 则每轮按 token 预算拼装上下文、超长工具结果落盘 |
+| `context_budget` | `Optional[int]` | `None` | 覆盖 `ctx` 自带的 token 预算 |
+| `context_offload_threshold` | `Optional[int]` | `None` | 工具结果卸载的字符数阈值 |
 
 ```python
 agent = ReActAgent(
@@ -789,7 +814,7 @@ agent = ReActAgent(
 
 ### 7. MCP（外部工具接入，扩展模块）
 
-> **状态说明**：本模块随配套文档一同交付（`fast_agents/mcp/` + `tools/builtin/mcp_tool.py` + `react_agent.py` 的 MCP 改动），仓库主分支尚未合并。合并方式与完整说明见 [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md)。
+> **状态说明**：本模块已并入主分支（`fast_agents/mcp/` + `tools/builtin/mcp_tool.py` + `react_agent.py` 的 MCP 接入）。完整说明见 [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md)。
 
 让 Agent 连接**外部 MCP 工具服务器**，工具清单自动发现、参数 schema 自动转换。
 
@@ -842,6 +867,38 @@ python examples\mcp\mcp_react_agent_demo.py     # 5 个 Agent 集成场景
 ```
 
 > SSE 传输需要 `pip install requests`；stdio 不需要。
+
+### 8. Context（上下文工程）
+
+> **状态说明**：本模块已并入主分支（`fast_agents/context/`）。完整说明见 [`docs/context模块编写说明.md`](./docs/context模块编写说明.md)。
+
+让 Agent 具备「**知道自己用了多少 token、超预算时先动谁**」的能力。默认关闭（`enable_context=False`），打开后才生效。
+
+| 能力 | 类 | 说明 |
+|------|----|------|
+| 计量 | `TokenCounter` | tiktoken → 通用编码 → 启发式估算，三级降级；没装 tiktoken 也能跑 |
+| 预算 | `TokenBudget` | `窗口 − 预留输出 − 安全余量`；不预留输出会导致「请求成功但回答被截断」 |
+| 分层 | `ContextLayer` / `ContextWindow` | 五层拼装：system → 记忆 → 历史 → 文件 → **本轮问题（永远最后）** |
+| 治理 | `ContextCompressor` | 三级：先卸载（不丢信息）→ 再成组裁剪（保住 tool 配对）→ 最后摘要 |
+| 卸载 | `ContextOffloader` | 超长工具结果落盘，上下文只留引用 + `offload_id`，模型用 `read_offloaded` 按行回读 |
+| 门面 | `ContextBuilder` | Agent 只跟它打交道，不感知底下的分层与策略 |
+
+```python
+from fast_agents import LLM, ReActAgent
+
+agent = ReActAgent(
+    name="上下文助手",
+    llm=llm,
+    enable_memory=True,
+    enable_context=True,               # ← 打开上下文工程
+    context_budget=27_000,             # 可选：覆盖默认 token 预算
+    context_offload_threshold=4_000,   # 可选：超过 4000 字符的工具结果落盘
+)
+```
+
+> **为什么「本轮问题永远最后」**：prompt caching 是前缀匹配。把每轮都变的记忆 / 历史写进 prompt 中段，后面的缓存会全部失效，长会话成本翻倍。
+
+> **`read_offloaded` 与 `ReadTool` 的分工**：前者回读「被卸载的工具结果」，后者读普通文件（`fast_agents.tools.builtin.ReadTool`），两者互不替代。
 
 ---
 
@@ -999,8 +1056,9 @@ registry.register_tool(builtin.SearchTool(provider="tavily"))
 python test\test_react_agent.py
 python test\test_tools.py
 python test\test_memory.py
-python test\test_skill.py
-python test\test_tool.py
+python test\test_file_tool.py
+python test\test_context.py
+python test\test_mcp.py
 ```
 
 > **不要**用 `python -m test.test_xxx`——`test` 是 Python 标准库模块名，会冲突。
@@ -1009,27 +1067,18 @@ python test\test_tool.py
 
 | 测试文件 | 状态 | 说明 |
 |---------|------|------|
-| `test/test_react_agent.py` | ✅ 全过 | 含记忆、技能、`enable_xxx=False` 各分支 |
-| `test/test_tools.py` | ⚠️ 10/14 | `test_read_file` / `test_registry_batch_and_hook` 仍在引用已删除的 `ReadFileTool`；`test_calculator` 的用例表里 `("2**10","1024")` 与 `("2**10","8")` 自相矛盾；`test_terminal` 是 Windows 专用，非 Windows 环境必失败 |
-| `test/test_memory.py` | ❌ 导入失败 | 写的是 `from fast_agents.memory import RememberTool`，真实位置在 `fast_agents.tools.builtin` |
-| `test/test_skill.py` | ❌ 导入失败 | 用的是 `fast_agents.skill`（单数），真实包名是 `fast_agents.skills` |
-| `test/test_tool.py` | ❌ 导入失败 | 缺 `sys.path` 处理，直接跑找不到 `fast_agents` |
+| `test/test_react_agent.py` | ✅ 全过 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支 |
+| `test/test_tools.py` | ✅ 14/14 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表；`test_terminal` 在非 Windows 上自动跳过 |
+| `test/test_memory.py` | ✅ 全过 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具三件套、作用域隔离 |
+| `test/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
+| `test/test_context.py` | ✅ 16/16 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端 |
+| `test/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
 
 `test/demo.py` / `test/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
 
-### 修这几处的小建议
+> **平台差异**：`test_tools.py::test_terminal` 走的是 Windows 命令白名单（`dir` / `type` / `echo` …），在 Windows 上执行真实断言，在 Linux / macOS 上会打印「跳过」并继续；其余用例跨平台一致。
 
-- **`test_memory.py`**：把 `from fast_agents.memory import RememberTool, RecallTool, ForgetTool, build_memory_tools` 改成 `from fast_agents.tools.builtin import ...`；
-- **`test_skill.py`**：全文把 `fast_agents.skill` 改成 `fast_agents.skills`；
-- **`test_tool.py`**：在文件最前面加
-
-  ```python
-  import sys, os
-  sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-  ```
-
-  其他 4 个测试文件都有这段，它是唯一漏掉的；
-- **`test_tools.py`**：① 把 `builtin.ReadFileTool(...)` 换成 `builtin.ReadTool(...)`——该工具已随 `read_file_tool.py` 删除；② 用例表里的 `("2**10", "8")` 与 `("2**10", "1024")` 只能留一个。
+> **离线提示**：`test_react_agent.py` 打开 context 后会实例化 `TokenCounter`，首次使用 tiktoken 需要联网取词表；无网络环境会自动降级为启发式估算（可能等待一次连接超时）。
 
 ---
 
@@ -1050,7 +1099,9 @@ python test\test_tool.py
 | MCP 实现 | 零依赖（不用官方 SDK） | 装包小、不被 SDK 版本打乱；代价是只覆盖 `tools` |
 | MCP 展开 | 细 / 粗两种 | 工具多时粗粒度能把工具表压成常量 |
 | MCP 生命周期 | 挂成 Agent 成员 + `atexit` 兜底 | 子进程必须显式回收，不然留孤儿进程 |
-| 默认开关 | 记忆 / 技能开，MCP 关 | MCP 会开子进程或建网络连接，不该默认开 |
+| 默认开关 | 记忆 / 技能开，MCP / context 关 | MCP 会开子进程或建网络连接；context 改动既有链路，都该显式打开 |
+| 上下文分层 | 静态在前、本轮问题在最后 | prompt caching 是前缀匹配，动态内容放中段会让缓存全部失效 |
+| 超预算治理 | 先卸载 → 再裁剪 → 最后摘要 | 优先选信息不丢的策略，把最贵、最不可逆的放最后 |
 
 ---
 
@@ -1062,13 +1113,13 @@ python test\test_tool.py
 |------|------|-----------|
 | 🔧 **tools** | ✅ 已实现 | 统一返回协议细化、RAG 工具、工具结果截断策略 |
 | 🧩 **skill** | ✅ 已实现 | 技能市场 / 技能依赖 / 技能版本管理 |
-| 🔌 **mcp** | ✅ 已交付（待合并） | `streamable-http` 传输、`resources` / `prompts`、图片透传 |
+| 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输、`resources` / `prompts`、图片透传 |
 | 🧠 **memory** | ✅ 已实现 | `SessionStore` 短期落盘、语义检索（embedding）、用户画像 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
-| 🪟 **context** | ⏳ 规划中 | token 预算、工具结果卸载、文件系统工具 |
+| 🪟 **context** | ✅ 已实现 | prompt caching 断点、摘要中间件化、embedding 召回扩展位 |
 | 🛠 **infra** | ⏳ 规划中 | `TraceLogger`、评估工具、异步、打包发布 |
 
-**P0 · 先做**（补齐「用得下去」的短板）：修测试导入路径 · `SearchTool` 稳定性 · `TokenCounter` · `llm.embed()`
+**P0 · 先做**（补齐「用得下去」的短板）：`SearchTool` 稳定性 · `llm.embed()` · 工具并行调用 · 工具审批（Human-in-the-loop）
 
 ---
 

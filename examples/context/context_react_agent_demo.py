@@ -10,9 +10,11 @@
 真实使用时把 ScriptedLLM 换成 fast_agents.llm.LLM 即可：
 
     from fast_agents import LLM, ReActAgent
+    from fast_agents.tools.builtin import ReadTool
+
     llm = LLM(model="gpt-4o-mini", api_key="...", base_url="...")
     agent = ReActAgent(name="助手", llm=llm, enable_memory=True, enable_context=True)
-    agent.add_tool(ReadFileTool(workspace="."))
+    agent.add_tool(ReadTool(workspace="."))
     print(agent.run("帮我把 README 里的安装步骤整理成一份清单文件"))
 
 运行方式（在仓库根目录）：

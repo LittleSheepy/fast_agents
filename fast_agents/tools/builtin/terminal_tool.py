@@ -32,10 +32,29 @@ from .command_splitter import (
 # 只读安全命令
 # 去掉的 命令 "copy", "xcopy", "move", "del", "ren", mkdir, "md"
 _WINDOWS_READONLY_COMMANDS: Set[str] = {
-    "dir", "type", "findstr", "where", "tree",
-    "more", "echo", "cd", "cls", "ver", "date", "time",
+    # 查看当前路径
+    # cmd 内置命令
+    "chdir", "cd",                                  # 设置路径（cmd 中 cd也可以查看路径）
+    "dir", "tree.com", "tree",                      # 查看目录、查看目录树
+    "type",                                         # 查看文件
+    "findstr", "where",                             # 文本搜索与定位
+    "more", "echo", "cls",                          # 分页显示、显示与清屏
+    "ver", "date", "time",                          # 系统信息与时间
+
+    # PowerShell 命令
+    "Set-Location", "sl", "Get-Location", "pwd",    # 设置路径、查看路径
+    "Get-ChildItem", "gci", "ls", "Test-Path",      # 查看目录、查看目录树、目录存在
+    "Get-Content", "gc", "cat",                     # 文件查看
+    "Select-String", "sls", "Get-Command", "gcm",   # 文本搜索与定位
+    "Write-Output", "write", "Clear-Host", "clear", # 显示与清屏
+    "Get-Date", "Get-ComputerInfo",                 # 系统信息与时间
+    "Get-Help", "help",                             # 查看命令帮助信息
+
+    # Windows 内置可执行程序
     "ping", "ipconfig", "netstat", "tasklist",
-    "powershell", "cmd",  # 允许显式调用shell，但参数会被安全校验
+
+    # 允许显式调用的 Shell 入口，参数需安全校验
+    "powershell", "cmd",
 }
 
 # 可执行命令（需显式开启allow_exec）
@@ -116,7 +135,7 @@ class TerminalTool(ToolBase):
 
             # 3. 补充：cd 出现在任意位置都要做沙箱路径校验
             #    原实现只校验首条命令，cd 放到链中（如 "dir && cd .."）就绕过了沙箱
-            if base == "cd":
+            if base in {"chdir", "cd", "Set-Location", "sl"}:
                 cd_indexes.append(idx)
                 cd_ok, cd_result = self._resolve_cd_target(parts)
                 if not cd_ok:

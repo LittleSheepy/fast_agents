@@ -1,6 +1,6 @@
 # Skill 模块编写说明
 
-> **对应代码**：`fast_agents/skills/`（基线提交 `6c4bb1a`）
+> **对应代码**：`fast_agents/skills/`（已同步至最新代码，2026-10-29）
 > **读者**：想给 FastAgents 增加技能、或想照着这套思路给自己的 Agent 加技能机制的人
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分一律放在 `docs/演进路线图.md`，本文不重复。
 
@@ -41,7 +41,7 @@
 
 **Tool 是「一个动作」，Skill 是「一套流程」。**
 
-- 工具层解决的是「Agent 能不能做某件事」。比如 `CalculatorTool` 能算数、`ReadFileTool` 能读文件。
+- 工具层解决的是「Agent 能不能做某件事」。比如 `CalculatorTool` 能算数、`ReadTool` 能读文件。
 - 技能层解决的是「Agent 知不知道这件事该按什么规矩做」。比如「生成周报」这件事本身不需要新工具，它需要的是**一套步骤、格式要求和质量规范**。
 
 把流程直接写进 System Prompt 会立刻遇到两个瓶颈：
@@ -946,16 +946,16 @@ else:
 
 Windows 默认单条路径上限 260 字符。技能目录如果嵌得很深（`D:\...\fast_agents\.skills\very-long-skill-name\references\some-deep-file.md`），加上项目路径本身就很长，有触顶风险。技能名尽量短。
 
-### 10.10 已知的四处「测试与实现不同步」
+### 10.10 曾经的四处「测试与实现不同步」（现已全部处理）
 
-这些都是仓库现状，不是本文档的笔误，列出来避免你踩：
+下面这几处是历史版本里的不同步现象，**现均已在最新仓库中修复、或随相关测试文件被清理而消失**，保留在此便于理解来龙去脉：
 
-| # | 现象 | 位置 | 建议修法 |
-|---|------|------|---------|
-| 1 | `test_memory.py` 报 `ImportError: cannot import name 'RememberTool' from 'fast_agents.memory'` | `memory/__init__.py` 的 `__all__` 里没有 `RememberTool` / `RecallTool` / `ForgetTool` / `build_memory_tools`（它们只在 `tools/builtin/__init__.py` 里） | 从 `fast_agents.tools.builtin` 导入，或把这三个名字补进 `memory/__init__.py` |
-| 2 | `test_skill.py` 报 `ModuleNotFoundError: No module named 'fast_agents.skill'` | 它 import 的是**单数** `fast_agents.skill` 和 `fast_agents.skill.errors`，而真实包是**复数** `fast_agents.skills`，且没有 `errors` 子模块 | 把测试改成 `from fast_agents.skills import ...` |
-| 3 | `test_tool.py` 报 `ModuleNotFoundError: No module named 'fast_agents'` | 它是唯一**没有**加 `sys.path.insert` 的测试文件；而且 import 路径写的是旧的 `fast_agents.tools.calculator_tool`（真实位置是 `fast_agents.tools.builtin.calculator_tool`） | 补 `sys.path`，改 import 路径 |
-| 4 | `test_tools.py` 里 `test_calculator` 失败：`2^10` 期望 1024 得到 8 | `builtin/calculator_tool.py` 把表达式交给 `ast` 解析，`^` 是**按位异或**而不是幂；`code_skill_example.py` 里的示例做了 `^`→`**` 替换，两处不一致 | 二选一：计算器里也做替换；或明确 `^` 就是异或，把测试期望改成 8 |
+| # | 现象 | 位置 | 结论 |
+|---|------|------|------|
+| 1 | `test_memory.py` 报 `ImportError: cannot import name 'RememberTool' from 'fast_agents.memory'` | `memory/__init__.py` 的 `__all__` 里没有 `RememberTool` / `RecallTool` / `ForgetTool` / `build_memory_tools`（它们只在 `tools/builtin/__init__.py` 里） | ✅ 已修：`test_memory.py` 改从 `fast_agents.tools.builtin` 导入，全过。若你偏好从 `memory` 侧导入，可把这三个名字补进 `memory/__init__.py` |
+| 2 | `test_skill.py` 报 `ModuleNotFoundError: No module named 'fast_agents.skill'` | 它 import 的是**单数** `fast_agents.skill`，真实包是**复数** `fast_agents.skills` | ✅ 已消失：该测试文件已随仓库清理删除 |
+| 3 | `test_tool.py` 报 `ModuleNotFoundError: No module named 'fast_agents'` | 它是唯一**没有**加 `sys.path.insert` 的测试文件 | ✅ 已消失：该测试文件已随仓库清理删除 |
+| 4 | `test_tools.py` 里 `test_calculator` 失败：`2^10` 期望 1024 得到 8 | `builtin/calculator_tool.py` 把表达式交给 `ast` 解析，`^` 是**按位异或**而不是幂 | ✅ 已修：用例表改为 `("2**10","1024")` + `("2^10","8")`，与实现自洽（`^` 的语义仍是异或） |
 
 `test_react_agent.py` 是全过的，其中包括两个技能相关用例（`test_skills_enabled_registers_tools_and_index` / `test_skills_disabled`）。
 
@@ -968,12 +968,13 @@ Windows 默认单条路径上限 260 字符。技能目录如果嵌得很深（`
 | 测试文件 | 结果 | 说明 |
 |---------|------|------|
 | `test/test_react_agent.py` | ✅ 全过 | 含技能启用/禁用两条用例 |
-| `test/test_tools.py` | 13/14 | 唯一失败项是计算器 `2^10` |
-| `test/test_memory.py` | ❌ ImportError | 见 [10.10](#1010-已知的四处测试与实现不同步) 第 1 条 |
-| `test/test_tool.py` | ❌ ModuleNotFoundError | 见第 3 条 |
-| `test/test_skill.py` | ❌ ModuleNotFoundError | 见第 2 条 |
+| `test/test_tools.py` | ✅ 14/14 | 计算器用例已与「`^` 是异或」的实现对齐 |
+| `test/test_memory.py` | ✅ 全过 | 导入已修正，见 [10.10](#1010-曾经的四处测试与实现不同步现已全部处理) 第 1 条 |
+| `test/test_file_tool.py` | ✅ 13/13 | 文件四件套专项 |
+| `test/test_context.py` | ✅ 16/16 | `context/` 模块专项 |
+| `test/test_mcp.py` | ✅ 10/10 | MCP 专项 |
 
-> `test/` 与 Python 标准库的 `test` 包同名，**必须用 `python test\xxx.py` 直接执行**，不要用 `python -m test.xxx`。另外 `test/` 下**没有** `conftest.py`，每个测试文件各自在开头写 `sys.path.insert(0, 父目录)` 来保证能 import 到 `fast_agents`（`test_tool.py` 漏了这一步）。
+> `test/` 与 Python 标准库的 `test` 包同名，**必须用 `python test\xxx.py` 直接执行**，不要用 `python -m test.xxx`。另外 `test/` 下**没有** `conftest.py`，每个测试文件各自在开头写 `sys.path.insert(0, 父目录)` 来保证能 import 到 `fast_agents`。
 
 ### 11.2 手工验证一份技能包
 
