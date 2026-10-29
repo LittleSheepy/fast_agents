@@ -15,14 +15,14 @@ from ..tool_result import ToolResult
 
 class CalculatorInput(BaseModel):
     expression: str = Field(
-        description="要计算的数学表达式，支持 +-*/^ 和函数 sqrt/sin/cos/tan/log/exp/abs/round/max/min，如 '2+3*4'、'sqrt(16)'、'sin(pi/2)'",
+        description="要计算的数学表达式，支持 +-*/ ** 和函数 sqrt/sin/cos/tan/log/exp/abs/round/max/min，如 '2+3*4'、'sqrt(16)'、'sin(pi/2)'",
     )
 
 
 class CalculatorTool(ToolBase):
     name = "python_calculator"
     description = (
-        "执行数学计算。支持基本运算（+ - * / ^）和常用数学函数 "
+        "执行数学计算。支持基本运算（+ - * / **）和常用数学函数 "
         "（sqrt, sin, cos, tan, log, exp, abs, round, max, min），常量 pi、e。"
         "适用于需要精确数值答案的场景。"
     )
