@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, Iterator
 
 from .openai_client import OpenAIClient
 from ..messages.message import Message
@@ -32,5 +32,5 @@ class LLM:
     def invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Message:
         return self._client.invoke(messages=messages, tools=tools, **kwargs)
 
-    def stream_invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> str:
+    def stream_invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Iterator[str]:
         return self._client.stream_invoke(messages=messages, tools=tools, **kwargs)
