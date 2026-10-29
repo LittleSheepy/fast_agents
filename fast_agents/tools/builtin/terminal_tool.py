@@ -101,7 +101,7 @@ class TerminalTool(ToolBase):
         # 初始化时探测一次shell
         self.detected_shell, self.shell_path = detect_shell()
 
-    def run(self, command: str) -> Union[str, ToolResult]:
+    def run(self, command: str) -> ToolResult:
         """执行命令入口"""
         if not command or not command.strip():
             return ToolResult.fail("命令不能为空")
@@ -258,4 +258,4 @@ if __name__ == "__main__":
     for cmd in test_cmds:
         print(f"\n>>> 执行: {cmd}")
         res = tool.run(cmd)
-        print(f"{'✅' if res.success else '❌'} {res.content[:200]}")
+        print(f"{'✅' if not res.error else '❌'} {res.output[:200]}")
