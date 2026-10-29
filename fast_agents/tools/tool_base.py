@@ -121,11 +121,9 @@ class ToolBase(ABC):
     args_schema: Optional[Type[BaseModel]] = None
     max_output_chars: int = 100_000
     handle_tool_error: bool = True
-    # 注意：ToolBase 是普通 ABC，不是 pydantic BaseModel，
-    # 这里不能写 Field(default_factory=...)，否则类属性会是个 FieldInfo 对象而非 list/dict。
     tags: List[str] = []
     metadata: Dict[str, Any] = {}
-    return_direct: bool = False
+    return_direct: bool = False     # 工具执行完后会直接将原始结果作为最终输出返回
 
     def __init__(
         self,
