@@ -6,11 +6,13 @@ from .in_memory_store import InMemoryStore
 from .manager import MemoryManager
 from .schema import ContextPacket, MemoryKind, MemoryRecord, MemoryStatus
 from .scoring import combined_score, lexical_score, lexical_terms, time_decay
+from .session_store import InMemorySessionStore, SessionStore, SQLiteSessionStore
 from .sqlite_store import SQLiteMemoryStore
 
 __all__ = [
     "MemoryRecord", "MemoryKind", "MemoryStatus", "ContextPacket",
     "MemoryStoreBase", "InMemoryStore", "SQLiteMemoryStore",
+    "SessionStore", "SQLiteSessionStore", "InMemorySessionStore",
     "BufferMemory", "MemoryManager",
     "lexical_terms", "lexical_score", "time_decay", "combined_score",
 ]

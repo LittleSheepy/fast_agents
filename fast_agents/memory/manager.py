@@ -23,6 +23,7 @@ from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory, DEFAULT_SUMMARY_PROMPT
 from .in_memory_store import InMemoryStore
 from .schema import ContextPacket, MemoryKind, MemoryRecord
+from .session_store import SessionStore
 
 
 # 从对话里自动抽取长期记忆的提示词：要求模型输出严格 JSON
@@ -54,6 +55,7 @@ class MemoryManager:
         self,
         *,
         long_term_store: Optional[MemoryStoreBase] = None,
+        session_store: Optional[SessionStore] = None,
         max_messages: int = 20,
         enable_summary: bool = True,
         llm=None,
@@ -65,6 +67,9 @@ class MemoryManager:
         """
         Args:
             long_term_store: 长期记忆后端，不传则用内存版（仅用于调试）
+            session_store: 短期会话持久化后端（SQLiteSessionStore），
+                不传则短期记忆纯内存（进程重启即丢，原有行为不变）。
+                对应演进路线 B1 —— 传此参数后，进程重启能自动恢复上次会话。
             max_messages: 短期窗口大小
             enable_summary: 短期是否开启滚动摘要
             llm: LLM 实例，摘要与自动抽取都依赖它
@@ -79,7 +84,10 @@ class MemoryManager:
 
         self.long_term: MemoryStoreBase = long_term_store or InMemoryStore()
         self.buffer = BufferMemory(
-            max_messages=max_messages, enable_summary=enable_summary, llm=llm
+            max_messages=max_messages,
+            enable_summary=enable_summary,
+            llm=llm,
+            persist_store=session_store,
         )
 
     # ---------- 1. 检索 ----------
@@ -191,8 +199,6 @@ class MemoryManager:
 
     def _call_extract(self, conversation: str) -> List[Dict[str, Any]]:
         """调用 LLM 抽取，容错解析 JSON"""
-        from ..memory.scoring import lexical_terms  # 局部导入，避免循环
-
         prompt = self.extract_prompt.format(conversation=conversation)
         try:
             response = self.llm.invoke(
@@ -247,3 +253,5 @@ class MemoryManager:
 
     def close(self) -> None:
         self.long_term.close()
+        if self.buffer.persist_store is not None:
+            self.buffer.persist_store.close()

@@ -67,7 +67,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 💬 **消息系统** | `Message` / `Messages` 双层结构，原生支持 function calling（`tool_calls` / `tool_call_id`），可一键转 OpenAI 格式 |
 | 🔧 **工具系统** | `ToolBase` 抽象基类 + `StructuredTool` / `@tool` 装饰器 + `ToolRegistry` 注册表，四种定义方式，schema 自动生成 |
 | 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关 |
-| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回，支持 Agent 主动读写 |
+| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回，支持 Agent 主动读写 |
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
@@ -233,6 +233,7 @@ fast_agents/
 │   │   ├── memory_store_base.py               #    MemoryStoreBase 抽象接口
 │   │   ├── scoring.py            #    词法打分 + 时间衰减
 │   │   ├── buffer.py             #    BufferMemory：短期窗口 + 滚动摘要
+│   │   ├── session_store.py      #    SessionStore：短期会话落盘（SQLite / 内存两版）
 │   │   ├── in_memory_store.py    #    InMemoryStore：纯内存长期记忆
 │   │   ├── sqlite_store.py       #    SQLiteMemoryStore：持久化长期记忆
 │   │   └── manager.py            #    MemoryManager：短期 + 长期的门面
@@ -596,6 +597,7 @@ buf = BufferMemory(
     enable_summary=True,      # 超窗时压成摘要
     summary_max_words=200,
     llm=llm,                  # 用于生成摘要；不传则降级为截断
+    persist_store=None,       # 可传 SQLiteSessionStore：短期落盘，进程重启可恢复
 )
 buf.append_user("你好")
 buf.append_ai("你好")
@@ -603,6 +605,7 @@ buf.get_messages() / buf.get_summary() / buf.to_openai_messages() / buf.clear()
 ```
 
 > 超窗时溢出的消息会**滚动压成一句摘要**（摘要 = 旧摘要 + 溢出消息 一起压）。没有 `llm` 时降级为直接截断。
+> **短期落盘（B1）**：给 `persist_store` 传一个 `SQLiteSessionStore`（来自 `fast_agents.memory`），构造时会自动 `load()` 回填上次的消息与摘要、`append()` 同步落库、`clear()` 同步清空，上层调用完全不用改。详见 `docs/记忆模块编写说明.md`。
 
 #### 长期：`MemoryStoreBase`
 

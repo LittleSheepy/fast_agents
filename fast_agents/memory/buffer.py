@@ -1,20 +1,21 @@
 """短期记忆（Working Memory / Buffer）
 
 职责：只管「当前这次会话聊到哪了」，不负责跨会话。
-- 保存最近 N 轮对话消息；
+- 保存最近 N 轮对话消息（内部用 Messages 容器承载）；
 - 超出窗口时，把被挤出去的消息交给 LLM 压成一句摘要（滚动摘要），
-  这样既不丢信息，又不让 prompt 无限膨胀。
+  这样既不丢信息，又不让 prompt 无限膨胀；
+- 可选传入 persist_store（SessionStore）实现短期落盘：
+  append 同步落库、构造时 load 回填、进程重启能恢复上次会话（对应演进路线 B1）。
 
 对应 HelloAgents 的 working memory（working_memory_capacity + TTL），
 但这里用「消息窗口 + 摘要」而不是纯 TTL，因为对 ReAct Agent 更实用。
-
-注意：本模块不落盘。会话结束即释放，真正的持久化交给长期记忆。
 """
 
 from typing import List, Optional
 
-from ..messages.message import Message
+from ..messages import Message, Messages
 from .schema import ContextPacket
+from .session_store import SessionStore
 
 
 # 与 prompt.py 一样，摘要提示词写成模块级常量，方便用户自定义
@@ -31,7 +32,11 @@ DEFAULT_SUMMARY_PROMPT = """请把下面这段对话压缩成不超过 {max_word
 
 
 class BufferMemory:
-    """会话级短期记忆：滑动窗口 + 滚动摘要"""
+    """会话级短期记忆：滑动窗口 + 滚动摘要
+
+    内部消息存储委托给 Messages 容器（纯粹的 Message 列表 + OpenAI 格式转换），
+    窗口裁剪、滚动摘要、持久化等「记忆」逻辑全部在这里实现，不侵入 Messages。
+    """
 
     def __init__(
         self,
@@ -40,6 +45,7 @@ class BufferMemory:
         summary_max_words: int = 200,
         llm=None,
         summary_prompt: Optional[str] = None,
+        persist_store: Optional[SessionStore] = None,
     ):
         """
         Args:
@@ -48,6 +54,12 @@ class BufferMemory:
             summary_max_words: 摘要字数上限
             llm: LLM 实例，仅在 enable_summary=True 时需要
             summary_prompt: 自定义摘要提示词
+            persist_store: 可选的短期持久化后端（SQLiteSessionStore / InMemorySessionStore）；
+                传入后：
+                1. 构造时自动从 persist_store.load() 回填历史消息与摘要；
+                2. 每次 append / 压缩产生新摘要时，同步落库；
+                3. clear() 时同步清空持久化层。
+                不传则保持原有纯内存行为（进程退出即丢）。
         """
         if max_messages < 2:
             raise ValueError("max_messages 至少为 2")
@@ -56,15 +68,29 @@ class BufferMemory:
         self.summary_max_words = summary_max_words
         self.llm = llm
         self.summary_prompt = summary_prompt or DEFAULT_SUMMARY_PROMPT
-
-        self._messages: List[Message] = []
+        self.persist_store = persist_store
+        self._messages: Messages = Messages()
         self._summary: str = ""
+        # 启动时先从持久化层回填（没有 persist_store 时保持空）
+        if persist_store is not None:
+            self._messages.extend(persist_store.load())
+            self._summary: str = persist_store.load_summary() or ""
+            # 回填后如果超过窗口，立刻裁剪保摘要（溢出消息可能已被摘要过，不重新摘要）
+            if len(self._messages) > self.max_messages:
+                overflow_count = len(self._messages) - self.max_messages
+                self._messages = Messages(self._messages[overflow_count:])
 
     # ---------- 写入 ----------
 
     def append(self, message: Message) -> None:
-        """追加一条消息，必要时触发压缩"""
+        """追加一条消息，必要时触发压缩；若开启了持久化则同步落库"""
         self._messages.append(message)
+        if self.persist_store is not None:
+            # 持久化失败不能拖垮主流程（和摘要失败同样的容错策略）
+            try:
+                self.persist_store.append(message)
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠️ 短期记忆持久化 append 失败（已写入内存）: {e}")
         self._maybe_compress()
 
     def append_user(self, content: str) -> None:
@@ -78,10 +104,16 @@ class BufferMemory:
         if len(self._messages) <= self.max_messages:
             return
         overflow_count = len(self._messages) - self.max_messages
-        overflow = self._messages[:overflow_count]
-        self._messages = self._messages[overflow_count:]
+        overflow: List[Message] = self._messages[:overflow_count]
+        # 用切片重建 Messages，窗口裁剪逻辑保留在记忆模块
+        self._messages = Messages(self._messages[overflow_count:])
         if self.enable_summary:
             self._summary = self._summarize(overflow, self._summary)
+            if self.persist_store is not None:
+                try:
+                    self.persist_store.save_summary(self._summary)
+                except Exception as e:  # noqa: BLE001
+                    print(f"⚠️ 短期记忆持久化 save_summary 失败: {e}")
 
     def _summarize(self, messages: List[Message], previous: str) -> str:
         """调用 LLM 生成摘要；调用失败时降级为拼接截断，保证不中断主流程"""
@@ -106,13 +138,18 @@ class BufferMemory:
 
     def get_messages(self) -> List[Message]:
         """返回窗口内的消息副本"""
-        return list(self._messages)
+        return self._messages.get_messages()
 
     def get_summary(self) -> str:
         return self._summary
 
     def to_openai_messages(self) -> List[dict]:
-        """转成 OpenAI messages 列表（供 Agent 直接喂给 LLM）"""
+        """转成 OpenAI messages 列表（供 Agent 直接喂给 LLM）
+
+        摘要作为一条 user 消息前缀注入，再拼接窗口内所有消息；
+        消息的 OpenAI 格式转换委托给 Messages.to_openai_messages()，
+        避免重复实现 to_openai_message 的遍历与拉平逻辑。
+        """
         result: List[dict] = []
         if self._summary:
             result.append(
@@ -121,7 +158,7 @@ class BufferMemory:
                     "content": f"[历史摘要，供参考]\n{self._summary}",
                 }
             )
-        result.extend(m.to_openai_message() for m in self._messages)
+        result.extend(self._messages.to_openai_messages())
         return result
 
     def to_context_packet(self) -> List[ContextPacket]:
@@ -144,8 +181,13 @@ class BufferMemory:
         return packets
 
     def clear(self) -> None:
-        self._messages = []
+        self._messages.clear()
         self._summary = ""
+        if self.persist_store is not None:
+            try:
+                self.persist_store.clear()
+            except Exception as e:  # noqa: BLE001
+                print(f"⚠️ 短期记忆持久化 clear 失败: {e}")
 
     def __len__(self) -> int:
         return len(self._messages)
