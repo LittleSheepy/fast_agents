@@ -5,11 +5,12 @@
 - 区分成功/失败/截断三种状态，Agent 可据此决定重试或换思路；
 - 携带 artifact（原始结构化数据），供下游工具或记忆使用；
 - 输出 token 安全：长结果自动截断并标注，防止爆上下文。
+- 携带 metadata（执行耗时等），供可观测与审计使用
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from enum import Enum
 
@@ -28,10 +29,11 @@ class ToolResult:
     error: Optional[str] = None
     artifact: Any = None
     is_error: bool = False
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def ok(cls, output: str, artifact: Any = None) -> "ToolResult":
-        return cls(output=output, status=ToolStatus.SUCCESS, artifact=artifact)
+    def ok(cls, output: str, artifact: Any = None, metadata: Optional[dict] = None) -> "ToolResult":
+        return cls(output=output, status=ToolStatus.SUCCESS, artifact=artifact, metadata=metadata or {})
 
     @classmethod
     def fail(cls, error: str) -> "ToolResult":

@@ -19,12 +19,15 @@ import asyncio
 import enum
 import functools
 import inspect
+import json
 import logging
+import time as _time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Type, Union, get_args, get_origin, get_type_hints
 
 from pydantic import BaseModel, create_model, ValidationError
 
+from .tool_exception import ToolException
 from .tool_result import ToolResult
 
 logger = logging.getLogger(__name__)
@@ -169,13 +172,13 @@ class ToolBase(ABC):
           1. 关键字参数：``tool.invoke(a=1, b="x")``；
           2. 单一 dict：``tool.invoke({"a": 1, "b": "x"})``（对齐 LangChain Runnable 风格）。
         """
+        start_time = _time.perf_counter()
         if tool_input is not None:
             if isinstance(tool_input, str):
                 try:
-                    import json as _json
-                    parsed = _json.loads(tool_input) if tool_input.strip() else {}
-                except Exception:
-                    parsed = {}
+                    parsed = json.loads(tool_input) if tool_input.strip() else {}
+                except json.JSONDecodeError as e:
+                    return ToolResult.fail(f"工具参数不是合法 JSON：{e}")
                 if not isinstance(parsed, dict):
                     return ToolResult.fail("工具参数必须是 JSON 对象")
                 parsed.update(kwargs)
@@ -196,23 +199,35 @@ class ToolBase(ABC):
         self._before_run(validated)
         try:
             raw = self.run(**validated)
+        except ToolException as e:
+            self._on_error(e, validated)
+            if not self.handle_tool_error:
+                raise
+            obs = e.observation or e.message
+            return ToolResult.fail(f"工具 '{self.name}' 执行失败：{obs}")
         except Exception as e:
             self._on_error(e, validated)
             if not self.handle_tool_error:
                 raise
             return ToolResult.fail(f"工具 '{self.name}' 执行失败：{e}")
         result = self._coerce_result(raw)
+        result.metadata["duration_ms"] = int((_time.perf_counter() - start_time) * 1000)
         if self.max_output_chars and len(result.output) > self.max_output_chars:
+            duration = int((_time.perf_counter() - start_time) * 1000)
             truncated_output = result.output[: self.max_output_chars]
             result = ToolResult.truncated(truncated_output, len(result.output), self.max_output_chars)
+            result.metadata["duration_ms"] = duration
         self._after_run(validated, result)
         return result
 
     async def ainvoke(self, tool_input: Optional[Union[str, Dict[str, Any]]] = None, **kwargs: Any) -> ToolResult:
+        start_time = _time.perf_counter()
         if tool_input is not None:
             if isinstance(tool_input, str):
-                import json as _json
-                parsed = _json.loads(tool_input) if tool_input.strip() else {}
+                try:
+                    parsed = json.loads(tool_input) if tool_input.strip() else {}
+                except json.JSONDecodeError as e:
+                    return ToolResult.fail(f"工具参数不是合法 JSON：{e}")
                 if not isinstance(parsed, dict):
                     return ToolResult.fail("工具参数必须是 JSON 对象")
                 parsed.update(kwargs)
@@ -231,14 +246,23 @@ class ToolBase(ABC):
         self._before_run(validated)
         try:
             raw = await self.arun(**validated)
+        except ToolException as e:
+            self._on_error(e, validated)
+            if not self.handle_tool_error:
+                raise
+            obs = e.observation or e.message
+            return ToolResult.fail(f"工具 '{self.name}' 执行失败：{obs}")
         except Exception as e:
             self._on_error(e, validated)
             if not self.handle_tool_error:
                 raise
             return ToolResult.fail(f"工具 '{self.name}' 执行失败：{e}")
         result = self._coerce_result(raw)
+        result.metadata["duration_ms"] = int((_time.perf_counter() - start_time) * 1000)
         if self.max_output_chars and len(result.output) > self.max_output_chars:
+            duration = int((_time.perf_counter() - start_time) * 1000)
             result = ToolResult.truncated(result.output[: self.max_output_chars], len(result.output), self.max_output_chars)
+            result.metadata["duration_ms"] = duration
         self._after_run(validated, result)
         return result
 

@@ -1,26 +1,40 @@
 """工具注册表 ToolRegistry
 
 统一管理一组工具，提供：注册/反注册、按名查找、执行（invoke_tool）、
-多 provider schema 导出、hook 回调。
+多工具并发执行、多 provider schema 导出、hook 回调、审批回调。
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Union
+import threading
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .structured_tool import StructuredTool
 from .tool_base import ToolBase
-from .tool_result import ToolResult
+from .tool_result import ToolResult, ToolStatus
 
 logger = logging.getLogger(__name__)
 
+# 审批回调签名：(tool_name, tool_args) -> (approved: bool, modified_args: Optional[dict] = None, reason: str = "")
+ApprovalCallback = Callable[[str, dict], Tuple[bool, Optional[dict], str]]
+
 
 class ToolRegistry:
-    def __init__(self):
+    def __init__(self, *, max_workers: int = 4, default_timeout: Optional[float] = 300):
         self._tools: Dict[str, ToolBase] = {}
         self._hooks: List[Callable[[str, dict, ToolResult], None]] = []
+        self._approval_callback: Optional[ApprovalCallback] = None
+        self.max_workers = max_workers
+        self.default_timeout = default_timeout
+        self._thread_local = threading.local()
+
+    def set_approval_callback(self, callback: Optional[ApprovalCallback]) -> None:
+        """设置人工审批回调。设置后，所有标记为 requires_approval=True 的工具执行前会触发回调。
+        回调返回 (approved: bool, modified_args: Optional[dict], reason: str)。"""
+        self._approval_callback = callback
 
     # ── 注册 / 反注册 ────────────────────────────────────────
 
@@ -66,14 +80,24 @@ class ToolRegistry:
             return "暂无可用工具"
         return "\n".join(f"- {t.name}: {t.description}" for t in self._tools.values())
 
-    # ── 执行 ─────────────────────────────────────────────────
+    # ── 单工具执行 ──────────────────────────────────────────
 
-    def invoke_tool(self, name: str, tool_input: Union[str, Dict[str, Any], None] = None, **kwargs: Any) -> ToolResult:
+    def invoke_tool(
+        self,
+        name: str,
+        tool_input: Union[str, Dict[str, Any], None] = None,
+        *,
+        timeout: Optional[float] = None,
+        skip_approval: bool = False,
+        **kwargs: Any,
+    ) -> ToolResult:
         """按名执行工具，统一返回 ToolResult。
 
         Args:
             name: 工具名。
             tool_input: JSON 字符串或 dict；支持同时用 kwargs 追加/覆盖。
+            timeout: 单次调用超时（秒），None 用 default_timeout。
+            skip_approval: 是否跳过审批流程（内部并发调用时使用）。
         """
         tool = self._tools.get(name)
         if tool is None:
@@ -95,13 +119,81 @@ class ToolRegistry:
         elif tool_input is not None:
             return ToolResult.fail(f"tool_input 必须是 dict / JSON 字符串 / None，收到 {type(tool_input).__name__}")
 
-        result = tool.invoke(**kwargs)
+        # ── 审批流程 ──
+        tool_meta = tool.metadata if isinstance(tool.metadata, dict) else {}
+        requires_approval = tool_meta.get("requires_approval", False)
+        if not skip_approval and self._approval_callback is not None and requires_approval:
+            try:
+                approved, modified_args, reason = self._approval_callback(name, kwargs)
+                if not approved:
+                    return ToolResult.fail(f"工具 '{name}' 执行被拒绝：{reason or '用户未批准'}")
+                if modified_args is not None:
+                    kwargs = modified_args
+            except Exception as e:
+                logger.exception("审批回调执行失败: %s", e)
+                return ToolResult.fail(f"工具 '{name}' 审批流程异常：{e}")
+
+        # ── 超时控制 ──
+        actual_timeout = timeout if timeout is not None else self.default_timeout
+        if actual_timeout is not None and actual_timeout > 0:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(tool.invoke, **kwargs)
+                try:
+                    result = future.result(timeout=actual_timeout)
+                except concurrent.futures.TimeoutError:
+                    result = ToolResult.fail(f"工具 '{name}' 执行超时（> {actual_timeout}s）")
+        else:
+            result = tool.invoke(**kwargs)
+
         for hook in self._hooks:
             try:
                 hook(name, kwargs, result)
             except Exception as e:
                 logger.exception("工具 hook 失败: %s", e)
         return result
+
+    # ── 并发工具执行 ──────────────────────────────────────────
+
+    def invoke_tools_concurrent(
+        self,
+        calls: List[Tuple[str, Union[str, Dict[str, Any], None]]],
+        *,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, ToolResult]:
+        """并发执行多个无依赖工具，总耗时取最大值。
+
+        Args:
+            calls: [(name, tool_input), ...] 列表
+            timeout: 整体超时，None 用注册表默认值
+
+        Returns:
+            {name: ToolResult} 字典，顺序与 calls 无关
+        """
+        if not calls:
+            return {}
+        actual_timeout = timeout if timeout is not None else self.default_timeout
+        results: Dict[str, ToolResult] = {}
+
+        def _run_one(name: str, inp):
+            return name, self.invoke_tool(name, inp, skip_approval=False)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(self.max_workers, len(calls))) as executor:
+            futures = {executor.submit(_run_one, name, inp): name for name, inp in calls}
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=actual_timeout):
+                    try:
+                        n, r = future.result()
+                        results[n] = r
+                    except Exception as e:
+                        n = futures[future]
+                        results[n] = ToolResult.fail(f"工具 '{n}' 并发执行失败：{e}")
+            except concurrent.futures.TimeoutError:
+                for future in futures:
+                    n = futures[future]
+                    if n not in results:
+                        future.cancel()
+                        results[n] = ToolResult.fail(f"工具 '{n}' 执行超时（整体超时 {actual_timeout}s）")
+        return results
 
     # ── Schema 导出（多 provider）────────────────────────────
 
@@ -123,6 +215,7 @@ class ToolRegistry:
 
     def clear(self) -> None:
         self._tools.clear()
+        self._hooks.clear()
 
     def __len__(self) -> int:
         return len(self._tools)

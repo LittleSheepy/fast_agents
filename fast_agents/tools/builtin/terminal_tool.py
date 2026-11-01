@@ -83,6 +83,7 @@ class TerminalTool(ToolBase):
     description = (
         "执行Windows shell命令查看文件与目录。默认支持只读命令（dir, type, findstr, where, tree等）。"
         "工作目录被限制在指定沙箱内，无法访问上级，自动防止命令注入。"
+        "若开启 allow_exec=True 支持执行 python/node/git 等命令，会触发人工审批。"
     )
     args_schema = TerminalInput
     tags = ["builtin", "filesystem"]
@@ -90,10 +91,12 @@ class TerminalTool(ToolBase):
     def __init__(self, workspace: str = ".", timeout: int = 30, max_output_chars: int = 20_000,
                  allow_exec: bool = False, allow_cd: bool = True, allowed_commands: Optional[Set[str]] = None):
         super().__init__(max_output_chars=max_output_chars)
+        self.metadata["requires_approval"] = allow_exec  # 开启执行权限时才要求审批
         self.workspace = Path(workspace).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
         self.allow_cd = allow_cd
+        self.allow_exec = allow_exec
         self._cwd = self.workspace
         self.allowed_commands: Set[str] = _build_allowed_commands(
             allow_exec=allow_exec, allowed_commands=allowed_commands

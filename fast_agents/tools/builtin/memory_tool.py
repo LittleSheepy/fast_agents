@@ -6,7 +6,8 @@
 - forget_memory:  撤回一条记忆（软删除，保留 audit trail）
 
 使用方式：
-    from fast_agents.memory import MemoryManager, build_memory_tools
+    from fast_agents.memory import MemoryManager
+    from fast_agents.tools.builtin import build_memory_tools
     mem = MemoryManager(llm=llm)
     for t in build_memory_tools(mem):
         agent.add_tool(t)
