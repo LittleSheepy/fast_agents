@@ -324,6 +324,7 @@ class WriteInput(BaseModel):
     path: str = Field(description="要写入的文件路径（相对于工作目录）")
     content: str = Field(description="要写入的完整文件内容")
     overwrite: bool = Field(default=True, description="文件已存在时是否允许覆盖；False 且文件存在则报错")
+    append: bool = Field(default=False, description="是否以追加模式写入（追加到文件末尾，不覆盖原内容）")
     expected_hash: Optional[str] = Field(default=None, description="乐观锁：期望的文件 hash（来自上次读取的 artifact.content_hash）")
     expected_size: Optional[int] = Field(default=None, ge=0, description="乐观锁：期望的文件字节数")
     expected_mtime: Optional[float] = Field(default=None, description="乐观锁：期望的文件修改时间戳")
@@ -349,12 +350,14 @@ class WriteTool(ToolBase):
 
     name = "write_file"
     description = (
-        "向工作目录内写入文件（覆盖创建或新建）。支持乐观锁冲突检测：传入"
+        "向工作目录内写入文件（覆盖/创建/追加）。支持乐观锁冲突检测：传入"
         " expected_hash 后，若文件被别人改过会拒绝写入，避免覆盖他人修改。"
-        "写入采用临时文件 + 原子替换，进程崩溃也不会留下半写文件。"
+        " append=True 可在文件末尾追加内容；写入采用临时文件 + 原子替换，"
+        "进程崩溃也不会留下半写文件。"
     )
     args_schema = WriteInput
     tags = ["builtin", "filesystem"]
+    metadata = {"requires_approval": True}
 
     def __init__(self, workspace: str = ".", read_tool: Optional[ReadTool] = None):
         super().__init__()
@@ -370,7 +373,7 @@ class WriteTool(ToolBase):
             return ToolResult.fail(f"不允许访问工作目录外的路径: {target}"), target, rel
         return None, target, rel
 
-    def run(self, path: str, content: str, overwrite: bool = True,
+    def run(self, path: str, content: str, overwrite: bool = True, append: bool = False,
             expected_hash: Optional[str] = None, expected_size: Optional[int] = None,
             expected_mtime: Optional[float] = None, backup: bool = False,
             encoding: str = "utf-8") -> Union[str, ToolResult]:
@@ -382,18 +385,34 @@ class WriteTool(ToolBase):
         if target.exists() and target.is_dir():
             return ToolResult.fail(f"{path} 是目录，无法写入文件")
 
-        # 乐观锁校验（含 overwrite 语义）
+        if append and overwrite:
+            overwrite = False  # append模式不允许覆盖
+
+        # 乐观锁校验（含 overwrite/append 语义）
+        original_content = ""
+        backup_note = ""
         if target.exists():
-            if not overwrite and not (expected_hash or expected_size is not None or expected_mtime is not None):
-                return ToolResult.fail(f"文件 {path} 已存在且 overwrite=False，拒绝覆盖")
-            lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size, encoding=encoding)
-            if lock_err is not None:
-                return lock_err
-            if backup:
-                backup_path = _make_backup(target)
-                backup_note = f"，原文件已备份到 {Path(backup_path).name}" if backup_path else ""
+            if append:
+                # 追加模式：读原内容拼接
+                try:
+                    original_bytes = target.read_bytes()
+                    original_content = _normalize_newlines(original_bytes.decode(encoding, errors="replace"))
+                    if not original_content.endswith("\n"):
+                        original_content += "\n"
+                except Exception as e:
+                    return ToolResult.fail(f"追加模式读取原文件失败：{e}")
+                if backup:
+                    backup_path = _make_backup(target)
+                    backup_note = f"，原文件已备份到 {Path(backup_path).name}" if backup_path else ""
             else:
-                backup_note = ""
+                if not overwrite and not (expected_hash or expected_size is not None or expected_mtime is not None):
+                    return ToolResult.fail(f"文件 {path} 已存在且 overwrite=False，拒绝覆盖")
+                lock_err, current = _check_lock(target, rel, expected_hash, expected_mtime, expected_size, encoding=encoding)
+                if lock_err is not None:
+                    return lock_err
+                if backup:
+                    backup_path = _make_backup(target)
+                    backup_note = f"，原文件已备份到 {Path(backup_path).name}" if backup_path else ""
         else:
             # 文件不存在：expected_* 必须都为空（表示「期望它不存在」）
             if expected_hash or expected_size is not None or expected_mtime is not None:
@@ -403,8 +422,9 @@ class WriteTool(ToolBase):
                 )
             backup_note = ""
 
+        final_content = original_content + content if append else content
         try:
-            _atomic_write(target, content, encoding=encoding)
+            _atomic_write(target, final_content, encoding=encoding)
         except Exception as e:
             return ToolResult.fail(f"写入失败：{e}")
 
@@ -413,27 +433,11 @@ class WriteTool(ToolBase):
             self._read_tool.invalidate(rel)
 
         new_meta = _stat_file(target, rel, read_content=True, encoding=encoding)
-        action = "覆盖写入" if (target.exists() and backup_note == "" and new_meta.size > 0 and
-                              expected_hash is not None) else ("创建" if not backup_note and "备份" not in backup_note else "覆盖写入")
-        if backup_note:
-            action = "覆盖写入"
-        elif not target.exists():
-            pass
+        if append:
+            action_word = "追加写入"
         else:
-            # 重新判断：备份与否都属于覆盖或创建
-            if not content:
-                # 空写入仍可能是覆盖
-                pass
-        # 上面那堆判断太绕，直接用存在性 + 之前状态：
-        existed_before = backup_note != "" or (expected_hash is not None) or (expected_size is not None) or (expected_mtime is not None) or (target.exists() and overwrite)
-        action_word = "覆盖写入" if existed_before else "创建"
-        # 注意：上面的判断在新建分支走不到这里，所以这里统一用更简单的口径：
-        # 若之前已存在 → 覆盖；否则 → 创建。用 backup_note 作为已存在的可靠信号，
-        # 再补一个 expected_hash 存在即说明之前读过（即文件存在）。
-        existed_before = bool(backup_note) or bool(expected_hash) or expected_size is not None or expected_mtime is not None
-        # 再补：文件现在 size 与第一次 stat 已无法区分（已写入），因此无法从目标本身判断，
-        # 但 overwrite=False 且走到这里的分支一定是新建——overwrite=True 我们就统一表述为「写入」。
-        action_word = "覆盖写入" if existed_before else ("创建" if not overwrite else "写入")
+            existed_before = bool(backup_note) or bool(expected_hash) or expected_size is not None or expected_mtime is not None or (target.exists() and not append)
+            action_word = "覆盖写入" if existed_before else ("创建" if not overwrite else "写入")
 
         return ToolResult.ok(
             f"✅ {action_word}成功：{path}（{new_meta.size} 字节，{new_meta.line_count} 行{backup_note}）\n"
@@ -491,6 +495,7 @@ class EditTool(ToolBase):
     )
     args_schema = EditInput
     tags = ["builtin", "filesystem"]
+    metadata = {"requires_approval": True}
 
     def __init__(self, workspace: str = ".", read_tool: Optional[ReadTool] = None):
         super().__init__()
@@ -685,6 +690,7 @@ class MultiEditTool(ToolBase):
     )
     args_schema = MultiEditInput
     tags = ["builtin", "filesystem"]
+    metadata = {"requires_approval": True}
 
     def __init__(self, workspace: str = ".", read_tool: Optional[ReadTool] = None):
         super().__init__()
