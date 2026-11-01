@@ -230,7 +230,7 @@ fast_agents/
 │   ├── memory/                   # ④ 记忆系统
 │   │   ├── __init__.py
 │   │   ├── schema.py             #    MemoryRecord / ContextPacket / MemoryKind
-│   │   ├── base.py               #    MemoryStore 抽象接口
+│   │   ├── memory_store_base.py               #    MemoryStoreBase 抽象接口
 │   │   ├── scoring.py            #    词法打分 + 时间衰减
 │   │   ├── buffer.py             #    BufferMemory：短期窗口 + 滚动摘要
 │   │   ├── in_memory_store.py    #    InMemoryStore：纯内存长期记忆
@@ -604,7 +604,7 @@ buf.get_messages() / buf.get_summary() / buf.to_openai_messages() / buf.clear()
 
 > 超窗时溢出的消息会**滚动压成一句摘要**（摘要 = 旧摘要 + 溢出消息 一起压）。没有 `llm` 时降级为直接截断。
 
-#### 长期：`MemoryStore`
+#### 长期：`MemoryStoreBase`
 
 两个实现，接口完全一致：
 

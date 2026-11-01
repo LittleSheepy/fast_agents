@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 import json
 
 from ..messages.message import Message
-from .base import MemoryStore
+from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory, DEFAULT_SUMMARY_PROMPT
 from .in_memory_store import InMemoryStore
 from .schema import ContextPacket, MemoryKind, MemoryRecord
@@ -53,7 +53,7 @@ class MemoryManager:
     def __init__(
         self,
         *,
-        long_term_store: Optional[MemoryStore] = None,
+        long_term_store: Optional[MemoryStoreBase] = None,
         max_messages: int = 20,
         enable_summary: bool = True,
         llm=None,
@@ -77,7 +77,7 @@ class MemoryManager:
         self.auto_extract = auto_extract
         self.extract_prompt = extract_prompt or DEFAULT_EXTRACT_PROMPT
 
-        self.long_term: MemoryStore = long_term_store or InMemoryStore()
+        self.long_term: MemoryStoreBase = long_term_store or InMemoryStore()
         self.buffer = BufferMemory(
             max_messages=max_messages, enable_summary=enable_summary, llm=llm
         )

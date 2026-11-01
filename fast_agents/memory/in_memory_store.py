@@ -6,12 +6,12 @@
 
 from typing import List, Optional
 
-from .base import MemoryStore
+from .memory_store_base import MemoryStoreBase
 from .schema import MemoryRecord
 from .scoring import lexical_score
 
 
-class InMemoryStore(MemoryStore):
+class InMemoryStore(MemoryStoreBase):
     """纯内存存储，进程退出即丢失"""
 
     def __init__(self):

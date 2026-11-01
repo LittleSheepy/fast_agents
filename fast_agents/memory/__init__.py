@@ -1,6 +1,6 @@
 """记忆模块"""
 
-from .base import MemoryStore
+from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory
 from .in_memory_store import InMemoryStore
 from .manager import MemoryManager
@@ -10,7 +10,7 @@ from .sqlite_store import SQLiteMemoryStore
 
 __all__ = [
     "MemoryRecord", "MemoryKind", "MemoryStatus", "ContextPacket",
-    "MemoryStore", "InMemoryStore", "SQLiteMemoryStore",
+    "MemoryStoreBase", "InMemoryStore", "SQLiteMemoryStore",
     "BufferMemory", "MemoryManager",
     "lexical_terms", "lexical_score", "time_decay", "combined_score",
 ]

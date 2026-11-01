@@ -17,12 +17,12 @@ from pathlib import Path
 from typing import Iterator, List, Optional
 from contextlib import contextmanager
 
-from .base import MemoryStore
+from .memory_store_base import MemoryStoreBase
 from .schema import MemoryRecord
 from .scoring import combined_score, lexical_score
 
 
-class SQLiteMemoryStore(MemoryStore):
+class SQLiteMemoryStore(MemoryStoreBase):
     """按 user_id + session_id 隔离的持久化记忆"""
 
     def __init__(

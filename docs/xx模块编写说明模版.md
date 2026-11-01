@@ -242,7 +242,7 @@ class [类名](BaseModel):
 
 1. **命名对齐既有约定**并显式提醒：例如 tools 的 `args_schema`（不是 `param_model`）、`to_openai_tool()`（不是 `build_...`）、`invoke() -> ToolResult`；新增字段前先搜一遍仓库里同类字段叫什么；
 2. 用「为什么需要这个中间模型」这类问题引出设计意图（如记忆模块的 `ContextPacket` 为何存在）；
-3. 抽象基类（`ToolBase` / `MemoryStore` / `Transport`）单独列，标出子类必须实现的方法。
+3. 抽象基类（`ToolBase` / `MemoryStoreBase` / `Transport`）单独列，标出子类必须实现的方法。
 
 ---
 
