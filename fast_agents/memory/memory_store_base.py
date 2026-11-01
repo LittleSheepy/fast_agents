@@ -5,6 +5,11 @@
 - 落盘可以有多种实现（纯 Python 文件 / SQLite / 向量库），
   只要实现同一个接口，MemoryManager 就不用改。
 这和你 tools 模块里 ToolRegistry 统一管理 ToolBase 的思路是一样的。
+
+设计约定：
+- add / get / all / update / delete / clear 是原子原语（必须由子类实现）；
+- search 默认通过 all() + scoring.rank_records 实现，子类无需重复写打分逻辑；
+- revise / retract 是高层组合操作，已有默认实现，子类按需覆盖。
 """
 
 from abc import ABC, abstractmethod
@@ -12,6 +17,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from .schema import MemoryRecord
+from .scoring import rank_records
 
 
 class MemoryStoreBase(ABC):
@@ -30,10 +36,6 @@ class MemoryStoreBase(ABC):
         """读取全部记录（按更新时间倒序）"""
 
     @abstractmethod
-    def search(self, query: str, limit: int = 5, *, include_preferences: bool = True) -> List[MemoryRecord]:
-        """按查询返回相关记忆；query 为空时返回最近的记录"""
-
-    @abstractmethod
     def update(self, record: MemoryRecord) -> MemoryRecord:
         """更新一条已有记忆（按 memory_id 覆盖）"""
 
@@ -45,9 +47,18 @@ class MemoryStoreBase(ABC):
     def clear(self) -> None:
         """清空当前作用域的全部记忆"""
 
-    # ---------- 以下两个是带默认实现的高级操作 ----------
-    # 所有后端都支持「修订」和「撤回」，语义与 SQLite 版一致：
-    # revise = 旧记录标记 superseded + 追加新记录；retract = 只改状态保留历史。
+    # ---------- 以下是带默认实现的高级操作 ----------
+    # 规则统一：能用 add/get/all/update/delete/clear 组合出来的操作都在这里写默认实现，
+    # 子类不需要重复造轮子；有更高效实现（例如 SQL 侧排序）时再 override。
+
+    def search(self, query: str, limit: int = 5, *, include_preferences: bool = True) -> List[MemoryRecord]:
+        """按查询返回相关记忆；query 为空时返回最近的记录
+
+        v1.3.0（B7）起默认实现在 Base：通过 all() 拉回记录，再用
+        scoring.rank_records 走统一打分公式与排序。子类若要做数据库侧
+        排序 / 向量检索 / 索引过滤，可直接覆盖本方法。
+        """
+        return rank_records(query, self.all(), limit, include_preferences=include_preferences)
 
     def revise(self, memory_id: str, content: str, source: str) -> MemoryRecord:
         """修订一条记忆，保留旧版本作为历史"""
