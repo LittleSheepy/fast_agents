@@ -12,7 +12,9 @@
 import re
 import math
 from datetime import datetime
-from typing import List
+from typing import Iterable, List, Optional
+
+from .schema import MemoryRecord
 
 # 中文按字也算词，所以用「英文词 + 单字」混合切分
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]")
@@ -70,3 +72,76 @@ def combined_score(query: str, content: str, importance: float, updated_at: date
         + importance * importance_weight
         + recency * recency_weight
     )
+
+
+# ---------- 供 MemoryStoreBase.search() 默认实现复用的统一打分与排序 ----------
+
+_PREF_RELEVANCE_FLOOR = 0.3  # 偏好类记忆的「角色权重保底」：哪怕词法零命中，
+#                              也给一个基础相关度，保证用户偏好能常驻召回。
+
+
+def score_record(query: str, record: MemoryRecord) -> float:
+    """对单条 MemoryRecord 计算统一得分（v1.3.0 / B7）
+
+    三类权重：
+    - 词法相关度 × 0.6（必须命中至少一个查询词才入候选，偏好类例外——
+      相关度低于 _PREF_RELEVANCE_FLOOR 时抬到保底值，等价于"角色权重"）；
+    - 重要性 × 0.3；
+    - 新鲜度（30 天半衰期）× 0.1；
+    偏好类与非偏好类共用同一套公式，不再有两套独立权重。
+    """
+    relevance = lexical_score(query, record.content)
+    if record.kind == "preference" and relevance < _PREF_RELEVANCE_FLOOR:
+        relevance = _PREF_RELEVANCE_FLOOR
+    recency = time_decay(record.updated_at)
+    return relevance * 0.6 + record.importance * 0.3 + recency * 0.1
+
+
+def rank_records(
+    query: str,
+    records: Iterable[MemoryRecord],
+    limit: int = 5,
+    *,
+    include_preferences: bool = True,
+) -> List[MemoryRecord]:
+    """统一的「打分 → 过滤 → 排序 → 截断」流程
+
+    供 MemoryStoreBase.search() 默认实现直接调用；
+    所有后端共享同一套公式与 tie-breaker（-score → -importance → -updated_at），
+    保证同一批记忆、同一 query 在任意后端上召回顺序一致。
+    """
+    if not isinstance(query, str):
+        raise ValueError("query 必须是字符串")
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError("limit 必须是正整数")
+
+    rec_list = list(records)
+
+    # 空查询：按最近更新（→ 重要性兜底）截断
+    if not query.strip():
+        sorted_all = sorted(
+            rec_list,
+            key=lambda r: (r.updated_at, r.importance),
+            reverse=True,
+        )
+        return sorted_all[:limit]
+
+    scored: list[tuple[float, MemoryRecord]] = []
+    for r in rec_list:
+        is_pref = r.kind == "preference"
+        rel = lexical_score(query, r.content)
+
+        if is_pref:
+            if not include_preferences:
+                continue
+            # 偏好类：保底相关度，始终入候选
+            score = score_record(query, r)
+            scored.append((score, r))
+        else:
+            # 普通记忆：至少命中一个查询词才入候选
+            if rel > 0:
+                score = score_record(query, r)
+                scored.append((score, r))
+
+    scored.sort(key=lambda x: (-x[0], -x[1].importance, -x[1].updated_at.timestamp()))
+    return [r for _, r in scored[:limit]]

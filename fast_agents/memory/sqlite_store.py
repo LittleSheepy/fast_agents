@@ -8,6 +8,10 @@
 3. 显式删除：retract 只改状态保留历史，delete 才真删。
 
 只用标准库 sqlite3，不引入 SQLAlchemy，保持和你现有 requirements 一致的轻量风格。
+
+search 不在此处实现，由 MemoryStoreBase 通过 all() + scoring.rank_records
+提供默认实现，保证与 InMemoryStore 打分口径一致（B7）。后续若要做 SQL 侧
+预过滤 / 全文索引 / FTS5 向量召回，可直接 override search()。
 """
 
 import json
@@ -19,7 +23,6 @@ from contextlib import contextmanager
 
 from .memory_store_base import MemoryStoreBase
 from .schema import MemoryRecord
-from .scoring import combined_score, lexical_score
 
 
 class SQLiteMemoryStore(MemoryStoreBase):
@@ -152,31 +155,10 @@ class SQLiteMemoryStore(MemoryStoreBase):
     ) -> List[MemoryRecord]:
         """按综合得分排序返回有效记忆；空查询返回最近记录
 
-        include_preferences=True 时，偏好类（preference）记忆无条件进入候选，
-        因为「用户偏好」这类信息几乎对所有问题都相关，不该被词法重叠卡掉。
-        这也是很多商业产品的做法：偏好常驻上下文，事实/情景按需召回。
+        v1.3.0（B7）起默认由 MemoryStoreBase 通过 rank_records 实现，
+        这里保留方法 docstring 作为 SQLite 版的语义说明，直接委托父类。
         """
-        if not isinstance(query, str):
-            raise ValueError("query 必须是字符串")
-        if not isinstance(limit, int) or limit < 1:
-            raise ValueError("limit 必须是正整数")
-
-        records = self.all()
-        if not query.strip():
-            return records[:limit]
-
-        scored = []
-        for r in records:
-            if r.kind == "preference" and include_preferences:
-                # 偏好类：即使字面不相关也给一个基础分，靠重要性排序
-                base = r.importance * 0.5 + lexical_score(query, r.content) * 0.5
-                scored.append((base, r))
-                continue
-            if lexical_score(query, r.content) > 0:
-                s = combined_score(query, r.content, r.importance, r.updated_at)
-                scored.append((s, r))
-        scored.sort(key=lambda x: (-x[0], -x[1].importance))
-        return [r for _, r in scored[:limit]]
+        return super().search(query, limit, include_preferences=include_preferences)
 
     def update(self, record: MemoryRecord) -> MemoryRecord:
         if self.get(record.memory_id) is None:
