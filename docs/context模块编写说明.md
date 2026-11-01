@@ -32,6 +32,7 @@
 
 | 版本 | 日期 | 变更 | 作者 |
 |------|------|------|------|
+| 1.2.0 | 2026-11-01 | **演进路线同步**：§十二 演进路线第 4 条从「依赖 B2/llm.embed() 待做」更新为「B2/I1 均已交付，下一步是把语义召回接到 ContextBuilder 并配合 A7 RAGTool」；其余章节与 7 文件源码保持一致（16/16 测试全过） | — |
 | 1.1.0 | 2026-10-29 | 同步最新代码：读文件工具 `ReadFileTool` 已随 `read_file_tool.py` 删除而更名 `ReadTool`（`tools/builtin/file_tool.py`），文档与示例同步更正；确认 `test_context.py` 16/16、`examples/context/context_react_agent_demo.py` 全部跑通 | — |
 | 1.0.0 | 2026-10-27 | 首次编写，逐行对齐 `fast_agents/context/` 真实实现；按《XX 模块编写说明》模版 v2.0 重排章节（开篇 → 一～十三 → 附录） | — |
 
@@ -1414,7 +1415,7 @@ $ python examples\context\context_react_agent_demo.py
 1. **[F4] 压缩中间件化** —— 现在三级策略是 `ContextCompressor` 的方法调用，可开关但不能插拔。目标是抽成与 `skills` 的 `SkillMiddleware` 同构的中间件接口（`before_build` / `after_build`），让「专用摘要器」「按主题裁剪器」都能挂上来。**现在不做的原因**：单模块内部调用已够用，抽中间件要先在多个 Agent 上验证接口稳定性；
 2. **[F5] Prompt caching 断点显式化** —— 顺序已就位（静态在前），但没打 `cache_control`。落点很小：给 `ContextLayer` 加 `cache_breakpoint: bool`，`flatten()` 时对该层最后一条消息打标即可，**不需要动压缩和裁剪逻辑**。现在不做是因为 OpenAI 侧缓存是自动的，只有接 Anthropic 才需要显式断点；
 3. **[F1+] 精确 tokenizer 接入** —— 现在是「tiktoken → 通用编码 → 启发式」三级降级，估算有 ±15% 误差。可增加 provider 级精确计数（如 Anthropic 官方计数接口）作为最高优先级的一级；
-4. **[B2] 语义召回层** —— 目前 memory 层只注入「长期记忆 + 会话摘要」，没有向量召回。`ContextPacket.metadata` 已留扩展位。依赖路线图 B2（语义检索）与 `llm.embed()`；
+4. **[B4+A7] 语义召回层与 RAG 工具接入** —— 目前 memory 层只注入「长期记忆 + 会话摘要」，没有向量召回。`ContextPacket.metadata` 已留扩展位。B2 语义检索包装器（v1.4.0 / 2026-11-01）与 `llm.embed_query/embed_documents`（v2.4.0 / 2026-10-29）已交付，语义召回的前置链路已打通，下一步是在 `ContextBuilder` 里开一个可选的 embedding 召回槽位，并配合 A7 `RAGTool` 把本地文档切片结果接入 L4（files）层；
 5. **[F2+] 流式截断** —— 现在卸载发生在「工具结果已完整返回」之后，对**流式输出过程中**的超长内容无能为力。可加一个「边流边算 token、超阈值即截断」的中间层；
 6. **[F2+] 卸载文件的生命周期管理** —— 现在只有 `max_files` 数量的粗粒度淘汰，没有按时间 / 按会话的清理。长跑服务需要「会话结束时清掉本会话的卸载文件」；
 7. **[B7] 双通道注入** —— 记忆层目前是「检索到就注入」。可改为「命中的注入正文、没命中的只注入标题」，进一步压 token；

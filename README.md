@@ -540,7 +540,7 @@ result.text / result.artifact / result.error
 | `ctx` | `Optional[ContextBuilder]` | `None` | 上下文构建器（`enable_context=True` 不传则自动创建） |
 | `enable_context` | `bool` | `False` | `True` 则每轮按 token 预算拼装上下文、超长工具结果落盘 |
 | `context_budget` | `Optional[int]` | `None` | 覆盖 `ctx` 自带的 token 预算 |
-| `context_offload_threshold` | `Optional[int]` | `None` | 工具结果卸载的字符数阈值 |
+| `context_offload_threshold` | `int` | `4_000` | 工具结果卸载的字符数阈值（单条工具输出超过该字符数即自动落盘，仅保留引用） |
 
 ```python
 agent = ReActAgent(
@@ -1114,15 +1114,15 @@ python test\test_mcp.py
 
 | 模块 | 状态 | 下一步重点 |
 |------|------|-----------|
-| 🔧 **tools** | ✅ 已实现 | 统一返回协议细化、RAG 工具、工具结果截断策略 |
-| 🧩 **skill** | ✅ 已实现 | 技能市场 / 技能依赖 / 技能版本管理 |
-| 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输、`resources` / `prompts`、图片透传 |
-| 🧠 **memory** | ✅ 已实现 | `SessionStore` 短期落盘、语义检索（embedding）、用户画像 |
+| 🔧 **tools** | ✅ 已实现 | RAG 工具（A7，I1/B2 已就位）、Tavily 生产级搜索默认化、成本权限审计、工具组合 pipeline |
+| 🧩 **skill** | ✅ 已实现 | 技能市场 / 技能依赖 / 技能版本管理、脚本沙箱、默认扫描路径统一 |
+| 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输、`resources` / `prompts`、图片透传、stderr 消费 |
+| 🧠 **memory** | ✅ 已实现 | 用户画像（ProfileStore）、双通道注入、记忆衰减合并、多租户 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
-| 🪟 **context** | ✅ 已实现 | prompt caching 断点、摘要中间件化、embedding 召回扩展位 |
+| 🪟 **context** | ✅ 已实现 | 摘要中间件化（F4）、prompt caching 断点（F5）、embedding 召回扩展位 |
 | 🛠 **infra** | ⏳ 规划中 | `TraceLogger`、评估工具、异步、打包发布 |
 
-**P0 · 先做**（补齐「用得下去」的短板）：`SearchTool` 稳定性 · `llm.embed()` · 工具并行调用 · 工具审批（Human-in-the-loop）
+**当前 P1 重点**：RAG 工具（A7）、用户画像（B3）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）。P0 已全部清零。
 
 ---
 
@@ -1144,7 +1144,7 @@ python test\test_mcp.py
 
 - [Model Context Protocol](https://modelcontextprotocol.io) —— 协议规范（版本 `2024-11-05`）
 
-详细的实现说明（含架构图、逐文件讲解、避坑清单）见 `docs/` 下的四份模块编写说明；
+详细的实现说明（含架构图、逐文件讲解、避坑清单）见 `docs/` 下的六份模块编写说明（工具 / 记忆 / Skill / MCP / context / LLM）；
 面向后续建设的分模块规划见 [`docs/演进路线图.md`](./docs/演进路线图.md)。
 
 ---
