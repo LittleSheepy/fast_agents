@@ -14,6 +14,7 @@
 import os
 import sys
 import tempfile
+import warnings
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,6 +23,7 @@ from fast_agents.memory import (
     InMemoryStore,
     MemoryManager,
     MemoryRecord,
+    SemanticMemoryStore,
     SQLiteMemoryStore,
     lexical_score,
 )
@@ -219,6 +221,151 @@ def test_scoring():
     print("✅ test_scoring 通过")
 
 
+# ===================== B2 / v1.4.0：SemanticMemoryStore =====================
+
+class _SemanticFakeLLM:
+    """按「词项类别」做 one-hot-ish 向量的假 LLM，离线可跑
+
+    位置 0: 地点类词（上海/北京/住/所在/位置/在哪/地）
+    位置 1: 工作类词（工作/上班/公司）
+    位置 2: 爱好类词（吃/辣/口味/喜欢/爱）
+    """
+    embedding_model = "fake-semantic"
+
+    def _vec(self, text: str):
+        v = [0.0, 0.0, 0.0]
+        if any(w in text for w in ("上海", "北京", "住", "所在", "位置", "在哪", "地")):
+            v[0] = 1.0
+        if any(w in text for w in ("工作", "上班", "公司")):
+            v[1] = 1.0
+        if any(w in text for w in ("吃", "辣", "口味", "喜欢", "爱")):
+            v[2] = 1.0
+        return v
+
+    def embed_query(self, q: str):
+        return self._vec(q)
+
+    def embed_documents(self, texts):
+        return [self._vec(t) for t in texts]
+
+
+def test_semantic_synonym_recall():
+    """B2 核心验收：同义改写 query 能召回（纯词法召不回的场景）
+
+    「用户所在地」词法上不含「上海」「工作」，纯 InMemory 召不回事实记录；
+    但 SemanticMemoryStore 走 embedding 后，「所在/地」和「上海/住」语义同簇，应当召回。
+    """
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.db")
+
+        # 对照：纯词法后端召不回
+        plain = SQLiteMemoryStore(db, user_id="u1")
+        plain.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
+                               source="t", kind="fact", importance=0.7))
+        plain.add(MemoryRecord(user_id="u1", session_id="s", content="我爱吃辣",
+                               source="t", kind="preference", importance=0.8))
+        lex_only = plain.search("用户所在地", limit=5)
+        # 词法零命中的 fact 被过滤掉，只留下保底的 preference
+        assert not any("上海" in r.content for r in lex_only), \
+            "前置条件不成立：纯词法竟然召回了上海（测试用例失效）"
+
+        # 语义后端：同一条记录能被同义改写召回
+        store = SemanticMemoryStore(SQLiteMemoryStore(db, user_id="u1"), _SemanticFakeLLM())
+        res = store.search("用户所在地", limit=5)
+        assert any("上海" in r.content for r in res), \
+            "B2 验收失败：同义改写 query 未召回对应事实"
+
+        # InMemory 包装器也同样成立
+        inner_mem = InMemoryStore()
+        store_mem = SemanticMemoryStore(inner_mem, _SemanticFakeLLM())
+        store_mem.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
+                                   source="t", kind="fact", importance=0.7))
+        store_mem.add(MemoryRecord(user_id="u1", session_id="s", content="我爱吃辣",
+                                   source="t", kind="preference", importance=0.8))
+        res_mem = store_mem.search("用户所在地", limit=5)
+        assert any("上海" in r.content for r in res_mem)
+
+    print("✅ test_semantic_synonym_recall 通过（B2 同义改写召回）")
+
+
+def test_semantic_graceful_degrade():
+    """B2：embedding 调用失败时必须降级，不抛异常、记忆照常写入/检索"""
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.db")
+
+        # 场景 A：embed_query 失败 → 整次 search 退化为纯词法
+        class _BombQuery(_SemanticFakeLLM):
+            def embed_query(self, q):
+                raise RuntimeError("模拟网络故障")
+        s_a = SemanticMemoryStore(SQLiteMemoryStore(db, user_id="u1"), _BombQuery())
+        s_a.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
+                             source="t", kind="fact", importance=0.7))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res_a = s_a.search("上海", limit=5)  # 词法「上海」命中，应能召回
+        assert any("上海" in r.content for r in res_a), "embed_query 失败后纯词法兜底失效"
+
+        # 场景 B：embed_documents 失败 → 写入照常、该条记忆无向量但仍可被词法召回
+        class _BombDoc(_SemanticFakeLLM):
+            def embed_documents(self, texts):
+                raise RuntimeError("模拟 API 限流")
+        s_b = SemanticMemoryStore(SQLiteMemoryStore(db, user_id="u2"), _BombDoc())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            rec = s_b.add(MemoryRecord(user_id="u2", session_id="s", content="我爱吃辣",
+                                       source="t", kind="preference", importance=0.8))
+        assert rec.memory_id  # 写入成功返回了 id
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res_b = s_b.search("口味", limit=5)
+        # 偏好类始终保底，所以至少返回偏好
+        assert any("辣" in r.content for r in res_b)
+
+        # 场景 C：空 query 直接走原后端，不调用 embedding
+        s_c = SemanticMemoryStore(InMemoryStore(), _SemanticFakeLLM())
+        s_c.add(MemoryRecord(user_id="u1", session_id="s", content="一条记忆",
+                             source="t", kind="fact", importance=0.5))
+        res_c = s_c.search("", limit=3)
+        assert len(res_c) == 1
+
+    print("✅ test_semantic_graceful_degrade 通过（B2 降级不炸）")
+
+
+def test_semantic_revise_and_crud():
+    """B2：revise 后新内容的向量跟随生效，delete/clear 同步清理向量"""
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.db")
+        inner = SQLiteMemoryStore(db, user_id="u1")
+        store = SemanticMemoryStore(inner, _SemanticFakeLLM())
+
+        old = store.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
+                                     source="t", kind="fact", importance=0.7))
+        store.add(MemoryRecord(user_id="u1", session_id="s", content="我爱吃辣",
+                               source="t", kind="preference", importance=0.8))
+
+        # revise：把「上海」改为「北京」，新内容应被「现在在哪工作」召回并排第一
+        new = store.revise(old.memory_id, "我在北京工作", source="revise")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = store.search("现在在哪工作", limit=5)
+        assert res[0].content == "我在北京工作", "revise 后新内容未排第一"
+
+        # delete 后对应的向量也清掉（不抛异常、不影响其他记录）
+        assert store.delete(new.memory_id) is True
+        # 打开一个包装同一 inner 的新实例，走懒加载路径——应当不会再看到新记录
+        store2 = SemanticMemoryStore(SQLiteMemoryStore(db, user_id="u1"), _SemanticFakeLLM())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res2 = store2.search("北京", limit=5)
+        assert not any("北京" in r.content for r in res2), "delete 后旧记录仍被召回"
+
+        # clear 清空当前作用域
+        store2.clear()
+        assert store2.all() == []
+
+    print("✅ test_semantic_revise_and_crud 通过（B2 revise/delete/clear 正常）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -231,4 +378,7 @@ if __name__ == "__main__":
     test_memory_tool()
     test_tool_schema()
     test_scoring()
+    test_semantic_synonym_recall()
+    test_semantic_graceful_degrade()
+    test_semantic_revise_and_crud()
     print("\n🎉 全部测试通过")

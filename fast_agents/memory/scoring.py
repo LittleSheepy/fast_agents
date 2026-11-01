@@ -74,14 +74,32 @@ def combined_score(query: str, content: str, importance: float, updated_at: date
     )
 
 
-# ---------- 供 MemoryStoreBase.search() 默认实现复用的统一打分与排序 ----------
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """余弦相似度（纯 Python 实现，不依赖 numpy）
 
-_PREF_RELEVANCE_FLOOR = 0.3  # 偏好类记忆的「角色权重保底」：哪怕词法零命中，
-#                              也给一个基础相关度，保证用户偏好能常驻召回。
+    用于语义检索通道的向量打分。返回值 0~1（负值截断为 0）。
+    长度不一致时按较短长度截断，避免维度错误把流程打断。
+    """
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for i in range(n):
+        ai = a[i]
+        bi = b[i]
+        dot += ai * bi
+        na += ai * ai
+        nb += bi * bi
+    if na <= 0 or nb <= 0:
+        return 0.0
+    sim = dot / (math.sqrt(na) * math.sqrt(nb))
+    return max(0.0, min(1.0, sim))
 
 
-def score_record(query: str, record: MemoryRecord) -> float:
-    """对单条 MemoryRecord 计算统一得分（v1.3.0 / B7）
+def score_record(query: str, record: "MemoryRecord", semantic: Optional[float] = None, *, hybrid_weight: float = 0.7) -> float:
+    """单条记忆MemoryRecord计算统一得分
 
     三类权重：
     - 词法相关度 × 0.6（必须命中至少一个查询词才入候选，偏好类例外——
@@ -89,31 +107,40 @@ def score_record(query: str, record: MemoryRecord) -> float:
     - 重要性 × 0.3；
     - 新鲜度（30 天半衰期）× 0.1；
     偏好类与非偏好类共用同一套公式，不再有两套独立权重。
+    - semantic 为 None 时：退化为纯词法打分（兼容 v1.3.0 行为）；
+    - semantic 传入时：relevance = hybrid_weight * semantic + (1 - hybrid_weight) * lexical，
+      默认 hybrid_weight=0.7，即偏语义（用户确认）；
+    - 偏好类仍走「relevance 保底 _PREF_RELEVANCE_FLOOR」的角色权重逻辑。
     """
-    relevance = lexical_score(query, record.content)
+    from .schema import MemoryRecord  # 局部导入避免循环
+    _PREF_RELEVANCE_FLOOR = 0.3
+    lex = lexical_score(query, record.content)
+    if semantic is None:
+        relevance = lex
+    else:
+        relevance = hybrid_weight * semantic + (1.0 - hybrid_weight) * lex
     if record.kind == "preference" and relevance < _PREF_RELEVANCE_FLOOR:
         relevance = _PREF_RELEVANCE_FLOOR
     recency = time_decay(record.updated_at)
     return relevance * 0.6 + record.importance * 0.3 + recency * 0.1
 
 
-def rank_records(
-    query: str,
-    records: Iterable[MemoryRecord],
-    limit: int = 5,
-    *,
-    include_preferences: bool = True,
-) -> List[MemoryRecord]:
-    """统一的「打分 → 过滤 → 排序 → 截断」流程
+def rank_records(query, records, limit, *, include_preferences=True,
+                 semantic_getter=None, hybrid_weight: float = 0.7,
+                 semantic_floor: float = 0.3) -> List["MemoryRecord"]:
+    """统一打分 / 排序 / 截断流水线（B2/v1.4.0 支持语义通道）
 
-    供 MemoryStoreBase.search() 默认实现直接调用；
-    所有后端共享同一套公式与 tie-breaker（-score → -importance → -updated_at），
-    保证同一批记忆、同一 query 在任意后端上召回顺序一致。
+    semantic_getter: 可选回调 `(MemoryRecord) -> Optional[float]`，
+        返回该条记忆的语义分；返回 None 表示该条无向量（降级为纯词法）。
+    semantic_floor: 非偏好类记忆在「词法=0 且语义分 < 该阈值」时被过滤掉，
+        既没词法命中也没语义相近的不进候选。
+    其余参数与 v1.3.0 一致。
     """
+    from .schema import MemoryRecord
     if not isinstance(query, str):
-        raise ValueError("query 必须是字符串")
-    if not isinstance(limit, int) or limit < 1:
-        raise ValueError("limit 必须是正整数")
+        raise TypeError("query 必须是字符串")
+    if not isinstance(limit, int) or limit <= 0:
+        raise TypeError("limit 必须是正整数")
 
     rec_list = list(records)
 
@@ -128,20 +155,17 @@ def rank_records(
 
     scored: list[tuple[float, MemoryRecord]] = []
     for r in rec_list:
-        is_pref = r.kind == "preference"
-        rel = lexical_score(query, r.content)
+        if not include_preferences and r.kind == "preference":
+            continue
 
-        if is_pref:
-            if not include_preferences:
-                continue
-            # 偏好类：保底相关度，始终入候选
-            score = score_record(query, r)
-            scored.append((score, r))
-        else:
-            # 普通记忆：至少命中一个查询词才入候选
-            if rel > 0:
-                score = score_record(query, r)
-                scored.append((score, r))
+        sem = semantic_getter(r) if semantic_getter is not None else None
+        lex = lexical_score(query, r.content)
+        if r.kind != "preference":
+            eff_sem = sem if sem is not None else 0.0
+            if lex <= 0 and eff_sem < semantic_floor:
+                continue  # 词法零命中 + 语义不够近，丢掉
+        score = score_record(query, r, semantic=sem, hybrid_weight=hybrid_weight)
+        scored.append((score, r))
 
     scored.sort(key=lambda x: (-x[0], -x[1].importance, -x[1].updated_at.timestamp()))
     return [r for _, r in scored[:limit]]
