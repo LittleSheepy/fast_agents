@@ -24,10 +24,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fast_agents.messages.message import Message, MsgToolCall
-from fast_agents.memory import MemoryManager
+from fast_agents.memory import InMemoryProfileStore, MemoryManager
 from fast_agents.tools.tool_registry import ToolRegistry
 from fast_agents.tools.builtin import CalculatorTool
-from fast_agents.agents.react_agent.react_agent import ReActAgent
+from fast_agents.agents.react_agent.react_agent import (
+    ReActAgent, _PROFILE_MARKER, _strip_profile_block,
+)
 
 
 class MockLLM:
@@ -318,6 +320,103 @@ def test_skills_disabled():
     print("✅ test_skills_disabled passed")
 
 
+def test_profile_noop_when_empty_or_unconfigured():
+    """B4 · 双通道注入：未配 profile_store 或画像为空时，system prompt 字节级保持一致（零侵入承诺）"""
+    # 场景 1：memory 用默认构造、未传 profile_store → get_profile() 返回空档案，system 不应该包含画像块
+    llm1 = MockLLM([Message("assistant", "ok")])
+    agent1 = ReActAgent("零配置助手", llm1, memory=MemoryManager(llm=llm1),
+                        enable_skills=False)
+    system_before = _system_messages(agent1)[0].content
+    assert _PROFILE_MARKER.strip() not in system_before, "未配置 profile_store 时 system 不应带画像块"
+
+    agent1.run("你好")
+    # 跑一次后 system 仍不应该出现画像块标记
+    system_after = _system_messages(agent1)[0].content
+    assert _PROFILE_MARKER.strip() not in system_after, "空画像不应追加画像块"
+    # 且和 run 之前比应当相等（无 profile → 无追加）
+    assert system_after == _strip_profile_block(system_before)
+
+    # 场景 2：显式传 InMemoryProfileStore 但不更新任何字段（空档案）→ 也不应追加
+    llm2 = MockLLM([Message("assistant", "ok")])
+    mem2 = MemoryManager(llm=llm2, profile_store=InMemoryProfileStore(), user_id="u1")
+    agent2 = ReActAgent("空档案助手", llm2, memory=mem2, enable_skills=False)
+    agent2.run("hi")
+    assert _PROFILE_MARKER.strip() not in _system_messages(agent2)[0].content
+    print("✅ test_profile_noop_when_empty_or_unconfigured passed（B4 零配置字节级一致）")
+
+
+def test_profile_injected_into_system_tail_non_context_path():
+    """B4 · 双通道注入（enable_context=False 路径）：画像追加到 system 末尾；跨 run 不叠加；改画像后下次 run 生效"""
+    llm = MockLLM([Message("assistant", "你好张三"),
+                   Message("assistant", "你好张三丰")])
+    mem = MemoryManager(llm=llm, profile_store=InMemoryProfileStore(), user_id="u1")
+    mem.update_profile({"name": "张三", "location": "上海"})
+
+    agent = ReActAgent("画像助手", llm, memory=mem, enable_skills=False, enable_context=False)
+    # 构造后还没 run：system 不应包含画像（refresh_system_prompt 不拼画像）
+    assert _PROFILE_MARKER.strip() not in _system_messages(agent)[0].content
+
+    # 第一次 run
+    agent.run("你好")
+    sys1 = _system_messages(agent)[0].content
+    assert _PROFILE_MARKER in sys1, "非 context 路径应把画像追加到 system 末尾"
+    assert "张三" in sys1 and "上海" in sys1
+    assert sys1.count(_PROFILE_MARKER) == 1, "画像块不应被重复叠加"
+
+    # 第二次 run：先改画像再跑，旧块会被剥离、新块追加
+    mem.update_profile({"name": "张三丰"})
+    agent.run("你好")
+    sys2 = _system_messages(agent)[0].content
+    assert _PROFILE_MARKER in sys2 and sys2.count(_PROFILE_MARKER) == 1
+    assert "张三丰" in sys2
+    # 旧名字已经被覆盖（不是在旧块后又叠一块）
+    assert "张三" in sys2  # 张三丰里包含"张三"子串；用"你好张三"整段检查更稳
+    # 更严谨的断言：旧块开头「姓名：张三」整行不应单独存在
+    assert "- 姓名：张三\n" not in sys2, "旧画像块未被剥离，导致跨 run 叠加"
+    assert "- 姓名：张三丰" in sys2
+    print("✅ test_profile_injected_into_system_tail_non_context_path passed（B4 非 context 路径）")
+
+
+def test_profile_injected_via_system_tail_in_context_path():
+    """B4 · 双通道注入（enable_context=True 路径）：画像走 ctx.build(system_tail=...) 拼到 L1 system 末尾，
+    不出现在 memory 层 / user 层；且跨 run 不叠加。"""
+    # 两步 LLM：第一步无工具（走最短路径），第二次再调用也是为了验证跨 run 不叠加
+    llm = MockLLM([Message("assistant", "ok"),
+                   Message("assistant", "ok2")])
+    mem = MemoryManager(llm=llm, profile_store=InMemoryProfileStore(), user_id="u1")
+    mem.set_profile_field("name", "李四")
+    mem.set_profile_field("preferences.语言", "中文")
+
+    agent = ReActAgent("ctx+画像助手", llm, memory=mem,
+                       enable_skills=False, enable_context=True)
+    agent.run("hello")
+
+    # 走了 context 路径后，self.messages 里的 system 应该包含画像
+    sys_msgs = _system_messages(agent)
+    assert len(sys_msgs) == 1
+    sys_content = sys_msgs[0].content
+    assert _PROFILE_MARKER in sys_content, "context 路径应通过 system_tail 把画像拼到 L1 system 末尾"
+    assert "李四" in sys_content and "中文" in sys_content
+    assert sys_content.count(_PROFILE_MARKER) == 1
+
+    # 真正发给 LLM 的 messages：只有第一条 system 包含画像块，
+    # memory 层（role=user, content 含「参考记忆」）与 user 层都不应出现画像文本
+    first_call = llm.calls[0]
+    system_in_call = [m for m in first_call if m.get("role") == "system"]
+    user_in_call = [m for m in first_call if m.get("role") == "user"]
+    assert len(system_in_call) == 1
+    assert _PROFILE_MARKER in (system_in_call[0].get("content") or "")
+    for u in user_in_call:
+        assert "李四" not in (u.get("content") or ""), "画像不应被拼进 user 层"
+        assert "用户画像" not in (u.get("content") or ""), "画像标记不应出现在 user 层"
+
+    # 第二次 run：不修改画像，再次确认块不叠加
+    agent.run("again")
+    sys2 = _system_messages(agent)[0].content
+    assert sys2.count(_PROFILE_MARKER) == 1, "跨 run 不应叠加画像块"
+    print("✅ test_profile_injected_via_system_tail_in_context_path passed（B4 context 路径）")
+
+
 if __name__ == "__main__":
     test_no_tool_path()
     test_tool_path_and_no_duplicate_system()
@@ -332,4 +431,7 @@ if __name__ == "__main__":
     test_skills_disabled()
     test_context_enabled_builds_and_registers_tools()
     test_context_user_input_not_duplicated()
+    test_profile_noop_when_empty_or_unconfigured()
+    test_profile_injected_into_system_tail_non_context_path()
+    test_profile_injected_via_system_tail_in_context_path()
     print("\n🎉 全部测试通过")

@@ -56,6 +56,47 @@ _PROJECT_SKILLS_DIRS = [
 ]
 
 
+# 用户画像块的固定起始行——追加在 system 消息末尾；每次 run 注入前用它定位并剥离上一轮残留，
+# 避免跨 run 叠加导致 system 越来越长（画像在会话中可能通过 update_user_profile 被修改）
+_PROFILE_MARKER = "\n\n## 用户画像（稳定信息，请在回答中始终遵守）\n"
+
+
+def _strip_profile_block(prompt: str) -> str:
+    """剥离之前追加的用户画像块，返回「纯」system prompt"""
+    if not prompt:
+        return prompt
+    idx = prompt.rfind(_PROFILE_MARKER)
+    if idx >= 0:
+        return prompt[:idx]
+    return prompt
+
+
+def _render_profile_block(profile_text: str) -> str:
+    """把 UserProfile.to_text() 渲染成追加到 system 末尾的一段文本"""
+    if not profile_text.strip():
+        return ""
+    return f"{_PROFILE_MARKER}{profile_text}\n"
+
+
+def _read_profile_text(memory: Optional[MemoryManager]) -> str:
+    """从 memory 读取画像文本；未配置 / 空画像 / 读取失败都返回空串（主流程不中断）"""
+    if memory is None:
+        return ""
+    try:
+        profile = memory.get_profile()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 用户画像读取失败，本轮跳过注入：{e}")
+        return ""
+    if profile is None or profile.is_empty():
+        return ""
+    try:
+        text = profile.to_text()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 用户画像渲染失败，本轮跳过注入：{e}")
+        return ""
+    return text
+
+
 class ReActAgent(AgentBase):
     """
     ReAct (Reasoning and Acting) Agent（内置短期 + 长期记忆、技能、MCP）
@@ -177,6 +218,9 @@ class ReActAgent(AgentBase):
 
         系统提示词只在构造时注入一次，因此工具变更后需要调用本方法同步提示词里的
         工具清单；本方法只改写已有的那条 system 消息，不会新增消息。
+
+        用户画像不在这里拼进 prompt——它属于跨轮可能变化的信息（通过 update_user_profile
+        更新），每次 run() 开始前由 _inject_profile_ 系列方法统一追加，避免重复叠加。
         """
         tools_desc = self.tool_registry.get_tools_description()
         prompt = self.system_prompt_template.format(tools=tools_desc)
@@ -185,7 +229,8 @@ class ReActAgent(AgentBase):
             prompt = self.skill_middleware.before_agent_run(prompt)
         for message in self.messages.get_messages():
             if message.role == "system":
-                message.content = prompt
+                # 先剥离之前可能追加的用户画像块，再写回纯 prompt，避免累积
+                message.content = _strip_profile_block(prompt)
                 return
         self.messages.append_system(prompt)
 
@@ -375,6 +420,27 @@ class ReActAgent(AgentBase):
             if m.role in ("user", "assistant"):
                 self.messages.append(m)
 
+    # ---------- 用户画像：双通道注入（B4） ----------
+
+    def _inject_profile_to_workspace(self) -> None:
+        """把用户画像追加到当前工作区 system 消息末尾（enable_context=False 路径用）
+
+        每次 run 调用前先剥离旧块再追加新块，保证跨 run 不会叠加。
+        画像为空 / 未配置 memory 时什么都不做，system 字节级保持原样。
+        """
+        text = _read_profile_text(self.memory)
+        block = _render_profile_block(text)
+        system_msg = next(
+            (m for m in self.messages.get_messages() if m.role == "system"), None
+        )
+        if system_msg is None:
+            return
+        stripped = _strip_profile_block(system_msg.content or "")
+        system_msg.content = stripped + block if block else stripped
+        if text and not self.enable_context:
+            # enable_context 路径在 _fit_context 里统一打印，避免双重日志
+            print("🧑‍🦱 已注入用户画像（system 末尾）")
+
     # ---------- 上下文工程 ----------
 
     def _init_context(
@@ -438,6 +504,10 @@ class ReActAgent(AgentBase):
 
         与 `_seed_workspace` 的区别：这里走的是「按 token 预算分层拼装 + 压缩」的路径，
         而不是「按消息条数直接搬运」。最终产出的仍是同一批 Message，写回 self.messages。
+
+        用户画像（B4 双通道注入）在这条路径上走 system_tail：builder 会把它拼到
+        L1 system 末尾（而不是 L2 memory / L5 user），因为画像属于「身份锚点」，
+        应享受 prompt caching 前缀。
         """
         if self.ctx is None:
             return
@@ -445,8 +515,14 @@ class ReActAgent(AgentBase):
         system_prompt = next(
             (m.content for m in self.messages.get_messages() if m.role == "system"), None
         )
+        # _seed_workspace 可能已经给 system 追加过画像，build() 通过 system_tail 统一拼，
+        # 这里先把旧块剥干净，避免重复
+        if system_prompt is not None:
+            system_prompt = _strip_profile_block(system_prompt)
         history = self.memory.buffer.get_messages() if self.memory else []
         packets = self._collect_context_packets(input_text)
+        profile_text = _read_profile_text(self.memory)
+        system_tail = _render_profile_block(profile_text) or None
 
         self.ctx.reset_turn()
         window = self.ctx.build(
@@ -454,11 +530,15 @@ class ReActAgent(AgentBase):
             history=history,
             user_input=input_text,
             memory_packets=packets,
+            system_tail=system_tail,
         )
 
         self.messages.clear()
         for message in window.flatten():
             self.messages.append(message)
+
+        if profile_text:
+            print("🧑‍🦱 已注入用户画像（system 末尾 / context 路径）")
 
         report = self.ctx.last_report
         if report is not None:
@@ -513,10 +593,15 @@ class ReActAgent(AgentBase):
         user_input = self._merge_memory(input_text, memory_text)
 
         # 开启 context 时，用「按 token 预算分层拼装」的方式重建工作区，
-        # 覆盖上面的简单 seed —— 此时长期记忆由 memory 层统一承载，不再重复拼进 user
+        # 覆盖上面的简单 seed —— 此时长期记忆由 memory 层统一承载，不再重复拼进 user；
+        # 用户画像也走这条路径（system_tail → L1 system 末尾）
         if self.enable_context and self.ctx is not None:
             self._fit_context(input_text)
             user_input = input_text
+        else:
+            # 关闭 context 的路径：把画像追加到工作区 system 消息末尾；
+            # 打开 context 时 _fit_context 已经处理过，这里不重复追加
+            self._inject_profile_to_workspace()
 
         final_answer: Optional[str] = None
         try:

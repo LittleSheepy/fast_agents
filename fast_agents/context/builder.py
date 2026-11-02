@@ -135,6 +135,7 @@ class ContextBuilder:
         memory_packets: Optional[Sequence[Any]] = None,
         file_snippets: Optional[Sequence[str]] = None,
         extra_packets: Optional[Sequence[Any]] = None,
+        system_tail: Optional[str] = None,
     ) -> ContextWindow:
         """按层拼装上下文并按预算裁剪，返回可直接喂给 LLM 的 ContextWindow
 
@@ -145,6 +146,11 @@ class ContextBuilder:
             memory_packets: 记忆包（``ContextPacket`` 或 ``{"content": ...}`` dict）
             file_snippets: 需要注入的文件片段（读到/卸载回读的内容）
             extra_packets: 其他需要参与预算排队的文本包
+            system_tail: 追加到 L1 system 末尾的「相对稳定、每轮都在」的补充文本
+                （典型用途：用户画像 / 画像偏好。走 L1 而不是 L2 memory，
+                因为画像属于「身份锚点」，应当享受 prompt caching；
+                不放进 system_prompt 本体，是因为画像可能在会话中途被更新）。
+                传空串 / None 时不追加，system 字节级保持原样。
 
         Returns:
             ContextWindow（层级有序，已超预算的部分已按策略压缩）
@@ -154,9 +160,17 @@ class ContextBuilder:
 
         # ---- L1 system：required，不参与裁剪 ----
         if system_prompt:
+            if system_tail:
+                final_system = f"{system_prompt}\n\n{system_tail}"
+            else:
+                final_system = system_prompt
             system_layer = ContextLayer(name="system", required=True, priority=100)
             system_layer.add(
-                Message("system", system_prompt, metadata={"type": "system", "required": True})
+                Message(
+                    "system",
+                    final_system,
+                    metadata={"type": "system", "required": True},
+                )
             )
             self.window.add_layer(system_layer)
 

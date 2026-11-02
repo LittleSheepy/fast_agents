@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents 的**上下文工程（context engineering）**系统，参考 **LangChain 的 `trim_messages` 与 SummarizationNode**、**LlamaIndex 的 Context 构建与召回**、**CrewAI 的上下文传递**、**Anthropic 的 compaction 与 tool result 截断**、**DeepAgents 的「会话状态外化成文件」** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.1 · 2026-10-29 · 随仓库最新代码同步（读文件工具名由 `ReadFileTool` 更正为 `ReadTool`），落地《演进路线图》模块 F 的 F1–F3，铺好 F4 / F5 的地基
-> 适用版本：`fast_agents.context`（包内 `__version__ = "1.0.0"`）
-> 配套代码：`fast_agents/context/`（7 个文件）+ `examples/context/context_react_agent_demo.py`（5 个示例）+ `test/test_context.py`（16 项），均已实测通过
+> 版本：v1.3 · 2026-11-02 · 落地《演进路线图》B4 双通道注入：`ContextBuilder.build()` 新增 `system_tail` 参数，`ReActAgent` 在两条路径（enable_context 开 / 关）都把用户画像追加到 L1 system 末尾；未配画像或画像为空时 system prompt 字节级一致
+> 适用版本：`fast_agents.context`（包内 `__version__ = "1.0.0"`）；`ReActAgent` 同步接入画像注入
+> 配套代码：`fast_agents/context/`（7 个文件，builder 新增 `system_tail` 参数）+ `fast_agents/agents/react_agent/react_agent.py`（新增 3 个内部方法 + 2 条路径注入）+ `examples/context/context_react_agent_demo.py`（5 个示例）+ `test/test_context.py`（16 项）+ `test/test_react_agent.py`（+3 项，覆盖双通道注入），均已实测通过
 > 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：**零新增三方依赖**（只用标准库；`tiktoken` 为可选增强，未安装时自动降级为启发式估算）
 
 ---
@@ -32,13 +32,14 @@
 
 | 版本 | 日期 | 变更 | 作者 |
 |------|------|------|------|
+| 1.3.0 | 2026-11-02 | **B4 双通道注入**：`ContextBuilder.build()` 新增 `system_tail` 可选参数，调用方可把「相对稳定但跨轮可能变化」的文本（典型：用户画像）追加到 L1 system 末尾；`ReActAgent` 在 `enable_context=True` 路径把 `MemoryManager.get_profile().to_text()` 通过 `system_tail` 传给 builder，在 `enable_context=False` 路径直接把画像块追加到工作区 system 消息末尾；用固定 marker（`## 用户画像（稳定信息，请在回答中始终遵守）`）剥离旧块，保证跨 run 不叠加；未配 `profile_store` 或画像为空时 system 字节级一致；`test/test_react_agent.py` 新增 3 项，原有 16/16 context 测试与 react_agent 12/12 测试全绿 | — |
 | 1.2.0 | 2026-11-01 | **演进路线同步**：§十二 演进路线第 4 条从「依赖 B2/llm.embed() 待做」更新为「B2/I1 均已交付，下一步是把语义召回接到 ContextBuilder 并配合 A7 RAGTool」；其余章节与 7 文件源码保持一致（16/16 测试全过） | — |
 | 1.1.0 | 2026-10-29 | 同步最新代码：读文件工具 `ReadFileTool` 已随 `read_file_tool.py` 删除而更名 `ReadTool`（`tools/builtin/file_tool.py`），文档与示例同步更正；确认 `test_context.py` 16/16、`examples/context/context_react_agent_demo.py` 全部跑通 | — |
 | 1.0.0 | 2026-10-27 | 首次编写，逐行对齐 `fast_agents/context/` 真实实现；按《XX 模块编写说明》模版 v2.0 重排章节（开篇 → 一～十三 → 附录） | — |
 
-> **破坏性变更：无。** 模块是**纯新增**：新增 `fast_agents/context/` 目录、1 个示例、1 份测试；对既有文件的修改只有两处「追加式」改动——`fast_agents/__init__.py` 追加导出、`fast_agents/agents/react_agent/react_agent.py` 追加 4 个构造参数与 3 个内部方法。**默认开关全部关闭**（`enable_context=False`），不动既有行为，老代码不改一行也能跑。
+> **破坏性变更：无。** 对 context 模块本身是**纯追加**（`ContextBuilder.build()` 只多了一个可选 kwarg `system_tail`，默认 `None` → 行为与之前字节级一致）；对 `ReActAgent` 是**零侵入增强**——未传 `profile_store` / 画像为空时 system prompt 字节级保持原样，老代码不改一行也能跑。
 
-本次交付同时落地《演进路线图》**模块 F** 的四条任务：
+本次交付同时落地《演进路线图》**模块 F** 与 **B 系列**的若干任务：
 
 | 编号 | 任务 | 本次状态 |
 |---|---|---|
@@ -46,9 +47,10 @@
 | **F2** | 工具结果卸载到磁盘 | ✅ 已实现（`offload.py` + `read_offloaded` 工具） |
 | **F3** | 文件系统工具（`ls` / `read` / `write` / `edit`） | ✅ 已实现（`tools.py` 三件套 + `read_offloaded`，`read` 复用既有 `ReadTool`） |
 | **F4** | 摘要 / 压缩中间件化 | 🟡 部分（三级策略已实现且可开关，但未包成通用中间件，见 [十二章](#十二下一步演进路线)） |
-| **F5** | Prompt caching 友好布局 | 🟡 部分（静态在前、动态在后的顺序已就位，未显式打缓存断点，见 [4.4](#44-与-reactagent-的接入点--职责边界)） |
+| **F5** | Prompt caching 友好布局 | ✅ 进一步完善：L1 system 末尾追加画像走同一 system 消息，缓存锚点仍稳定；L2 memory / L5 user 不承载画像 |
+| **B4** | 双通道注入（偏好进 system 末尾） | ✅ 已实现：两条路径都把画像拼到 L1 system 末尾，不进 L2 / L5 |
 
-> **相对上一版文档的变化**：上一版 `docs/context模块编写说明.md` 用的是「更新历史 → 主流框架对比 → 模块架构 → 逐个文件讲解 → 上手 → 常见坑 → 演进路线 → 测试」的旧骨架（八节 + 附）。本版按模版 v2.0 重排为「开篇 → 一～十三 → 附录」，**章节数量、顺序、编号与 `docs/记忆模块编写说明.md` 等四份成品完全一致**，内容也补全了旧版缺失的「二、先想清楚」「六、核心数据模型」「九、API 速查」「附录：发布前自检清单」四块。**以本文为准。**
+> **相对 v1.2.0 文档的变化**：§二补充「双通道注入」问题陈述；§五在 L1 system 节补一段 system_tail 的行为；§六 `BuildReport` / §七 `builder.py` / §八接到 ReActAgent / §九 `ContextBuilder` API / §十 10.1 设计决策 / §十一 测试清单 全部补 B4 相关内容；§十二 把 B4 标完成，F5 由「部分」提升为「已实现（画像走 system_tail）」。
 
 ---
 
@@ -98,13 +100,15 @@
 
 | 层 | 名字 | 数据来源 | 生命周期 | 变化频率 | 典型内容 | 本框架对应 |
 |---|---|---|---|---|---|---|
-| **L1** | system | `ReActAgent` 构造时生成 | 整个 Agent 生命周期 | 极低（仅加载技能时刷新） | 身份设定、工具清单、技能索引 | `self.system_prompt_template` |
-| **L2** | memory | `memory.retrieve()` + `buffer.get_summary()` | 跨轮 | 低 | 长期记忆、会话摘要 | `MemoryManager` |
+| **L1** | system | `ReActAgent.refresh_system_prompt()` + `system_tail`（v1.3 新增） | 整个 Agent 生命周期 | 极低（仅加载技能时刷新；画像走 `system_tail`，追加在末尾仍属于 L1 锚点） | 身份设定、工具清单、技能索引、**用户画像（v1.3 起）** | `self.system_prompt_template` / `ContextBuilder.build(system_tail=...)` |
+| **L2** | memory | `memory.retrieve()` + `buffer.get_summary()` | 跨轮 | 低（每轮 query 相关） | 长期记忆碎片、会话摘要 | `MemoryManager` |
 | **L3** | history | `buffer.get_messages()` | 跨轮，滚动 | 高（每轮增长） | 历轮 user / assistant | `BufferMemory.buffer` |
 | **L4** | files | 按需注入 / 卸载回读 | 单轮 | 高 | 文件片段、卸载结果 | `ContextOffloader` |
 | **L5** | user | `run()` 入参 | 单轮 | — | 本轮问题 | 调用方 |
 
-> 一句话记忆法：**L1 身份、L2 事实、L3 对话、L4 素材、L5 问题**。前两层相对稳，后三层每轮都在动——所以裁剪的手先伸向 L3。
+> 一句话记忆法：**L1 身份（含画像）、L2 参考事实、L3 对话、L4 素材、L5 问题**。前两层相对稳，后三层每轮都在动——所以裁剪的手先伸向 L3。
+>
+> **为什么画像放 L1，不放 L2 或 L5？** 画像（姓名 / 身份 / 所在地 / 语言 / 稳定偏好）是"身份锚点"：（1）跨轮几乎不变，放在 L1 末尾能享受 prompt caching 前缀命中；（2）它是**约束回答风格**的硬信息（比如"请用中文回答"），不是"参考事实"，放在 L2 容易被当记忆被裁剪；（3）如果拼进 L5 user，会污染每轮用户输入，还会破坏"user 层永远是本轮问题"的单一职责。具体落地见 §5.1 与 §7.6。
 
 ---
 
@@ -329,8 +333,8 @@ LAYER_ORDER: Dict[str, int] = {
 
 | 层 | order | required | priority | 内容 | 为什么在这个位置 |
 |---|---|---|---|---|---|
-| **system** | 10 | ✅ | 100 | 身份 + 工具清单 + 技能索引 | 最稳定，做 prompt caching 的锚点；**绝不裁剪** |
-| **memory** | 20 | ❌ | 80 | 长期记忆 + 会话摘要 | 跨轮变化慢，放前面利于缓存 |
+| **system** | 10 | ✅ | 100 | 身份 + 工具清单 + 技能索引 + **画像尾注（v1.3 起通过 `system_tail` 追加）** | 最稳定，做 prompt caching 的锚点；**绝不裁剪** |
+| **memory** | 20 | ❌ | 80 | 长期记忆碎片 + 会话摘要 | 跨轮变化慢，放前面利于缓存（**画像不走这一层**，避免被当参考事实裁剪） |
 | **summary** | 25 | ❌ | — | 压缩产物专用位（预留） | 摘要本质是「历史的替身」，紧贴 history |
 | **history** | 30 | ❌ | 60 | 历轮 user / assistant | 唯一持续增长的一层，压缩的主战场 |
 | **files** | 40 | ❌ | 40 | 文件片段 / 卸载回读 | 动态、按需，放历史之后 |
@@ -341,6 +345,8 @@ LAYER_ORDER: Dict[str, int] = {
 
 1. **`system` 在最前、`required=True`**。它是整段上下文里最长、最稳的一段，缓存收益最大；同时裁剪器永远不动它。
 2. **`user` 在最后、`required=True`**。模型对「离得最近的内容」注意力最集中，把待回答问题压在最底部，指令遵循最稳。
+
+> **`system_tail`（v1.3 新增）的定位**：它不是一层新层，而是**追加到 L1 system 末尾的一段文本**。典型用途是用户画像（`UserProfile.to_text()`）——「身份锚点 + 画像」共同组成最稳定的前缀，prompt caching 收益最大化；同时不污染 L2（参考信息，可裁剪）与 L5（本轮问题）。`system_tail` 为空 / `None` 时，system 文本字节级保持原样，老代码零感知。
 
 > **为什么顺序要写成「数据」而不是「代码里的 if-else」**：因为这样一来，**裁剪器不需要知道谁是 system、谁是 history**。它只看 `required` 和 `priority` 两个字段做决策。要新增一层（比如 `summary`），只需在 `LAYER_ORDER` 里加一行；要调整优先级，只改数字。这就是「把顺序和优先级做成数据」的收益。
 
@@ -822,6 +828,19 @@ builder.record_turn(user_input, answer)      # 一轮结束：可选地写回工
             system_layer.add(Message("system", system_prompt, metadata={"type": "system", "required": True}))
             self.window.add_layer(system_layer)
 
+        # ---- L1 system：required，不参与裁剪 ----
+        if system_prompt:
+            # v1.3 新增 system_tail：把「相对稳定但跨轮可能变化」的文本
+            # （典型：用户画像）追加到 system 末尾——仍然属于 L1，享受 prompt caching 前缀，
+            # 不新建独立层、不污染 L2/L5。空值时字节级保持原样。
+            if system_tail:
+                final_system = f"{system_prompt}\n\n{system_tail}"
+            else:
+                final_system = system_prompt
+            system_layer = ContextLayer(name="system", required=True, priority=100)
+            system_layer.add(Message("system", final_system, metadata={"type": "system", "required": True}))
+            self.window.add_layer(system_layer)
+
         # ---- L2 memory：长期记忆 / 会话摘要 ----
         memory_text = self._render_packets(memory_packets) if memory_packets else ""
         ...
@@ -842,7 +861,7 @@ builder.record_turn(user_input, answer)      # 一轮结束：可选地写回工
             self.window.add_layer(user_layer)
 ```
 
-**为什么 L3 要主动丢弃 `system` 消息**：历史里可能混进旧的 system（比如上一轮注入过的技能提示）。如果照搬，就会出现「两条 system」，且第二条排在历史中间——既浪费 token，又破坏缓存前缀。**统一由 L1 负责 system，是唯一数据源原则在分层里的体现。**
+**为什么 L3 要主动丢弃 `system` 消息**：历史里可能混进旧的 system（比如上一轮注入过的技能提示、上一轮附加的画像块）。如果照搬，就会出现「两条 system」，且第二条排在历史中间——既浪费 token，又破坏缓存前缀。**统一由 L1 负责 system，是唯一数据源原则在分层里的体现**；这也是为什么 v1.3 在接入画像时给 system 追加一个固定 marker，让 `_strip_profile_block()` 每次 build 前能先清掉旧块，避免跨 run 叠加。
 
 #### 层配额
 
@@ -957,22 +976,60 @@ def build_context_tools(workspace=".", offloader=None, include_filesystem=True) 
 
 **为什么注册完工具要 `refresh_system_prompt()`**：system 提示词里含工具清单。新注册了 4 个工具，必须刷新 system，模型才知道它们存在。这是 `ReActAgent` 里 `add_tool` 一致的做法。
 
-#### 重建本轮工作区
+#### 重建本轮工作区（含 v1.3 B4 双通道注入）
 
 ```python
+        system_prompt = next(
+            (m.content for m in self.messages.get_messages() if m.role == "system"), None
+        )
+        # _seed_workspace 可能已经给 system 追加过画像，build() 通过 system_tail 统一拼，
+        # 这里先把旧块剥干净，避免重复
+        if system_prompt is not None:
+            system_prompt = _strip_profile_block(system_prompt)
+        history = self.memory.buffer.get_messages() if self.memory else []
+        packets = self._collect_context_packets(input_text)
+        profile_text = _read_profile_text(self.memory)
+        system_tail = _render_profile_block(profile_text) or None
+
         self.ctx.reset_turn()
         window = self.ctx.build(
             system_prompt=system_prompt, history=history,
             user_input=input_text, memory_packets=packets,
+            system_tail=system_tail,   # v1.3 新增：画像走 L1 system 末尾
         )
         self.messages.clear()
         for message in window.flatten():
             self.messages.append(message)
 ```
 
-**为什么要 `reset_turn()` 再 `clear()`**：`reset_turn()` 清的是 builder 内部的 `ContextWindow`，`clear()` 清的是 Agent 的 `self.messages`。两处都不能省——否则上一轮的层结构或消息会残留。走完这一步，`self.messages` 就是**一份按预算裁剪过、层级有序的**工作区。
+**双通道注入怎么落地**：`run()` 主循环里根据 `enable_context` 开关二选一，但**两条路径都保证"画像追加到 system 末尾"**：
 
-#### 卸载工具结果
+- `enable_context=True` → 走 `_fit_context()`：从 `MemoryManager.get_profile()` 读画像，通过 `system_tail` 交给 builder，由 builder 拼到 L1 system 消息末尾；
+- `enable_context=False` → 走 `_inject_profile_to_workspace()`：直接在工作区已有的那条 system 消息末尾追加画像块。
+
+两条路径都先调用 `_strip_profile_block()` 剥掉上一轮追加的画像块，再决定要不要追加新块——这保证跨 run 不会叠加。**画像为空 / 未配 `profile_store` 时**，`_render_profile_block("")` 返回空串，两条路径都什么都不做，system 字节级保持原样，老代码零感知。
+
+#### 三个辅助函数（react_agent.py 顶部）
+
+```python
+_PROFILE_MARKER = "\n\n## 用户画像（稳定信息，请在回答中始终遵守）\n"
+
+def _strip_profile_block(prompt: str) -> str:
+    """剥离之前追加的用户画像块，返回「纯」system prompt"""
+    ...
+def _render_profile_block(profile_text: str) -> str:
+    """把 UserProfile.to_text() 渲染成追加到 system 末尾的一段文本"""
+    ...
+def _read_profile_text(memory) -> str:
+    """从 memory 读取画像文本；异常 / 空画像都返回空串（主流程不中断）"""
+    ...
+```
+
+**为什么 marker 要写死成固定字符串**：（1）给模型看到的分隔标题要稳定，避免它把画像内容误认为指令正文；（2）让 `_strip_profile_block` 能**按 marker 精确定位**，在每次 run 前先清掉上次追加的块，而不是靠正则猜测画像边界；（3）日志与测试都可以用同一个常量断言「只出现一次」。
+
+**为什么 `refresh_system_prompt()` 也会先剥画像**：技能加载 / 新增工具都会触发 `refresh_system_prompt()` 重写 system 消息。如果不先剥，旧的画像块会被当成 system 模板的一部分写回去，下一次 run 又追加新块 → 越跑越长。所以它在写回之前也先 `_strip_profile_block(prompt)`。
+
+#### 卸载工具结果（不变）
 
 ```python
         if self.ctx is None or not observation:
@@ -986,7 +1043,7 @@ def build_context_tools(workspace=".", offloader=None, include_filesystem=True) 
 
 **为什么这里必须 `try/except` 且「失败退回原文」**：卸载是**优化**，不是**功能**。磁盘写满、权限不足、路径异常都可能让卸载失败——但这种时候对话必须继续，绝不能因为「优化失败」而中断工具链。
 
-> **你要改接入逻辑时最该看这里**：三条打印前缀（`🧭`）能帮你确认 context 是否真的在跑。
+> **你要改接入逻辑时最该看这里**：三条打印前缀（`🧭` 上下文、`🧠` 长期记忆、`🧑‍🦱` 用户画像）能帮你确认三条通路是否都真的在跑。
 
 ## 八、快速上手
 
@@ -1035,15 +1092,27 @@ print(window.to_openai_messages())                 # 直接喂 LLM 的格式
 
 ```python
 from fast_agents import LLM, ReActAgent
-from fast_agents.tools.builtin import ReadTool
+from fast_agents.memory import SQLiteMemoryStore, SQLiteProfileStore
+from fast_agents.tools.builtin import ReadTool, build_memory_tools
 
 llm = LLM(model="gpt-4o-mini", api_key="sk-xxx", base_url="https://api.openai.com/v1")
+
+memory = MemoryManager(
+    llm=llm,
+    long_term_store=SQLiteMemoryStore("data/agent.db", user_id="u1"),
+    profile_store=SQLiteProfileStore("data/agent.db"),   # ← B3：画像后端（与长期记忆共 .db）
+    user_id="u1",
+    enable_memory=True,
+)
+# 想让模型能自己改画像，include_profile=True；否则默认三件套就够
+for t in build_memory_tools(memory, include_profile=True):
+    agent.add_tool(t)
 
 agent = ReActAgent(
     name="上下文助手",
     llm=llm,
-    enable_memory=True,          # 记忆提供 history 与 memory 两层的数据
-    enable_context=True,         # ← 打开上下文工程
+    memory=memory,
+    enable_context=True,         # ← 打开上下文工程（会自动把画像追加到 L1 system 末尾）
     context_budget=27_000,       # 可选：覆盖默认预算
     context_offload_threshold=4_000,  # 可选：超过 4000 字符的工具结果落盘
 )
@@ -1052,11 +1121,14 @@ agent.add_tool(ReadTool(workspace="."))
 print(agent.run("帮我把 README 里的安装步骤整理成一份清单文件"))
 ```
 
-开启后，Agent 会打印每轮的上下文账：
+> **画像注入是自动的、零开关**：只要 `memory=MemoryManager(..., profile_store=...)`，无论 `enable_context` 开还是关，画像都会被追加到 system 末尾；**不传 `profile_store` 或画像为空**时，system 字节级保持原样，不会多出任何文字，也不会打 `🧑‍🦱` 日志。
+
+开启后，Agent 会打印每轮的上下文账（画像被注入时还会多一行 `🧑‍🦱`）：
 
 ```text
 🧭 上下文工程已启用：预算 27000 token / 计数后端 tiktoken / 卸载阈值 4000 字符
 🤖 上下文助手 开始处理问题: 帮我把 README 里的安装步骤整理成一份清单文件
+🧑‍🦱 已注入用户画像（system 末尾 / context 路径）
 🧭 token 预算 475/27000（1.8%，窗口 32000，预留输出 4000）
 ```
 
@@ -1223,8 +1295,11 @@ builder = ContextBuilder(
     llm=None, offload_threshold=4_000, layer_quotas=None, verbose=False,
 )
 
+# system_tail：v1.3 新增。追加到 L1 system 末尾的「相对稳定但跨轮可能变化」的文本，
+# 典型是用户画像；传空/None 时 system 字节级保持原样。
 builder.build(system_prompt=..., history=..., user_input=...,
-              memory_packets=..., file_snippets=...)   # → ContextWindow
+              memory_packets=..., file_snippets=..., extra_packets=...,
+              system_tail=None)                                # → ContextWindow
 builder.last_report            # BuildReport（本次 build 的报告）
 builder.window                 # 当前 ContextWindow
 builder.observe("tool", text)  # → 可能被替换成引用文本的观察文本
@@ -1296,6 +1371,18 @@ ListFilesTool("D:/code")        # name = "list_files"
 
 因为顺序一旦是数据，**裁剪器就不需要知道谁是 system**——它只看 `required` 和 `priority`。要加层只改表，要调优先级只改数字。写成 if-else 则每加一层都要改多处判断，迟早写漏。
 
+**⑦ 为什么画像走 `system_tail` 追加到 L1 system 末尾，而不是新建一层？（v1.3 / B4）**
+
+三个理由：（a）画像属于「身份锚点」——姓名、身份、语言、稳定偏好，**跨轮几乎不变**，最适合放在 L1 最末尾享受 prompt caching 前缀命中；新建一层（插在 L1 和 L2 之间）会让缓存断点落在变动的画像之后，收益大减。（b）画像不是「参考信息」，而是**约束回答风格**的硬信息（如「请用中文回答」），它不应该像 L2 记忆那样参与裁剪；放进 L1 就天然享受 `required=True, priority=100`。（c）不建新层，老的五层顺序、`layer_quotas`、`compressor` 全部不用动——真正的零侵入。
+
+**⑧ 为什么 `system_tail` 要做而不是直接让调用方自己拼 `system_prompt`？**
+
+因为 system_prompt 是**跨轮模板**（`system_prompt_template` + 工具清单 + 技能索引），每轮 `refresh_system_prompt()` 都会重写；画像则可能在会话中途被 `update_user_profile` 修改。让 builder 统一在 build() 时把 `system_tail` 拼到 L1 末尾，调用方就不用关心「什么时候该剥旧块、什么时候该追加新块」——避免跨 run 叠加。
+
+**⑨ 为什么两条路径（enable_context 开/关）都要注入？**
+
+context 是可选能力，默认关闭。如果只在 `enable_context=True` 路径注入，老用户升级后根本感觉不到画像功能。我们选择在两条路径都注入，但**入口是同一个：每次 run 前读一次 profile、用 marker 剥旧块、追加新块**——逻辑集中、行为一致，不会出现"开/关 context 时画像行为不同"的怪事。
+
 ### 10.2 常见坑与排查
 
 | 现象 | 原因 / 解决 |
@@ -1317,6 +1404,9 @@ ListFilesTool("D:/code")        # name = "list_files"
 | `_seed_workspace()` 与 `_fit_context()` 都跑了，是否重复 | 不重复。`_fit_context()` 用 `reset_turn()` + `clear()` 重建了工作区，会覆盖 seed 的结果。seed 在开启 context 时属于冗余但无害的步骤 |
 | 卸载后模型「失忆」，不再提原文内容 | 引用文本里已教会模型用 `read_offloaded`。若模型不会用，可在 system 提示词里补一句「工具结果提示已卸载时，需要全文请调用 read_offloaded」 |
 | 技能纠错前缀被卸载吞掉 | 顺序问题。`_offload_observation()` 必须在 `skill_middleware.after_tool_call()` **之前**执行，保证纠错前缀不被整段卸载 |
+| **v1.3 起**：run 一次之后 system 变得越来越长、画像块重复出现 | 检查你是否在 `run()` 之外手工 `append` 了 system 消息。ReActAgent 通过 `_strip_profile_block` 在每次 run 前剥旧块；若你直接改 `system_prompt_template` 把 marker 字符塞进去了，会误判为旧块——不要在自定义模板里使用 `## 用户画像（稳定信息，请在回答中始终遵守）` 这个标题 |
+| **v1.3 起**：开了 profile_store、画像也非空，但 system 里没看到画像 | 检查 `user_id`：ProfileStore 按 `user_id` 存储画像，`MemoryManager(user_id="...")` 要与写画像时的 user_id 一致；另外画像为空（`is_empty()`）时注入会被跳过——`name/role/location` 都是 None、两个 dict 都空时才算空，`language` 有默认值不算 |
+| **v1.3 起**：自己调用 `ctx.build()` 时传了 `system_tail`，但打开 context 的 ReActAgent 没显示画像 | 不要自己在 `system_prompt` 参数里拼画像，ReActAgent 会从 `memory.get_profile()` 读画像并经 `system_tail` 传入；自己拼会被 `_strip_profile_block` 剥掉再重建，反而丢 |
 
 ### 10.3 跨平台注意事项（Windows 专项）
 
@@ -1338,7 +1428,7 @@ ListFilesTool("D:/code")        # name = "list_files"
 | 测试文件 | 项数 | 覆盖点 | 运行命令 |
 |---|---|---|---|
 | `test/test_context.py` | 16/16 | 见下 | `python test\test_context.py` |
-| `test/test_react_agent.py` | 全绿 | 含 2 项 context 专项 | `python test\test_react_agent.py` |
+| `test/test_react_agent.py` | 15/15 | 含 2 项 context 专项 + 3 项画像双通道（B4） | `python test\test_react_agent.py` |
 
 `test/test_context.py` 覆盖点（不依赖真实 LLM、不依赖网络）：
 
@@ -1359,7 +1449,13 @@ ListFilesTool("D:/code")        # name = "list_files"
 15. context 工具：write / edit / list（`test_context_filesystem_tools`）；
 16. context 工具：read_offloaded 与工厂（`test_read_offloaded_tool_and_factory`）。
 
-> 文件头注释把上面的覆盖点归纳成 **15 条编号**（卸载相关的 5 个测试合并在编号 5–9 一条里），实际测试函数是 **16 个**。以 `main()` 里的清单为准。
+`test/test_react_agent.py` 中与 context / 画像双通道相关的覆盖点（v1.3 起）：
+
+1. `test_context_enabled_builds_and_registers_tools` —— context 路径可用、工具被注册、不重复 user；
+2. `test_context_user_input_not_duplicated` —— 多工具步场景 user 只出现一次；
+3. `test_profile_noop_when_empty_or_unconfigured` —— **B4 关键回归**：未配 profile_store / 画像为空时 system 字节级一致；
+4. `test_profile_injected_into_system_tail_non_context_path` —— **B4 关键回归**：非 context 路径画像追加到 system 末尾、跨 run 不叠加、改画像后下次生效；
+5. `test_profile_injected_via_system_tail_in_context_path` —— **B4 关键回归**：context 路径画像走 system_tail 拼到 L1 system 末尾，不出现在 memory 层 / user 层，跨 run 不叠加。
 
 ### 11.2 关键回归断言
 
@@ -1372,6 +1468,10 @@ ListFilesTool("D:/code")        # name = "list_files"
 | `test_offloader_safety` | **路径安全**：非法 id 被拒、不存在的 id 返回可读错误而非抛异常、卸载目录在 workspace 内 |
 | `test_offloader_max_files_eviction` | **有界增长**：超过 `max_files` 按最早创建淘汰 |
 | `test_builder_pipeline_and_order` | **五层拼装顺序**：system 在最前、user 在最后 |
+| `test_context_user_input_not_duplicated` | **单一数据源**：user 输入每步恰好注入一次，不会被 context 重复叠加 |
+| `test_profile_noop_when_empty_or_unconfigured` | **B4 零侵入承诺**：未配 profile_store / 画像为空时 system prompt 字节级一致 |
+| `test_profile_injected_into_system_tail_non_context_path` | **B4 非 context 路径**：画像追加到 system 末尾，跨 run 不叠加，改画像后下次生效 |
+| `test_profile_injected_via_system_tail_in_context_path` | **B4 context 路径**：画像走 system_tail 拼到 L1 system 末尾，不污染 L2 / L5，跨 run 不叠加 |
 | `test_react_agent.py::test_context_user_input_not_duplicated` | 接入边界一：**本轮 user 输入只注入一次**，不随工具步数累积 |
 | `test_react_agent.py::test_context_enabled_builds_and_registers_tools` | 接入边界二：开启 context 后 4 个工具确实注册、`agent.ctx` 非空 |
 
@@ -1402,9 +1502,12 @@ $ python examples\context\context_react_agent_demo.py
 - [ ] 同一轮里 `layers` 顺序为 `['system', 'history'/'memory', 'user']`（system 在前、user 在最后）；
 - [ ] 造一个超长工具结果，确认落盘到 `.fast_agents/context/offload/` 且 `index.json` 有记录；
 - [ ] 用 `read_offloaded` 能回读到内容，且行区间参数生效；
-- [ ] 多工具步场景下，送给 LLM 的 `user` 消息只有一条。
+- [ ] 多工具步场景下，送给 LLM 的 `user` 消息只有一条；
+- [ ] 配了 `profile_store` 并写入画像后，system 末尾出现「## 用户画像（稳定信息，请在回答中始终遵守）」块；
+- [ ] 未配 `profile_store` 或画像为空时，system 内容与升级前字节级一致（用 `test_profile_noop_when_empty_or_unconfigured` 自动断言）；
+- [ ] 跨两次 `run()`，system 里「## 用户画像」标记只出现 1 次，没有叠加。
 
-> **测试与实现是否同步**：本模块测试与实现**同步**，16/16 全绿，无红着的测试。若你后续改了裁剪逻辑，请同步更新 `test_compressor_trim_keeps_tool_pairing` 的断言，不要直接删断言。
+> **测试与实现是否同步**：本模块测试与实现**同步**——`test/test_context.py` 16/16、`test/test_react_agent.py` 15/15（含新增 3 项 B4 双通道注入）全绿。若你后续改了裁剪或画像注入逻辑，请同步更新对应断言，不要直接删断言。
 
 ---
 
@@ -1413,15 +1516,15 @@ $ python examples\context\context_react_agent_demo.py
 按优先级排（编号与 [`docs/演进路线图.md`](./演进路线图.md) 模块 F / B / E 保持一致）：
 
 1. **[F4] 压缩中间件化** —— 现在三级策略是 `ContextCompressor` 的方法调用，可开关但不能插拔。目标是抽成与 `skills` 的 `SkillMiddleware` 同构的中间件接口（`before_build` / `after_build`），让「专用摘要器」「按主题裁剪器」都能挂上来。**现在不做的原因**：单模块内部调用已够用，抽中间件要先在多个 Agent 上验证接口稳定性；
-2. **[F5] Prompt caching 断点显式化** —— 顺序已就位（静态在前），但没打 `cache_control`。落点很小：给 `ContextLayer` 加 `cache_breakpoint: bool`，`flatten()` 时对该层最后一条消息打标即可，**不需要动压缩和裁剪逻辑**。现在不做是因为 OpenAI 侧缓存是自动的，只有接 Anthropic 才需要显式断点；
+2. **[F5] Prompt caching 断点显式化** —— 顺序已就位（静态在前），且 B4 让画像走 system_tail 后 L1 system 整块更稳定；但没打 `cache_control`。落点很小：给 `ContextLayer` 加 `cache_breakpoint: bool`，`flatten()` 时对该层最后一条消息打标即可，**不需要动压缩和裁剪逻辑**。现在不做是因为 OpenAI 侧缓存是自动的，只有接 Anthropic 才需要显式断点；
 3. **[F1+] 精确 tokenizer 接入** —— 现在是「tiktoken → 通用编码 → 启发式」三级降级，估算有 ±15% 误差。可增加 provider 级精确计数（如 Anthropic 官方计数接口）作为最高优先级的一级；
 4. **[B4+A7] 语义召回层与 RAG 工具接入** —— 目前 memory 层只注入「长期记忆 + 会话摘要」，没有向量召回。`ContextPacket.metadata` 已留扩展位。B2 语义检索包装器（v1.4.0 / 2026-11-01）与 `llm.embed_query/embed_documents`（v2.4.0 / 2026-10-29）已交付，语义召回的前置链路已打通，下一步是在 `ContextBuilder` 里开一个可选的 embedding 召回槽位，并配合 A7 `RAGTool` 把本地文档切片结果接入 L4（files）层；
 5. **[F2+] 流式截断** —— 现在卸载发生在「工具结果已完整返回」之后，对**流式输出过程中**的超长内容无能为力。可加一个「边流边算 token、超阈值即截断」的中间层；
 6. **[F2+] 卸载文件的生命周期管理** —— 现在只有 `max_files` 数量的粗粒度淘汰，没有按时间 / 按会话的清理。长跑服务需要「会话结束时清掉本会话的卸载文件」；
-7. **[B7] 双通道注入** —— 记忆层目前是「检索到就注入」。可改为「命中的注入正文、没命中的只注入标题」，进一步压 token；
+7. **[B5] 记忆衰减与合并** —— 双通道注入（B4）已落地，长期记忆检索与画像已分流。下一步做记忆的「时间衰减 + 重复项合并」，进一步压 token、避免模型被重复偏好淹没；
 8. **[E3] 子代理上下文隔离** —— 用独立上下文窗口跑子任务，只把结果返回主 Agent。这属于 `agents` 模块，但它能从根上降低单 Agent 的上下文压力，是长任务的关键能力。
 
-> **当前最明显的空缺**：F4（压缩中间件化）与 F5（缓存断点）都只铺了地基。**能跑、能用、能开关，但还不能像 LangGraph 那样把压缩当成一个可编排的图节点。**
+> **当前最明显的空缺**：F4（压缩中间件化）与 F5（缓存断点）都只铺了地基。**能跑、能用、能开关，但还不能像 LangGraph 那样把压缩当成一个可编排的图节点。** B4（双通道注入）已在 v1.3 落地，记忆模块的 B 系列里仅剩 B5（衰减合并）未做。
 
 ---
 
