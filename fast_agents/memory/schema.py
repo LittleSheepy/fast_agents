@@ -70,3 +70,84 @@ class ContextPacket(BaseModel):
 
     def render(self) -> str:
         return f"- {self.content}"
+
+
+class UserProfile(BaseModel):
+    """结构化用户画像（B3）
+
+    和 MemoryRecord 的分工：
+    - MemoryRecord 是「可能被遗忘 / 修订 / 检索的碎片」，带 kind / status / supersedes；
+    - UserProfile 是「经过确认、稳定存在的单份档案」，字段级覆盖式合并，没有版本链。
+    所以画像**不塞进长期记忆的检索链路**（否则会和 fact / preference 重复打分）。
+
+    字段设计刻意保持「扁平 + dict 扩展」：
+    - 顶层只放 name / role / location / language 四个通用字段；
+    - 其余稳定信息走 stable_preferences / stable_facts 两个键值字典，
+      避免过早把字段写死成白名单（等真实用一段时间再收紧）。
+    """
+
+    user_id: str = ""
+    name: Optional[str] = None
+    role: Optional[str] = None
+    location: Optional[str] = None
+    language: str = "zh-CN"
+    stable_preferences: Dict[str, str] = Field(default_factory=dict)
+    stable_facts: Dict[str, str] = Field(default_factory=dict)
+    updated_at: datetime = Field(default_factory=datetime.now)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        """是否还是一份没有任何信息的空档案（language 有默认值，不计入）"""
+        return not any(
+            [self.name, self.role, self.location,
+             self.stable_preferences, self.stable_facts]
+        )
+
+    def merge_patch(self, patch: Dict[str, Any]) -> "UserProfile":
+        """按字段覆盖式合并：同名 key 后写覆盖前写，两个 dict 做浅合并
+
+        - None 值一律忽略（不覆盖已有内容）；
+        - user_id / updated_at 不允许通过 patch 改写；
+        - 未知的顶层键忽略，不会往模型上乱塞属性。
+        """
+        for key, value in (patch or {}).items():
+            if value is None:
+                continue
+            if key == "stable_preferences" and isinstance(value, dict):
+                self.stable_preferences.update({str(k): str(v) for k, v in value.items()})
+            elif key == "stable_facts" and isinstance(value, dict):
+                self.stable_facts.update({str(k): str(v) for k, v in value.items()})
+            elif key == "metadata" and isinstance(value, dict):
+                self.metadata.update(value)
+            elif key in ("user_id", "updated_at"):
+                continue
+            elif key in ("name", "role", "location", "language"):
+                setattr(self, key, value)
+        self.updated_at = datetime.now()
+        return self
+
+    def to_text(self) -> str:
+        """渲染成可直接注入 prompt 的多行文本（B4 双通道注入时会用到）"""
+        lines: list = []
+        if self.name:
+            lines.append(f"- 姓名：{self.name}")
+        if self.role:
+            lines.append(f"- 身份：{self.role}")
+        if self.location:
+            lines.append(f"- 所在地：{self.location}")
+        if self.language:
+            lines.append(f"- 语言：{self.language}")
+        for k, v in self.stable_preferences.items():
+            lines.append(f"- 偏好·{k}：{v}")
+        for k, v in self.stable_facts.items():
+            lines.append(f"- 事实·{k}：{v}")
+        return "\n".join(lines)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """dict 序列化，datetime 转 ISO 串（与 MemoryRecord.to_dict 保持一致）"""
+        data = self.model_dump()
+        data["updated_at"] = self.updated_at.isoformat()
+        return data
+
+    def __str__(self) -> str:
+        return f"UserProfile(user_id={self.user_id!r}, name={self.name!r}, role={self.role!r})"

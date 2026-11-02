@@ -49,7 +49,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 文档 | 内容 |
 |------|------|
 | [`docs/工具模块编写说明.md`](./docs/工具模块编写说明.md) | 工具的四种定义方式、`ToolBase` 全字段、`ToolResult` 协议、schema 导出、内置工具逐行讲解（含文件四件套的乐观锁与原子写入） |
-| [`docs/记忆模块编写说明.md`](./docs/记忆模块编写说明.md) | 短期 vs 长期两层设计、**记忆注入位置**、打分公式、SQLite 表结构、两个后端的真实差异 |
+| [`docs/记忆模块编写说明.md`](./docs/记忆模块编写说明.md) | 短期 vs 长期两层设计、**记忆注入位置**、打分公式、SQLite 表结构、语义检索包装器、结构化用户画像 |
 | [`docs/Skill模块编写说明.md`](./docs/Skill模块编写说明.md) | `SKILL.md` 标准、三级渐进式加载、`@skill` / `BaseSkill` 两种写法、与 LangChain / Anthropic 的对比 |
 | [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md) | 零依赖 JSON-RPC 实现、**细粒度 vs 粗粒度展开**、`MCPConfig` 声明式配置、Windows 专项 |
 | [`docs/context模块编写说明.md`](./docs/context模块编写说明.md) | Token 预算与三级降级计数、五层拼装顺序、三级压缩策略、工具结果卸载与按需回读、与主流框架的取舍 |
@@ -67,7 +67,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 💬 **消息系统** | `Message` / `Messages` 双层结构，原生支持 function calling（`tool_calls` / `tool_call_id`），可一键转 OpenAI 格式 |
 | 🔧 **工具系统** | `ToolBase` 抽象基类 + `StructuredTool` / `@tool` 装饰器 + `ToolRegistry` 注册表，四种定义方式，schema 自动生成 |
 | 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关 |
-| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回，支持 Agent 主动读写 |
+| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **结构化用户画像**（`ProfileStore`），支持 Agent 主动读写 |
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
@@ -225,18 +225,20 @@ fast_agents/
 │   │       ├── shell_detector.py     # 终端配套：shell 探测 + 路由执行
 │   │       ├── search_tool.py        # web_search
 │   │       ├── file_tool.py          # read_file / write_file / edit_file / multi_edit_file
-│   │       ├── memory_tool.py        # remember_memory / recall_memory / forget_memory
+│   │       ├── memory_tool.py        # remember_memory / recall_memory / forget_memory（+ update_user_profile）
 │   │       └── mcp_tool.py           # list_mcp_servers / connect_mcp_server / disconnect_mcp_server
 │   ├── memory/                   # ④ 记忆系统
 │   │   ├── __init__.py
-│   │   ├── schema.py             #    MemoryRecord / ContextPacket / MemoryKind
+│   │   ├── schema.py             #    MemoryRecord / ContextPacket / MemoryKind / UserProfile
 │   │   ├── memory_store_base.py               #    MemoryStoreBase 抽象接口
 │   │   ├── scoring.py            #    词法打分 + 时间衰减
 │   │   ├── buffer.py             #    BufferMemory：短期窗口 + 滚动摘要
 │   │   ├── session_store.py      #    SessionStore：短期会话落盘（SQLite / 内存两版）
 │   │   ├── in_memory_store.py    #    InMemoryStore：纯内存长期记忆
 │   │   ├── sqlite_store.py       #    SQLiteMemoryStore：持久化长期记忆
-│   │   └── manager.py            #    MemoryManager：短期 + 长期的门面
+│   │   ├── semantic_store.py     #    SemanticMemoryStore：语义检索包装器（B2，可选）
+│   │   ├── profile_store.py      #    ProfileStore：结构化用户画像（B3，可选，SQLite / 内存两版）
+│   │   └── manager.py            #    MemoryManager：短期 + 长期 + 画像的门面
 │   ├── skills/                   # ⑤ 技能系统
 │   │   ├── __init__.py
 │   │   ├── models.py             #    SkillMetadata / SkillLoadResult
@@ -466,6 +468,7 @@ registry.register_tool(now)    # 自动包成 StructuredTool
 | `RememberTool` | `remember_memory` | `content` / `kind` / `importance` | 写长期记忆 |
 | `RecallTool` | `recall_memory` | `query` / `limit` | 查长期记忆 |
 | `ForgetTool` | `forget_memory` | `memory_id` | 撤回一条记忆（支持前 8 位简写） |
+| `UpdateProfileTool` | `update_user_profile` | `field` / `value` | 更新结构化用户画像（B3，默认不装配，见 [记忆系统](#5-memory记忆系统)） |
 
 ```python
 from fast_agents import builtin
@@ -580,7 +583,7 @@ run(用户输入)
 
 ### 5. Memory（记忆系统）
 
-两层：**短期**（这次聊到哪了）+ **长期**（这个用户是谁）。
+两层：**短期**（这次聊到哪了）+ **长期**（这个用户是谁）。可选再叠一条**画像**通路——把稳定的「这个用户是谁」单独存成一份档案。
 
 ```python
 from fast_agents.memory import (
@@ -658,11 +661,12 @@ store.close()
 #### 门面：`MemoryManager`
 
 ```python
-from fast_agents.memory import MemoryManager, SQLiteMemoryStore
+from fast_agents.memory import MemoryManager, SQLiteMemoryStore, SQLiteProfileStore
 
 store = SQLiteMemoryStore("data/memory.db", user_id="u1", session_id="s1")
 memory = MemoryManager(
     long_term_store=store,     # 不传则用 InMemoryStore（不落盘！）
+    profile_store=SQLiteProfileStore("data/memory.db"),   # 可选：结构化用户画像
     max_messages=20,
     enable_summary=True,
     llm=llm,                   # 摘要 + 自动抽取都靠它
@@ -681,11 +685,31 @@ memory.extract_and_store()                            # 从 buffer 抽取长期�
 
 memory.forget(memory_id) / memory.forget_session() / memory.close()
 
+memory.get_profile()                                     # → UserProfile（未配 profile_store 时是空档案，不报错）
+memory.update_profile({"name": "张三", "location": "上海"})  # 按 patch 覆盖式合并
+memory.set_profile_field("preferences.编辑器", "vscode")   # 改单个字段
+
 memory.long_term      # 底层 store
 memory.buffer         # 底层 BufferMemory
 ```
 
 > ⚠️ **`long_term_store` 不传就是 `InMemoryStore`——不落盘。** 要跨会话必须显式传 `SQLiteMemoryStore`。
+
+#### 用户画像（B3，可选）
+
+想让 Agent 有一份稳定的用户档案（姓名 / 身份 / 所在地 / 惯用语言 / 长期偏好），就给它一个 `ProfileStore`：
+
+```python
+from fast_agents.memory import SQLiteProfileStore
+
+profile_store = SQLiteProfileStore("data/memory.db")   # 与长期记忆共用同一个 .db，第三张独立表
+memory.set_profile_field("location", "上海")             # 支持 name / role / location / language
+memory.set_profile_field("preferences.语言", "中文")      # 也支持 preferences.<键> / facts.<键>
+print(memory.get_profile().to_text())                  # 渲染成可注入 prompt 的多行文本
+```
+
+> 画像与长期记忆**分表存放、互不干扰**：画像不会混进 `memories` 表、也不参与 `retrieve()` 打分。不配 `profile_store` 时 `get_profile()` 返回空档案、`update_profile()` 会报错（读不炸、写才提示）。
+> 画像是**一份、覆盖式更新**的档案；长期记忆是**碎片、可检索**的集合——两者职责不同，别互相替代。
 
 #### 让模型自己管记忆
 
@@ -693,6 +717,10 @@ memory.buffer         # 底层 BufferMemory
 from fast_agents.tools.builtin import build_memory_tools
 
 for t in build_memory_tools(memory):     # 一次拿三个工具
+    registry.register_tool(t)
+
+# 想让模型顺手维护用户画像：manager 配好 profile_store 后
+for t in build_memory_tools(memory, include_profile=True):   # 多一个 update_user_profile
     registry.register_tool(t)
 ```
 
@@ -1117,12 +1145,12 @@ python test\test_mcp.py
 | 🔧 **tools** | ✅ 已实现 | RAG 工具（A7，I1/B2 已就位）、Tavily 生产级搜索默认化、成本权限审计、工具组合 pipeline |
 | 🧩 **skill** | ✅ 已实现 | 技能市场 / 技能依赖 / 技能版本管理、脚本沙箱、默认扫描路径统一 |
 | 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输、`resources` / `prompts`、图片透传、stderr 消费 |
-| 🧠 **memory** | ✅ 已实现 | 用户画像（ProfileStore）、双通道注入、记忆衰减合并、多租户 |
+| 🧠 **memory** | ✅ 已实现 | 双通道注入（B4）、记忆衰减合并（B5）、多租户 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
 | 🪟 **context** | ✅ 已实现 | 摘要中间件化（F4）、prompt caching 断点（F5）、embedding 召回扩展位 |
 | 🛠 **infra** | ⏳ 规划中 | `TraceLogger`、评估工具、异步、打包发布 |
 
-**当前 P1 重点**：RAG 工具（A7）、用户画像（B3）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）。P0 已全部清零。
+**当前 P1 重点**：RAG 工具（A7）、双通道注入（B4）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）。P0 已全部清零。
 
 ---
 

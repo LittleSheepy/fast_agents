@@ -20,14 +20,19 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fast_agents.memory import (
     BufferMemory,
+    InMemoryProfileStore,
     InMemoryStore,
     MemoryManager,
     MemoryRecord,
     SemanticMemoryStore,
     SQLiteMemoryStore,
+    SQLiteProfileStore,
+    UserProfile,
     lexical_score,
 )
-from fast_agents.tools.builtin import RememberTool, RecallTool, ForgetTool
+from fast_agents.tools.builtin import (
+    RememberTool, RecallTool, ForgetTool, UpdateProfileTool,
+)
 from fast_agents.messages.message import Message
 
 
@@ -366,6 +371,137 @@ def test_semantic_revise_and_crud():
     print("✅ test_semantic_revise_and_crud 通过（B2 revise/delete/clear 正常）")
 
 
+# ===================== B3 / v1.5.0：结构化用户画像 =====================
+
+def test_profile_merge_and_override():
+    """B3：画像字段级覆盖式合并；dict 浅合并；None 不覆盖；非法字段报错"""
+    store = InMemoryProfileStore()
+    assert store.get("u1").is_empty(), "新用户应为空档案"
+
+    p = store.merge("u1", {"name": "张三", "role": "后端工程师"})
+    assert p.name == "张三" and p.role == "后端工程师"
+
+    p = store.merge("u1", {"name": "张三丰"})
+    assert p.name == "张三丰", "同名字段应被后写覆盖"
+    assert p.role == "后端工程师", "patch 里没提到的字段应保留"
+
+    p = store.set_field("u1", "preferences.编辑器", "vscode")
+    assert p.stable_preferences == {"编辑器": "vscode"}
+
+    p = store.set_field("u1", "preferences.语言", "中文")
+    assert p.stable_preferences == {"编辑器": "vscode", "语言": "中文"}, "键值字段应浅合并"
+
+    p = store.set_field("u1", "facts.公司", "某厂")
+    assert p.stable_facts == {"公司": "某厂"}
+
+    p = store.merge("u1", {"name": None, "location": None})
+    assert p.name == "张三丰", "None 不应覆盖已有值"
+
+    # 未知顶层键被静默忽略，不会往模型上乱塞属性
+    p = store.merge("u1", {"not_a_field": "x"})
+    assert not hasattr(p, "not_a_field")
+
+    # 非法字段名应显式报错，而不是写脏键
+    try:
+        store.set_field("u1", "bogus", "x")
+        raise AssertionError("非法字段应抛 ValueError")
+    except ValueError:
+        pass
+
+    assert store.get("u1").to_text(), "to_text() 应能渲染出非空文本"
+    assert store.get("u1").to_dict()["name"] == "张三丰"
+    print("✅ test_profile_merge_and_override 通过（B3 覆盖式合并）")
+
+
+def test_profile_sqlite_persistence():
+    """B3：画像落盘 SQLite，换实例仍能读回；不同 user_id 互相隔离"""
+    with tempfile.TemporaryDirectory() as d:
+        db = os.path.join(d, "memory.db")
+
+        s1 = SQLiteProfileStore(db)
+        s1.merge("alice", {"name": "Alice", "location": "上海"})
+        s1.set_field("alice", "preferences.编辑器", "vim")
+        s1.close()
+
+        s2 = SQLiteProfileStore(db)
+        p = s2.get("alice")
+        assert p.name == "Alice" and p.location == "上海"
+        assert p.stable_preferences == {"编辑器": "vim"}
+        assert s2.get("bob").is_empty(), "画像应按 user_id 隔离"
+        s2.close()
+
+    print("✅ test_profile_sqlite_persistence 通过（B3 持久化 + 隔离）")
+
+
+def test_profile_manager_integration():
+    """B3：MemoryManager 整合——读写正常、画像不污染长期记忆、未配置时降级"""
+    with tempfile.TemporaryDirectory() as d:
+        db = os.path.join(d, "memory.db")
+        mgr = MemoryManager(
+            long_term_store=SQLiteMemoryStore(db, user_id="u1"),
+            profile_store=SQLiteProfileStore(db),
+            user_id="u1",
+        )
+        assert mgr.get_profile().is_empty()
+
+        mgr.set_profile_field("location", "上海")
+        mgr.set_profile_field("preferences.语言", "中文")
+        p = mgr.get_profile()
+        assert p.location == "上海"
+        assert p.stable_preferences == {"语言": "中文"}
+
+        mgr.update_profile({"role": "后端工程师"})
+        assert mgr.get_profile().role == "后端工程师", "update_profile 应按 patch 覆盖式合并"
+
+        # 画像是独立的一份档案，不进长期记忆检索链路
+        assert mgr.long_term.all() == [], "画像不应写进长期记忆表"
+        mgr.close()
+
+    # 未配置 profile_store：读返回空档案，写明确报错
+    mgr2 = MemoryManager(user_id="u2")
+    assert mgr2.get_profile().is_empty(), "未配置时应返回空档案而不是抛错"
+    try:
+        mgr2.update_profile({"name": "x"})
+        raise AssertionError("未配置 profile_store 时写入应抛 RuntimeError")
+    except RuntimeError as e:
+        assert "profile_store" in str(e)
+
+    print("✅ test_profile_manager_integration 通过（B3 Manager 整合 + 降级）")
+
+
+def test_profile_tool():
+    """B3：update_user_profile 工具；默认不装配，include_profile=True 才加入"""
+    from fast_agents.tools.builtin import build_memory_tools
+
+    mgr = MemoryManager(profile_store=InMemoryProfileStore(), user_id="u1")
+
+    assert len(build_memory_tools(mgr)) == 3, "默认仍返回三个工具（向后兼容）"
+    tools = build_memory_tools(mgr, include_profile=True)
+    assert len(tools) == 4
+    tool = tools[-1]
+    assert tool.name == "update_user_profile"
+    assert tool.to_openai_tool()["function"]["name"] == "update_user_profile"
+
+    res = tool.invoke(field="name", value="张三")
+    assert not res.failed, res
+    assert mgr.get_profile().name == "张三"
+
+    res = tool.invoke(field="preferences.编辑器", value="vscode")
+    assert not res.failed, res
+    assert mgr.get_profile().stable_preferences == {"编辑器": "vscode"}
+
+    # 空 field / 非法字段 → 失败结果，不抛异常
+    assert tool.invoke(field="", value="x").failed
+    assert tool.invoke(field="bogus", value="x").failed
+
+    # 未配置 profile_store 的 manager：工具返回失败，而不是崩掉
+    mgr2 = MemoryManager(user_id="u2")
+    r2 = UpdateProfileTool(mgr2).invoke(field="name", value="x")
+    assert r2.failed and "profile_store" in r2.error
+
+    print("✅ test_profile_tool 通过（B3 画像工具）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -381,4 +517,8 @@ if __name__ == "__main__":
     test_semantic_synonym_recall()
     test_semantic_graceful_degrade()
     test_semantic_revise_and_crud()
+    test_profile_merge_and_override()
+    test_profile_sqlite_persistence()
+    test_profile_manager_integration()
+    test_profile_tool()
     print("\n🎉 全部测试通过")

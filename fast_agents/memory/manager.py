@@ -10,7 +10,7 @@ MemoryManager 是整个记忆系统的门面（facade），把短期和长期两
         ↓
     [写入] buffer.append(对话) + 可选 long_term.add(抽取出的记忆)
 
-对外只暴露 3 个动作：retrieve / record / build_context，
+对外只暴露 4 个动作：retrieve / record / build_context / update_profile，
 Agent 侧不需要知道底下是 SQLite 还是内存。
 """
 
@@ -22,7 +22,8 @@ from ..messages.message import Message
 from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory, DEFAULT_SUMMARY_PROMPT
 from .in_memory_store import InMemoryStore
-from .schema import ContextPacket, MemoryKind, MemoryRecord
+from .profile_store import ProfileStore
+from .schema import ContextPacket, MemoryKind, MemoryRecord, UserProfile
 from .session_store import SessionStore
 
 
@@ -56,6 +57,7 @@ class MemoryManager:
         *,
         long_term_store: Optional[MemoryStoreBase] = None,
         session_store: Optional[SessionStore] = None,
+        profile_store: Optional[ProfileStore] = None,
         max_messages: int = 20,
         enable_summary: bool = True,
         llm=None,
@@ -70,6 +72,9 @@ class MemoryManager:
             session_store: 短期会话持久化后端（SQLiteSessionStore），
                 不传则短期记忆纯内存（进程重启即丢，原有行为不变）。
                 对应演进路线 B1 —— 传此参数后，进程重启能自动恢复上次会话。
+            profile_store: 结构化用户画像后端（SQLiteProfileStore），
+                不传则没有画像（get_profile() 返回空档案，不报错）。
+                对应演进路线 B3 —— 画像与长期记忆是两份数据，互不影响。
             max_messages: 短期窗口大小
             enable_summary: 短期是否开启滚动摘要
             llm: LLM 实例，摘要与自动抽取都依赖它
@@ -83,6 +88,7 @@ class MemoryManager:
         self.extract_prompt = extract_prompt or DEFAULT_EXTRACT_PROMPT
 
         self.long_term: MemoryStoreBase = long_term_store or InMemoryStore()
+        self.profile_store = profile_store
         self.buffer = BufferMemory(
             max_messages=max_messages,
             enable_summary=enable_summary,
@@ -251,7 +257,41 @@ class MemoryManager:
         """清空短期记忆（会话结束调用）"""
         self.buffer.clear()
 
+    # ---------- 4. 用户画像（B3） ----------
+
+    def get_profile(self) -> UserProfile:
+        """读取当前用户的画像
+
+        未配置 profile_store 时返回**空档案**（不报错），
+        这样上层不用为「有没有画像」写特判。
+        """
+        if self.profile_store is None:
+            return UserProfile(user_id=self.user_id)
+        return self.profile_store.get(self.user_id)
+
+    def update_profile(
+        self, patch: Dict[str, Any], *, source: str = "manual"
+    ) -> UserProfile:
+        """按 patch 覆盖式合并画像（需先配置 profile_store）
+
+        未配置时直接 `raise RuntimeError`——画像写入属于「用户明确要求记住」，
+        静默丢弃会让上层以为记下了、其实没有，比报错更危险。
+        """
+        if self.profile_store is None:
+            raise RuntimeError("未配置 profile_store，无法更新用户画像")
+        return self.profile_store.merge(self.user_id, patch or {}, source=source)
+
+    def set_profile_field(
+        self, field: str, value: str, *, source: str = "manual"
+    ) -> UserProfile:
+        """更新画像的单个字段（字段写法见 `profile_store.build_field_patch`）"""
+        if self.profile_store is None:
+            raise RuntimeError("未配置 profile_store，无法更新用户画像")
+        return self.profile_store.set_field(self.user_id, field, value, source=source)
+
     def close(self) -> None:
         self.long_term.close()
         if self.buffer.persist_store is not None:
             self.buffer.persist_store.close()
+        if self.profile_store is not None:
+            self.profile_store.close()

@@ -1,15 +1,20 @@
-"""记忆工具 —— 让 Agent 能主动读/写/撤回长期记忆。
+"""记忆工具 —— 让 Agent 能主动读/写/撤回长期记忆，并维护用户画像。
 
-提供三个工具：
-- remember_memory: 写入长期记忆（支持偏好/事实/做法/事件四类）
-- recall_memory:  按关键词检索长期记忆
-- forget_memory:  撤回一条记忆（软删除，保留 audit trail）
+提供四个工具：
+- remember_memory:     写入长期记忆（支持偏好/事实/做法/事件四类）
+- recall_memory:       按关键词检索长期记忆
+- forget_memory:       撤回一条记忆（软删除，保留 audit trail）
+- update_user_profile: 更新结构化用户画像（B3 新增，默认不装配，见下方说明）
 
 使用方式：
     from fast_agents.memory import MemoryManager
     from fast_agents.tools.builtin import build_memory_tools
     mem = MemoryManager(llm=llm)
-    for t in build_memory_tools(mem):
+    for t in build_memory_tools(mem):        # 默认三个（与之前一致）
+        agent.add_tool(t)
+
+    # 想额外把「更新画像」交给模型，且 MemoryManager 已配 profile_store：
+    for t in build_memory_tools(mem, include_profile=True):   # 四个
         agent.add_tool(t)
 """
 
@@ -37,6 +42,14 @@ class RecallInput(BaseModel):
 
 class ForgetInput(BaseModel):
     memory_id: str = Field(description="要撤回的记忆 id（支持前 8 位简写）")
+
+
+class UpdateProfileInput(BaseModel):
+    field: str = Field(
+        description="要更新的画像字段：name(姓名)/role(身份)/location(所在地)/language(语言)，"
+                    "或 preferences.<键>（稳定偏好）、facts.<键>（稳定事实）"
+    )
+    value: str = Field(description="字段的值，用简短的字符串表述")
 
 
 class RememberTool(ToolBase):
@@ -105,6 +118,42 @@ class ForgetTool(ToolBase):
         return ToolResult.fail(f"未找到记忆 {memory_id}")
 
 
-def build_memory_tools(manager: MemoryManager) -> list:
-    """一次性创建三个记忆工具。返回的是 ToolBase 实例列表，可直接传给 agent.add_tool / registry.register_tools。"""
-    return [RememberTool(manager), RecallTool(manager), ForgetTool(manager)]
+class UpdateProfileTool(ToolBase):
+    name = "update_user_profile"
+    description = (
+        "更新用户画像里的稳定信息（姓名、身份、所在地、语言，或长期偏好/事实）。"
+        "当用户明确告知自己的稳定信息、或要求你长期记住某项偏好时调用；一次只更新一个字段。"
+    )
+    args_schema = UpdateProfileInput
+    tags = ["memory", "profile"]
+
+    def __init__(self, manager: MemoryManager):
+        super().__init__()
+        self.manager = manager
+
+    def run(self, field: str, value: str) -> Union[str, ToolResult]:
+        if not (field or "").strip():
+            return ToolResult.fail("field 不能为空")
+        if not (value or "").strip():
+            return ToolResult.fail("value 不能为空")
+        try:
+            profile = self.manager.set_profile_field(field, value, source="agent_tool")
+        except (ValueError, RuntimeError) as e:
+            return ToolResult.fail(str(e))
+        return ToolResult.ok(
+            f"已更新用户画像：{field} = {value}",
+            artifact={"profile": profile.to_dict()},
+        )
+
+
+def build_memory_tools(manager: MemoryManager, *, include_profile: bool = False) -> list:
+    """一次性创建记忆工具，返回 ToolBase 实例列表，可直接传给 agent.add_tool / registry.register_tools。
+
+    默认返回三个（remember / recall / forget），行为与之前完全一致；
+    include_profile=True 时额外带上 update_user_profile —— 此时 MemoryManager 需要配了
+    profile_store，否则工具调用会返回「未配置 profile_store」的失败提示。
+    """
+    tools = [RememberTool(manager), RecallTool(manager), ForgetTool(manager)]
+    if include_profile:
+        tools.append(UpdateProfileTool(manager))
+    return tools

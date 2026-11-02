@@ -4,7 +4,8 @@ from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory
 from .in_memory_store import InMemoryStore
 from .manager import MemoryManager
-from .schema import ContextPacket, MemoryKind, MemoryRecord, MemoryStatus
+from .profile_store import InMemoryProfileStore, ProfileStore, SQLiteProfileStore
+from .schema import ContextPacket, MemoryKind, MemoryRecord, MemoryStatus, UserProfile
 from .scoring import (
     combined_score, cosine_similarity, lexical_score, lexical_terms,
     rank_records, score_record, time_decay,
@@ -15,6 +16,7 @@ from .sqlite_store import SQLiteMemoryStore
 
 __all__ = [
     "MemoryRecord", "MemoryKind", "MemoryStatus", "ContextPacket",
+    "UserProfile", "ProfileStore", "SQLiteProfileStore", "InMemoryProfileStore",
     "MemoryStoreBase", "InMemoryStore", "SQLiteMemoryStore",
     "SemanticMemoryStore",
     "SessionStore", "SQLiteSessionStore", "InMemorySessionStore",
