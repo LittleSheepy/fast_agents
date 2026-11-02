@@ -635,6 +635,249 @@ def test_success_is_not_truncated():
     print("✅ SUCCESS/ERROR 态 is_truncated=False 通过")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# A15: A8 并发执行 / A9 人工审批 / A10 超时熔断 测试护栏
+# ──────────────────────────────────────────────────────────────────────────
+
+def _sleep_tool(name: str, seconds: float):
+    """构造一个耗时 seconds 的测试工具（并发测试需要不同名的工具共存）。"""
+    import time
+
+    class _SleepTool(ToolBase):
+        def run(self):
+            time.sleep(seconds)
+            return f"{name} done"
+
+    return _SleepTool(name=name, description=f"耗时 {seconds}s 的测试工具")
+
+
+def _approval_tool(name: str = "approval_tool"):
+    """构造一个标记了 requires_approval 的测试工具。"""
+
+    class _ApprovalTool(ToolBase):
+        def run(self, expression: str = "1+1"):
+            return f"expr={expression}"
+
+    return _ApprovalTool(
+        name=name,
+        description="需要审批的测试工具",
+        metadata={"requires_approval": True},
+    )
+
+
+def test_concurrent_runs_in_parallel():
+    """A8：多个无依赖工具并发执行，总耗时取最大值而非累加。"""
+    import time
+    reg = ToolRegistry(max_workers=4, default_timeout=300)
+    reg.register_tools(
+        _sleep_tool("s1", 0.3),
+        _sleep_tool("s2", 0.3),
+        _sleep_tool("s3", 0.3),
+    )
+    start = time.perf_counter()
+    results = reg.invoke_tools_concurrent([("s1", None), ("s2", None), ("s3", None)])
+    elapsed = time.perf_counter() - start
+    assert len(results) == 3
+    assert all(r.succeeded for r in results.values()), results
+    # 串行约需 0.9s；并发应接近 0.3s，上界留足抖动余量
+    assert elapsed < 0.7, f"并发未生效，总耗时 {elapsed:.3f}s（串行约 0.9s）"
+    print(f"✅ A8 并发总耗时 {elapsed:.3f}s（< 0.7s）通过")
+
+
+def test_concurrent_empty_calls_returns_empty():
+    """A8：空调用列表返回空字典，不报错。"""
+    reg = ToolRegistry()
+    assert reg.invoke_tools_concurrent([]) == {}
+    print("✅ A8 空调用列表返回 {} 通过")
+
+
+def test_concurrent_exception_isolated():
+    """A8：单个工具抛异常不影响其它工具，异常那个以失败返回。"""
+
+    class BoomTool(ToolBase):
+        name = "boom_tool"
+        description = "必然抛异常的测试工具"
+
+        def run(self):
+            raise ValueError("故意炸")
+
+    reg = ToolRegistry()
+    reg.register_tools(_sleep_tool("ok_tool", 0.05), BoomTool())
+    results = reg.invoke_tools_concurrent([("ok_tool", None), ("boom_tool", None)])
+    assert results["ok_tool"].succeeded
+    assert results["boom_tool"].failed
+    assert "故意炸" in results["boom_tool"].output
+    print("✅ A8 单工具异常被隔离通过")
+
+
+def test_concurrent_partial_timeout():
+    """A8：整体超时后，已完成的工具保留结果，未完成的标记超时失败。"""
+    reg = ToolRegistry(max_workers=4)
+    reg.register_tools(_sleep_tool("fast_tool", 0.05), _sleep_tool("slow_tool", 0.5))
+    results = reg.invoke_tools_concurrent(
+        [("fast_tool", None), ("slow_tool", None)], timeout=0.2
+    )
+    assert results["fast_tool"].succeeded, results
+    assert results["slow_tool"].failed
+    assert "超时" in results["slow_tool"].output
+    print("✅ A8 整体超时：快的保留、慢的标记超时通过")
+
+
+def test_approval_approved():
+    """A9：审批通过后正常执行。"""
+    reg = ToolRegistry()
+    reg.register_tool(_approval_tool())
+    reg.set_approval_callback(lambda name, args: (True, None, ""))
+    r = reg.invoke_tool("approval_tool", {"expression": "1+1"})
+    assert r.succeeded, r.output
+    assert r.output == "expr=1+1"
+    print("✅ A9 审批通过后正常执行通过")
+
+
+def test_approval_rejected():
+    """A9：审批拒绝时工具不执行，返回失败并带上原因。"""
+    executed = []
+
+    class SpyTool(ToolBase):
+        name = "spy_tool"
+        description = "记录是否执行过的审批工具"
+        metadata = {"requires_approval": True}
+
+        def run(self, expression: str = "1+1"):
+            executed.append(expression)
+            return f"expr={expression}"
+
+    reg = ToolRegistry()
+    reg.register_tool(SpyTool())
+    reg.set_approval_callback(lambda name, args: (False, None, "不安全"))
+    r = reg.invoke_tool("spy_tool", {"expression": "1+1"})
+    assert r.failed
+    assert "被拒绝" in r.output
+    assert "不安全" in r.output
+    assert executed == [], "被拒绝的工具不应执行"
+    print("✅ A9 审批拒绝：不执行 + 失败带原因 通过")
+
+
+def test_approval_modified_args():
+    """A9：审批回调可改写参数，工具用改写后的参数执行。"""
+    reg = ToolRegistry()
+    reg.register_tool(_approval_tool())
+    reg.set_approval_callback(lambda name, args: (True, {"expression": "2+2"}, ""))
+    r = reg.invoke_tool("approval_tool", {"expression": "1+1"})
+    assert r.succeeded, r.output
+    assert r.output == "expr=2+2", f"未使用改写后的参数: {r.output!r}"
+    print("✅ A9 审批改写参数生效通过")
+
+
+def test_approval_callback_exception():
+    """A9：审批回调抛异常时返回失败，不抛穿到调用方。"""
+    reg = ToolRegistry()
+    reg.register_tool(_approval_tool())
+
+    def boom(name, args):
+        raise RuntimeError("回调炸了")
+
+    reg.set_approval_callback(boom)
+    r = reg.invoke_tool("approval_tool", {"expression": "1+1"})
+    assert r.failed
+    assert "审批流程异常" in r.output
+    print("✅ A9 审批回调异常：失败返回不抛穿 通过")
+
+
+def test_approval_skipped_without_callback():
+    """A9：未设置审批回调时，即使工具标记了 requires_approval 也直接执行。"""
+    reg = ToolRegistry()
+    reg.register_tool(_approval_tool())
+    r = reg.invoke_tool("approval_tool", {"expression": "3+3"})
+    assert r.succeeded, r.output
+    assert r.output == "expr=3+3"
+    print("✅ A9 无回调时直接执行通过")
+
+
+def test_approval_not_triggered_for_unmarked_tool():
+    """A9：未标记 requires_approval 的工具不触发审批回调。"""
+    calls = []
+
+    class PlainTool(ToolBase):
+        name = "plain_tool"
+        description = "无需审批的测试工具"
+
+        def run(self):
+            return "plain ok"
+
+    reg = ToolRegistry()
+    reg.register_tool(PlainTool())
+    reg.set_approval_callback(
+        lambda name, args: (calls.append(name), (False, None, "x"))[1]
+    )
+    r = reg.invoke_tool("plain_tool", {})
+    assert r.succeeded
+    assert calls == [], f"未标记的工具不该触发审批，实际调用 {calls}"
+    print("✅ A9 未标记工具不触发审批通过")
+
+
+def test_approval_skip_flag_bypasses_callback():
+    """A9：skip_approval=True 时跳过审批（并发内部路径依赖此语义）。"""
+    calls = []
+    reg = ToolRegistry()
+    reg.register_tool(_approval_tool())
+    reg.set_approval_callback(
+        lambda name, args: (calls.append(name), (False, None, "rejected"))[1]
+    )
+    r = reg.invoke_tool("approval_tool", {"expression": "4+4"}, skip_approval=True)
+    assert r.succeeded, r.output
+    assert r.output == "expr=4+4"
+    assert calls == [], "skip_approval=True 不应触发回调"
+    print("✅ A9 skip_approval 跳过审批通过")
+
+
+def test_timeout_returns_failure():
+    """A10：超过单次超时返回明确失败。"""
+    reg = ToolRegistry()
+    reg.register_tool(_sleep_tool("slow_timeout_tool", 0.5))
+    r = reg.invoke_tool("slow_timeout_tool", {}, timeout=0.1)
+    assert r.failed
+    assert "超时" in r.output
+    print("✅ A10 超时返回明确失败通过")
+
+
+def test_timeout_not_triggered_when_fast():
+    """A10：快速工具不受超时影响（防误伤）。"""
+    reg = ToolRegistry()
+    reg.register_tool(_sleep_tool("fast_timeout_tool", 0.02))
+    r = reg.invoke_tool("fast_timeout_tool", {}, timeout=5)
+    assert r.succeeded, r.output
+    print("✅ A10 快工具不被超时误伤通过")
+
+
+def test_duration_ms_is_int():
+    """A10：结果 metadata 携带整型 duration_ms。"""
+    calc = builtin.CalculatorTool()
+    r = calc.invoke(expression="1+1")
+    d = r.metadata.get("duration_ms")
+    assert isinstance(d, int), f"duration_ms 应为 int，实际 {type(d).__name__}"
+    assert d >= 0
+    print("✅ duration_ms 为 int 且 >= 0 通过")
+
+
+def test_write_append_preserves_existing_content():
+    """A6：write_file 的 append=True 追加而非覆盖。"""
+    import tempfile
+    from pathlib import Path
+    from fast_agents.tools.builtin.file_tool import WriteTool
+
+    with tempfile.TemporaryDirectory() as tmp:
+        wt = WriteTool(workspace=tmp)
+        wt.invoke(path="log.txt", content="line1")
+        r = wt.invoke(path="log.txt", content="line2", append=True)
+        assert r.succeeded, r.output
+        content = (Path(tmp) / "log.txt").read_text(encoding="utf-8")
+        assert "line1" in content and "line2" in content, f"追加丢失原内容: {content!r}"
+        assert content.index("line1") < content.index("line2"), "追加内容顺序错误"
+    print("✅ write_file append=True 追加不覆盖通过")
+
+
+
 if __name__ == "__main__":
     from pathlib import Path  # for test_terminal
     tests = [
@@ -662,6 +905,21 @@ if __name__ == "__main__":
         test_coerce_fallback_for_non_serializable,
         test_truncated_semantics,
         test_success_is_not_truncated,
+        test_concurrent_runs_in_parallel,
+        test_concurrent_empty_calls_returns_empty,
+        test_concurrent_exception_isolated,
+        test_concurrent_partial_timeout,
+        test_approval_approved,
+        test_approval_rejected,
+        test_approval_modified_args,
+        test_approval_callback_exception,
+        test_approval_skipped_without_callback,
+        test_approval_not_triggered_for_unmarked_tool,
+        test_approval_skip_flag_bypasses_callback,
+        test_timeout_returns_failure,
+        test_timeout_not_triggered_when_fast,
+        test_duration_ms_is_int,
+        test_write_append_preserves_existing_content,
     ]
     failed = 0
     for t in tests:
