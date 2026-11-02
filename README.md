@@ -1162,7 +1162,7 @@ python test\test_mcp.py
 
 | 模块 | 状态 | 下一步重点 |
 |------|------|-----------|
-| 🔧 **tools** | ✅ 已实现 | RAG 工具（A7，I1/B2 已就位）、Tavily 生产级搜索默认化、成本权限审计、工具组合 pipeline |
+| 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A20 计算器 AST 迁移） | **P0：A15 补 A8/A9/A10 测试护栏（并发 / 审批 / 超时 / `append` / `duration_ms` 当前零覆盖）**；**P1**：A16 并发与超时语义加固、A17 装饰器透出 `metadata`、A18 `return_direct` 落地、RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：异步 `arun`、跨平台 Shell、`ToolRegistry` 清理、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
 | 🧩 **skill** | ✅ 已实现 | 技能市场 / 技能依赖 / 技能版本管理、脚本沙箱、默认扫描路径统一 |
 | 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输、`resources` / `prompts`、图片透传、stderr 消费 |
 | 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地 |
@@ -1170,7 +1170,7 @@ python test\test_mcp.py
 | 🪟 **context** | ✅ 已实现（v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、embedding 召回扩展位 |
 | 🛠 **infra** | ⏳ 规划中 | `TraceLogger`、评估工具、异步、打包发布 |
 
-**当前 P1 重点**：RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）。P0 已全部清零。
+**当前 P0 重点**：工具模块测试护栏（A15，回补 A8/A9/A10 的并发 / 审批 / 超时能力用例）。**当前 P1 重点**：并发 / 超时语义加固（A16）、RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）——除新回补的 A15 外，原 P0 已全部清零。
 
 ---
 
