@@ -371,6 +371,87 @@ def test_plus_operator():
 
 
 # ─────────────────────────────────────────────────────────
+# A24: 截断时保留原有artifact与metadata，不覆盖下游所需数据
+# ─────────────────────────────────────────────────────────
+def test_truncation_preserves_dict_artifact():
+    """截断时保留原有dict artifact，追加截断标记，不覆盖content_hash等乐观锁凭证"""
+    class LongDictTool(ToolBase):
+        name = "long_dict"
+        description = "返回长文本+dict artifact"
+        max_output_chars = 50
+
+        def run(self, **kwargs):
+            return ToolResult.ok(
+                output="a" * 200,
+                artifact={"content_hash": "abc123", "size": 200, "line_count": 5},
+                metadata={"source": "test_file"},
+            )
+
+    t = LongDictTool()
+    res = t.invoke()
+    assert res.status == ToolStatus.TRUNCATED
+    # 原有artifact字段保留
+    assert res.artifact["content_hash"] == "abc123"
+    assert res.artifact["size"] == 200
+    assert res.artifact["line_count"] == 5
+    # 追加截断标记
+    assert res.artifact["truncated"] is True
+    assert res.artifact["original_length"] == 200
+    assert res.artifact["limit"] == 50
+    # 原有metadata保留
+    assert res.metadata["source"] == "test_file"
+    assert res.metadata["truncated"] is True
+    assert "duration_ms" in res.metadata
+    print("✅ 截断保留dict artifact（含乐观锁字段）通过")
+
+
+def test_truncation_preserves_non_dict_artifact():
+    """非dict类型artifact会被包在data字段里，不会丢失"""
+    class LongListTool(ToolBase):
+        name = "long_list"
+        description = "返回长文本+列表artifact"
+        max_output_chars = 30
+
+        def run(self, **kwargs):
+            return ToolResult.ok(
+                output="b" * 100,
+                artifact=[1, 2, 3, 4],
+            )
+
+    t = LongListTool()
+    res = t.invoke()
+    assert res.status == ToolStatus.TRUNCATED
+    # 原有数据保存在data字段
+    assert res.artifact["data"] == [1, 2, 3, 4]
+    assert res.artifact["truncated"] is True
+    print("✅ 截断保留非dict artifact通过")
+
+
+def test_read_large_file_preserves_hash_for_optimistic_lock():
+    """读大文件被截断后仍返回content_hash，乐观锁凭证不丢失（真实场景验证）"""
+    from fast_agents.tools.builtin.file_tool import ReadTool, _sha256_bytes
+    import tempfile, os
+
+    class SmallMaxReadTool(ReadTool):
+        """测试用子类，降低截断阈值"""
+        max_output_chars = 20_000
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fpath = os.path.join(tmp, "big.txt")
+        content = "x" * 200_000  # 20万字符，远大于2万阈值
+        raw_bytes = content.encode("utf-8")
+        with open(fpath, "wb") as f:
+            f.write(raw_bytes)
+        expected_hash = _sha256_bytes(raw_bytes, encoding="utf-8")  # 取前16位短hash，与file_tool口径一致
+
+        reader = SmallMaxReadTool(workspace=tmp)
+        res = reader.invoke(path="big.txt")
+        assert res.status == ToolStatus.TRUNCATED
+        # 最关键：乐观锁需要的content_hash必须保留，否则后续write_file无法做冲突检测
+        assert res.artifact["content_hash"] == expected_hash
+        assert res.artifact["truncated"] is True
+        assert "duration_ms" in res.metadata
+    print("✅ 大文件截断保留content_hash（乐观锁凭证不丢失）通过")
 
 
 # ─────────────────────────────────────────────────────────
@@ -437,6 +518,9 @@ if __name__ == "__main__":
         test_read_file,
         test_registry_batch_and_hook,
         test_plus_operator,
+        test_truncation_preserves_dict_artifact,
+        test_truncation_preserves_non_dict_artifact,
+        test_read_large_file_preserves_hash_for_optimistic_lock,
         test_nested_model_ref_expansion,
     ]
     failed = 0

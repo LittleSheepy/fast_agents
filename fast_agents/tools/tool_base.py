@@ -215,7 +215,13 @@ class ToolBase(ABC):
         if self.max_output_chars and len(result.output) > self.max_output_chars:
             duration = int((_time.perf_counter() - start_time) * 1000)
             truncated_output = result.output[: self.max_output_chars]
-            result = ToolResult.truncated(truncated_output, len(result.output), self.max_output_chars)
+            result = ToolResult.truncated(
+                truncated_output,
+                len(result.output),
+                self.max_output_chars,
+                artifact=result.artifact,
+                metadata=result.metadata,
+            )
             result.metadata["duration_ms"] = duration
         self._after_run(validated, result)
         return result
@@ -261,7 +267,13 @@ class ToolBase(ABC):
         result.metadata["duration_ms"] = int((_time.perf_counter() - start_time) * 1000)
         if self.max_output_chars and len(result.output) > self.max_output_chars:
             duration = int((_time.perf_counter() - start_time) * 1000)
-            result = ToolResult.truncated(result.output[: self.max_output_chars], len(result.output), self.max_output_chars)
+            result = ToolResult.truncated(
+                result.output[: self.max_output_chars],
+                len(result.output),
+                self.max_output_chars,
+                artifact=result.artifact,
+                metadata=result.metadata,
+            )
             result.metadata["duration_ms"] = duration
         self._after_run(validated, result)
         return result

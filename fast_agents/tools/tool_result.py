@@ -45,12 +45,29 @@ class ToolResult:
         )
 
     @classmethod
-    def truncated(cls, output: str, original_length: int, limit: int) -> "ToolResult":
+    def truncated(
+        cls,
+        output: str,
+        original_length: int,
+        limit: int,
+        artifact: Any = None,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> "ToolResult":
         note = f"\n\n[⚠️ 输出已截断：原始 {original_length} 字符，已返回前 {limit} 字符。可使用更精确的查询缩小范围。]"
+        # 保留原有artifact，追加截断标记，不覆盖下游工具需要的结构化数据（如乐观锁hash、搜索结果等）
+        merged_artifact: Any
+        if isinstance(artifact, dict):
+            merged_artifact = {**artifact, "truncated": True, "original_length": original_length, "limit": limit}
+        else:
+            merged_artifact = {"data": artifact, "truncated": True, "original_length": original_length, "limit": limit}
+        # 保留原有metadata，追加截断标记，不覆盖duration_ms等执行元数据
+        merged_metadata = dict(metadata or {})
+        merged_metadata["truncated"] = True
         return cls(
             output=output + note,
             status=ToolStatus.TRUNCATED,
-            artifact={"truncated": True, "original_length": original_length, "limit": limit},
+            artifact=merged_artifact,
+            metadata=merged_metadata,
         )
 
     @property
