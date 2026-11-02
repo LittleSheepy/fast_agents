@@ -1,6 +1,6 @@
 """context 模块测试：不依赖真实 LLM、不依赖网络
 
-覆盖（15 项）：
+覆盖（16 项）：
 1.  TokenCounter 的启发式估算与消息计数
 2.  TokenBudget 的预算换算与描述
 3.  ContextWindow 的分层顺序与 flatten
@@ -15,7 +15,8 @@
 12. ContextCompressor 第 3 级：LLM 摘要替换历史
 13. ContextBuilder 的完整分层拼装顺序
 14. ContextBuilder 的预算裁剪（历史被压掉）
-15. context 工具：write / edit / list / read_offloaded
+15. context 工具：list / read_offloaded（文件读写编辑统一由 tools/builtin/file_tool.py 提供）
+16. 文件工具单一来源：context 不再导出 WriteFileTool / EditFileTool，注册不重名
 """
 
 import os
@@ -32,14 +33,14 @@ from fast_agents.context import (
     ContextLayer,
     TokenBudget,
     TokenCounter,
-    EditFileTool,
     ListFilesTool,
     ReadOffloadedTool,
-    WriteFileTool,
     build_context_tools,
     estimate_text_tokens,
 )
 from fast_agents.messages.message import Message, MsgToolCall
+from fast_agents.tools.builtin import build_file_tools
+from fast_agents.tools.tool_registry import ToolRegistry
 
 
 # ============================================================
@@ -415,10 +416,12 @@ def test_builder_budget_trims():
 # ============================================================
 
 def test_context_filesystem_tools():
+    """context 侧只保留 list_files；写 / 编辑由 tools/builtin/file_tool.py 统一提供"""
     with tempfile.TemporaryDirectory() as tmp:
-        write_tool = WriteFileTool(tmp)
         list_tool = ListFilesTool(tmp)
-        edit_tool = EditFileTool(tmp)
+        file_tools = {t.name: t for t in build_file_tools(tmp)}
+        write_tool = file_tools["write_file"]
+        edit_tool = file_tools["edit_file"]
 
         # 写文件
         r = write_tool.invoke({"path": "notes/a.md", "content": "第一行\n第二行\n"})
@@ -464,13 +467,36 @@ def test_read_offloaded_tool_and_factory():
         # 工厂：传 offloader 时包含 read_offloaded + 文件三件套
         tools = build_context_tools(workspace=tmp, offloader=offloader)
         names = {t.name for t in tools}
-        assert names == {"read_offloaded", "list_files", "write_file", "edit_file"}, names
+        assert names == {"read_offloaded", "list_files"}, names
 
         # 工具 schema 能被正常导出（说明 args_schema 定义合法）
         for t in tools:
             schema = t.to_openai_tool()
             assert schema["function"]["name"] == t.name
     print("✅ test_read_offloaded_tool_and_factory 通过")
+
+
+def test_file_tools_single_source():
+    """文件工具单一来源：context 不再导出 WriteFileTool / EditFileTool；
+    同时注册 context 工具与文件四件套时不应出现同名覆盖"""
+    import fast_agents.context as ctx_pkg
+
+    assert not hasattr(ctx_pkg, "WriteFileTool"), "context 不应再导出 WriteFileTool"
+    assert not hasattr(ctx_pkg, "EditFileTool"), "context 不应再导出 EditFileTool"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        offloader = ContextOffloader(workspace=tmp, threshold=20)
+        tools = build_context_tools(workspace=tmp, offloader=offloader) + build_file_tools(tmp)
+        names = [t.name for t in tools]
+        assert len(names) == len(set(names)), f"存在重名工具: {names}"
+
+        registry = ToolRegistry()
+        registry.register_tools(*tools)
+        assert {t.name for t in registry.list_tools()} == {
+            "read_offloaded", "list_files",
+            "read_file", "write_file", "edit_file", "multi_edit_file",
+        }, "注册后工具集合与预期不符"
+    print("✅ test_file_tools_single_source 通过")
 
 
 # ============================================================
@@ -495,6 +521,7 @@ def main():
         test_builder_budget_trims,
         test_context_filesystem_tools,
         test_read_offloaded_tool_and_factory,
+        test_file_tools_single_source,
     ]
     passed = 0
     for t in tests:

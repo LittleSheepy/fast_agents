@@ -33,12 +33,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from fast_agents.context import (
     ContextBuilder,
     ContextOffloader,
-    EditFileTool,
     ListFilesTool,
     TokenBudget,
     TokenCounter,
-    WriteFileTool,
 )
+from fast_agents.tools.builtin import build_file_tools
 from fast_agents.messages.message import Message, MsgToolCall
 from fast_agents.agents.react_agent.react_agent import ReActAgent
 
@@ -220,9 +219,9 @@ def demo_compression(workspace: str) -> None:
 def demo_filesystem(workspace: str) -> None:
     _banner("示例 4：文件系统工具（write / list / edit）", "把会话状态外化成文件")
 
-    write_tool = WriteFileTool(workspace)
+    # 写 / 编辑来自 tools/builtin/file_tool.py（带乐观锁 + 原子写）；context 侧只保留 list_files
+    _reader, write_tool, edit_tool, _multi = build_file_tools(workspace)
     list_tool = ListFilesTool(workspace)
-    edit_tool = EditFileTool(workspace)
 
     r = write_tool.invoke({
         "path": "notes/todo.md",
@@ -270,7 +269,7 @@ def demo_agent_with_context(workspace: str) -> None:
         context_budget=32_000,
         context_offload_threshold=2_000,
     )
-    agent.add_tool(WriteFileTool(workspace))
+    agent.add_tools(build_file_tools(workspace))
     agent.add_tool(ListFilesTool(workspace))
     agent.refresh_system_prompt()
 
@@ -290,8 +289,10 @@ def demo_agent_with_context(workspace: str) -> None:
             extra = " (+tool_calls)" if m.get("tool_calls") else ""
             print(f"    - [{role:<9}] {text}{extra}")
 
-    ctx_tools = [n for n in names if n in {"read_offloaded", "write_file", "edit_file", "list_files"}]
+    ctx_tools = [n for n in names if n in {"read_offloaded", "list_files"}]
     print(f"\n其中由 context 自动注册的工具：{ctx_tools}")
+    file_ts = [n for n in names if n in {"read_file", "write_file", "edit_file", "multi_edit_file"}]
+    print(f"由 file_tool 提供的文件工具：{file_ts}")
     print(f"当前上下文统计：{agent.ctx.stats()}")
 
 

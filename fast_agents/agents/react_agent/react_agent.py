@@ -42,6 +42,7 @@ from ...memory.manager import MemoryManager
 from ...messages import Messages
 from ...messages.message import Message
 from ...skills import SkillMiddleware, SkillRegistry
+from ...tools.builtin.file_tool import build_file_tools
 from ...tools.builtin.mcp_tool import build_mcp_tools
 from ...tools.structured_tool import StructuredTool
 from ...tools.tool_base import ToolBase
@@ -453,8 +454,10 @@ class ReActAgent(AgentBase):
 
         1. 构建/复用 ContextBuilder（分层拼装 + token 预算 + 三级压缩）；
         2. 如果开了记忆，把记忆的短期历史接进 builder（单一数据源仍是 buffer）；
-        3. 注册 context 自带工具：read_offloaded（回读卸载内容）+ 文件三件套；
-        4. 工具名与 system 提示词同步刷新，保证模型知道这些工具存在。
+        3. 注册 context 自带工具：read_offloaded（回读卸载内容）+ list_files；
+        4. 注册文件读写编辑四件套（read_file / write_file / edit_file /
+           multi_edit_file），统一来自 tools/builtin/file_tool.py；
+        5. 工具名与 system 提示词同步刷新，保证模型知道这些工具存在。
         """
         if ctx is None:
             token_budget = (
@@ -469,9 +472,18 @@ class ReActAgent(AgentBase):
             )
         self.ctx = ctx
 
-        # 注册 context 自带工具（read_offloaded 需要 offloader，一定传得上）
+        # 注册 context 自带工具（read_offloaded 需要 offloader，一定传得上；
+        # 文件系统部分只产出 list_files）
         for t in build_context_tools(workspace=".", offloader=ctx.offloader):
             self.tool_registry.register_tool(t)
+
+        # 文件读写编辑四件套统一由 tools/builtin/file_tool.py 提供
+        # （read_file / write_file / edit_file / multi_edit_file，带乐观锁 + 原子写 + 备份）。
+        # 同名工具若已由用户预注册则不覆盖，避免静默顶掉用户自己的实现。
+        existing = {t.name for t in self.tool_registry.list_tools()}
+        for t in build_file_tools(workspace="."):
+            if t.name not in existing:
+                self.tool_registry.register_tool(t)
         self.refresh_system_prompt()
 
         print(
