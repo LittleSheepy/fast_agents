@@ -33,8 +33,6 @@
 | 2.0.0 | 2026-10-27 | 引入 `MCPServerTool`、`auto_expand` 钩子（**已废弃**） | — |
 | 1.0.0 | 2026-10-27 | 首版：JSON-RPC over stdio/SSE 传输层 + 工具适配 | — |
 
-> **与 `fb/MCP模块编写说明.md` 的区别**：那份描述的是 v2（含 `auto_expand` 钩子、`MCPServerTool` 旧签名）。v3 已删除 `auto_expand`，把「工具展开」交给 `MCPRegistry.register_into(expand=...)`，并让 `MCPServerTool` 改用 A1 结构化入参。**以本文为准。**
-
 ---
 
 ## 二、先想清楚：MCP 解决什么问题

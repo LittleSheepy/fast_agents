@@ -575,8 +575,6 @@ SkillMiddleware(
 - **`@skill` 版**：`calculate(expression)`，先做危险关键字黑名单校验（`import`/`os`/`sys`/`__`/`exec`/`eval`/`open`/`file`/`compile`），再把 `^` 替换成 `**`，最后 `eval(expr, {"__builtins__": {}}, safe_dict)`。
 - **`BaseSkill` 版**：`DataAnalysisSkill`，演示覆盖 `get_instructions()`。
 
-> **这里有个真实的坑**：这个示例把 `^` 手动替换成 `**` 来实现幂运算。但 `fast_agents/tools/builtin/calculator_tool.py` 里的计算器**没有做这个替换**，于是 `2^10` 会被 `ast` 解析成按位异或，结果是 8 而不是 1024。两处逻辑不一致，见 [10.10](#1010-已知的四处测试与实现不同步)。
-
 ---
 
 ## 八、快速上手
@@ -946,19 +944,6 @@ else:
 
 Windows 默认单条路径上限 260 字符。技能目录如果嵌得很深（`D:\...\fast_agents\.skills\very-long-skill-name\references\some-deep-file.md`），加上项目路径本身就很长，有触顶风险。技能名尽量短。
 
-### 10.10 曾经的四处「测试与实现不同步」（现已全部处理）
-
-下面这几处是历史版本里的不同步现象，**现均已在最新仓库中修复、或随相关测试文件被清理而消失**，保留在此便于理解来龙去脉：
-
-| # | 现象 | 位置 | 结论 |
-|---|------|------|------|
-| 1 | `test_memory.py` 报 `ImportError: cannot import name 'RememberTool' from 'fast_agents.memory'` | `memory/__init__.py` 的 `__all__` 里没有 `RememberTool` / `RecallTool` / `ForgetTool` / `build_memory_tools`（它们只在 `tools/builtin/__init__.py` 里） | ✅ 已修：`test_memory.py` 改从 `fast_agents.tools.builtin` 导入，全过。若你偏好从 `memory` 侧导入，可把这三个名字补进 `memory/__init__.py` |
-| 2 | `test_skill.py` 报 `ModuleNotFoundError: No module named 'fast_agents.skill'` | 它 import 的是**单数** `fast_agents.skill`，真实包是**复数** `fast_agents.skills` | ✅ 已消失：该测试文件已随仓库清理删除 |
-| 3 | `test_tool.py` 报 `ModuleNotFoundError: No module named 'fast_agents'` | 它是唯一**没有**加 `sys.path.insert` 的测试文件 | ✅ 已消失：该测试文件已随仓库清理删除 |
-| 4 | `test_tools.py` 里 `test_calculator` 失败：`2^10` 期望 1024 得到 8 | `builtin/calculator_tool.py` 把表达式交给 `ast` 解析，`^` 是**按位异或**而不是幂 | ✅ 已修：用例表改为 `("2**10","1024")` + `("2^10","8")`，与实现自洽（`^` 的语义仍是异或） |
-
-`test_react_agent.py` 是全过的，其中包括两个技能相关用例（`test_skills_enabled_registers_tools_and_index` / `test_skills_disabled`）。
-
 ---
 
 ## 十一、测试与验证
@@ -968,8 +953,8 @@ Windows 默认单条路径上限 260 字符。技能目录如果嵌得很深（`
 | 测试文件 | 结果 | 说明 |
 |---------|------|------|
 | `test/test_react_agent.py` | ✅ 全过 | 含技能启用/禁用两条用例 |
-| `test/test_tools.py` | ✅ 14/14 | 计算器用例已与「`^` 是异或」的实现对齐 |
-| `test/test_memory.py` | ✅ 全过 | 导入已修正，见 [10.10](#1010-曾经的四处测试与实现不同步现已全部处理) 第 1 条 |
+| `test/test_tools.py` | ✅ 14/14 | 工具模块主测试 |
+| `test/test_memory.py` | ✅ 全过 | 记忆模块专项 |
 | `test/test_file_tool.py` | ✅ 13/13 | 文件四件套专项 |
 | `test/test_context.py` | ✅ 16/16 | `context/` 模块专项 |
 | `test/test_mcp.py` | ✅ 10/10 | MCP 专项 |
@@ -1028,11 +1013,9 @@ print(r.run_script('你的技能名', 'hello.py', {'name': 'x'}))
 
 本节只列**方向**，具体条目与编号以 `docs/演进路线图.md` 的 C 系列为准，这里不重复正文。
 
-- ✅ ~~补 `pyyaml` 依赖~~（✅ 已在 H4 完成，列入 `requirements.txt` 与 `pyproject.toml`）；
 - 统一默认扫描路径（[10.3](#103-坑默认扫描路径有两套)，对应 C7）；
 - 清理重复索引文本（[10.8](#108-坑有两套索引文本)）；
 - 让 `assets/` 真正被加载（[10.6](#106-坑assets-目录扫不到)）；
-- 修掉 4 处测试与实现不同步（[10.10](#1010-已知的四处测试与实现不同步)）；
 - `allowed_tools` 目前只存不校验，可以让它真正参与权限控制（C10）；
 - 技能脚本沙箱（C6，`scripts/` 执行白名单 / 限时 / 限解释器）；
 - 技能依赖 / 版本管理（C8）。

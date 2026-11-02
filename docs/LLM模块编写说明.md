@@ -505,7 +505,6 @@ llm = LLM(
 | `Exception: LLM调用失败: ... 401 ...` | API Key 错或过期。检查 `.env` 的 `LLM_API_KEY`，或显式传 `api_key=` |
 | `Exception: LLM调用失败: ... model not found` | chat 模型名错（第三方中转不一定支持 `gpt-4o-mini`），或 embedding 模型名在第三方端点不可用。第三方中转要显式传 `embedding_model=` 指定该平台支持的 embedding 模型名 |
 | `Exception: Embedding 调用失败（documents）: ... maximum context length ...` / `400 input length exceeded` | 单条文本过长（OpenAI text-embedding-3 单条上限约 8191 token）。RAG 场景必须先分 chunk，不能把整篇文档直接塞给 `embed_documents` |
-| `embed_documents` 返回顺序和输入对不上 | 老版本没按 `data[*].index` 排序会偶发；请确保使用本版本 |
 | 中文乱码 / Windows 控制台打印乱码 | 在脚本开头加 `import sys; sys.stdout.reconfigure(encoding='utf-8')`，或 PowerShell 先执行 `chcp 65001` |
 | 调用很慢、批量 embed 耗时明显 | 单次 batch 内部已并发；若总文本量很大（> 1万条），建议调用方自己分批分段入库，控制并发 |
 | 第三方中转端点 embedding 路径不是 `/v1/embeddings` | 少数中转端点改了路径；这种情况只能换端点或手动改 `base_url`，OpenAI SDK 没有路径重写开关 |

@@ -35,7 +35,7 @@
 | 1.4.0 | 2026-11-02 | **A14 文件工具单一来源治理（破坏性变更）**：删除 `context/tools.py` 里的 `WriteFileTool` / `EditFileTool`（与 `tools/builtin/file_tool.py` 的 `WriteTool` / `EditTool` 工具名完全相同，同时注册会互相静默覆盖，是真实可复现的静默错误）；`build_context_tools(include_filesystem=True)` 只产出 `list_files`；`ReActAgent._init_context()` 在注册完本模块工具后自动调用 `build_file_tools(workspace=".")` 补齐 `read_file` / `write_file` / `edit_file` / `multi_edit_file` 四件套，**同名工具若已由用户预注册则不覆盖**；`fast_agents.context.__all__`、`fast_agents/__init__.py`、`examples/context/context_react_agent_demo.py` 同步调整；`test_context.py` 16→17 项（新增「单一来源无重名」回归用例）；工具模块/文件工具/context/react_agent 全部测试（14+13+17+12）与 5 个示例全绿 | — |
 | 1.3.0 | 2026-11-02 | **B4 双通道注入**：`ContextBuilder.build()` 新增 `system_tail` 可选参数，调用方可把「相对稳定但跨轮可能变化」的文本（典型：用户画像）追加到 L1 system 末尾；`ReActAgent` 在 `enable_context=True` 路径把 `MemoryManager.get_profile().to_text()` 通过 `system_tail` 传给 builder，在 `enable_context=False` 路径直接把画像块追加到工作区 system 消息末尾；用固定 marker（`## 用户画像（稳定信息，请在回答中始终遵守）`）剥离旧块，保证跨 run 不叠加；未配 `profile_store` 或画像为空时 system 字节级一致；`test/test_react_agent.py` 新增 3 项，原有 16/16 context 测试与 react_agent 12/12 测试全绿 | — |
 | 1.2.0 | 2026-11-01 | **演进路线同步**：§十二 演进路线第 4 条从「依赖 B2/llm.embed() 待做」更新为「B2/I1 均已交付，下一步是把语义召回接到 ContextBuilder 并配合 A7 RAGTool」；其余章节与 7 文件源码保持一致（16/16 测试全过） | — |
-| 1.1.0 | 2026-10-29 | 同步最新代码：读文件工具 `ReadFileTool` 已随 `read_file_tool.py` 删除而更名 `ReadTool`（`tools/builtin/file_tool.py`），文档与示例同步更正；确认 `test_context.py` 16/16、`examples/context/context_react_agent_demo.py` 全部跑通 | — |
+| 1.1.0 | 2026-10-29 | 同步最新代码：读文件工具 `ReadFileTool` 已随 `read_file_tool.py` 删除而更名 `ReadTool`（`tools/builtin/file_tool.py`）；确认 `test_context.py` 16/16、`examples/context/context_react_agent_demo.py` 全部跑通 | — |
 | 1.0.0 | 2026-10-27 | 首次编写，逐行对齐 `fast_agents/context/` 真实实现；按《XX 模块编写说明》模版 v2.0 重排章节（开篇 → 一～十三 → 附录） | — |
 
 > **破坏性变更：有（自 v1.3.0 起首次破坏性变更）。** `from fast_agents.context import WriteFileTool` / `EditFileTool` 会 ImportError——这两个类已删除，文件写/编辑能力由 `from fast_agents.tools.builtin import WriteTool, EditTool, build_file_tools` 统一提供。`ReActAgent(enable_context=True)` 会自动补齐四件套，用户无需再手动 `add_tool(WriteFileTool(...))`；已有预注册实现时也不会被静默顶掉。v1.3.0 的 B4 双通道注入行为保持不变。
@@ -1364,8 +1364,6 @@ MultiEditTool("D:/code")        # name = "multi_edit_file"
 | `enable_context` | `False` | 是否启用上下文工程 |
 | `context_budget` | `None` | 覆盖预算（int token 数）；不传用 `TokenBudget()` 默认 128k |
 | `context_offload_threshold` | `4_000` | 触发卸载的字符数阈值 |
-
-> **已废弃写法**：早期版本构造参数叫 `budget` / `offload_threshold`（与 `ReActAgent` 里其他参数命名打架）。现在统一为 `context_budget` / `context_offload_threshold`，语义更清楚。旧写法不再支持，请改过来。
 
 ---
 
