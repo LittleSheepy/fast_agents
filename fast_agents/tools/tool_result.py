@@ -72,11 +72,21 @@ class ToolResult:
 
     @property
     def succeeded(self) -> bool:
-        return self.status == ToolStatus.SUCCESS
+        """工具是否正常执行完成（截断也算完成，只是输出被裁剪）。
+        
+        失败判定仅基于 ERROR 状态，与截断无关。需要精确判断输出是否被裁剪
+        时使用 ``is_truncated``。
+        """
+        return self.status in (ToolStatus.SUCCESS, ToolStatus.TRUNCATED)
 
     @property
     def failed(self) -> bool:
         return self.status == ToolStatus.ERROR or self.is_error
+
+    @property
+    def is_truncated(self) -> bool:
+        """输出是否因超长被截断。关心结果完整性的调用方应优先判断该属性。"""
+        return self.status == ToolStatus.TRUNCATED
 
     def __str__(self) -> str:
         return self.output
