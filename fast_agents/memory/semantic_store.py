@@ -14,7 +14,7 @@
     llm = LLM()
     inner = SQLiteMemoryStore("memories.db", user_id="u1")
     store = SemanticMemoryStore(inner, llm)   # 默认 hybrid_weight=0.7
-    manager = MemoryManager(llm=llm, long_term=store)
+    manager = MemoryManager(llm=llm, long_term_store=store)
 """
 
 from __future__ import annotations
