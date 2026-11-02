@@ -204,21 +204,23 @@ class SQLiteMemoryStore(MemoryStoreBase):
         1. 省掉一次读（基类要走 get + update 两条 SQL）；
         2. 基类的 update() 会把 updated_at 刷成当前时间，而 updated_at 参与时间衰减
            打分——命中一次就刷新，会让「越旧越轻」失效，这里必须绕开。
+
+        同一次命中的多个 id 用单条 ``UPDATE ... WHERE memory_id IN (...)`` 批量写回：
+        逐条执行会发 N 条 SQL、吃 N 份事务开销，而 touch 恰好在「每轮检索」的热路径上。
         """
         ids = [mid for mid in memory_ids if mid]
         if not ids:
             return 0
         clause, params = self._scope_clause()
         now = datetime.now().isoformat()
-        count = 0
+        placeholders = ",".join("?" for _ in ids)
         with self._connect() as db:
-            for memory_id in ids:
-                cur = db.execute(
-                    f"UPDATE memories SET access_count = access_count + 1,"
-                    f" last_accessed_at = ? WHERE memory_id=? AND {clause}",
-                    (now, memory_id, *params),
-                )
-                count += cur.rowcount
+            count = db.execute(
+                f"UPDATE memories SET access_count = access_count + 1,"
+                f" last_accessed_at = ?"
+                f" WHERE memory_id IN ({placeholders}) AND {clause}",
+                (now, *ids, *params),
+            ).rowcount
         return count
 
     def update(self, record: MemoryRecord) -> MemoryRecord:
