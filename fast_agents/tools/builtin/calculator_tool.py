@@ -79,8 +79,6 @@ class CalculatorTool(ToolBase):
             if isinstance(node.value, (int, float)):
                 return node.value
             raise ValueError(f"不支持的字面量：{node.value!r}")
-        if isinstance(node, ast.Num):
-            return node.n
         if isinstance(node, ast.BinOp):
             op_type = type(node.op)
             if op_type not in self._BINOPS:

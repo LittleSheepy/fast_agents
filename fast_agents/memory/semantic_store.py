@@ -5,7 +5,9 @@
 - 向量存储策略：inner 是 SQLiteMemoryStore 时，同库独立表 memory_embeddings（BLOB）；
   inner 是 InMemoryStore 或其他自定义后端时，用内存 dict 存；
 - embedding 调用失败一律降级（warning + 照常 CRUD），不阻塞主流程；
-- 不修改 memories 主表 schema，不污染既有数据。
+- 不修改 memories 主表 schema，不污染既有数据；
+- B5 起额外提供 semantic_vectors()（批量向量）与 touch()（记账代理），
+  让「记忆合并 / 命中记账」也能用上语义通道。
 
 使用方式：
     from fast_agents.llm import LLM
@@ -314,6 +316,43 @@ class SemanticMemoryStore(MemoryStoreBase):
             hybrid_weight=self.hybrid_weight,
             semantic_floor=self._SEMANTIC_FLOOR,
         )
+
+    # ===================== B5：合并相似度的向量通道 =====================
+
+    def semantic_vectors(self, texts: List[str]) -> Optional[List[List[float]]]:
+        """批量算向量，供上层做「合并相似度」；失败返回 None（降级纯词法）
+
+        合并是两两比较，逐对调用 embedding 会非常贵，所以这里一次性算完一批。
+        只要有一条拿不到向量就返回 None——宁可按纯词法走，也不要出现
+        「一半有向量一半没有」的混合口径（阈值会变得不可预期）。
+        """
+        if not texts:
+            return None
+        try:
+            vecs = self.llm.embed_documents(list(texts))
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"SemanticMemoryStore: 批量 embedding 失败，合并相似度降级为纯词法（{exc!r}）",
+                RuntimeWarning, stacklevel=2,
+            )
+            return None
+        if not vecs or len(vecs) != len(texts):
+            return None
+        result: List[List[float]] = []
+        for v in vecs:
+            if not v:
+                return None
+            result.append(list(v))
+        return result
+
+    def touch(self, memory_ids) -> int:
+        """命中记账代理给 inner
+
+        必须代理（而不是用基类默认的 get + update）：包装器的 update() 最终会走到
+        inner.update()，而 SQLite 的 update() 会把 updated_at 刷成当前时间，
+        那样就破坏了时间衰减。inner 自己的 touch() 才不会碰 updated_at。
+        """
+        return self.inner.touch(list(memory_ids))
 
     # ===================== 资源释放 =====================
 

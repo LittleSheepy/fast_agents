@@ -18,8 +18,9 @@ from pydantic import BaseModel, Field
 # inference   推断（由前几类推导出的结论，置信度较低）
 MemoryKind = Literal["preference", "fact", "episode", "procedure", "inference"]
 
-# 记忆状态：active 有效 / superseded 被新版本取代 / retracted 已撤回
-MemoryStatus = Literal["active", "superseded", "retracted"]
+# 记忆状态：active 有效 / superseded 被新版本取代 / retracted 已撤回 /
+#           archived 已归档（B5：低重要度 + 久未命中，退出检索但保留可审计）
+MemoryStatus = Literal["active", "superseded", "retracted", "archived"]
 
 
 class MemoryRecord(BaseModel):
@@ -28,7 +29,9 @@ class MemoryRecord(BaseModel):
     设计要点（参考 HelloAgents 的 MemoryRecord）：
     - 每条记录都带 source（来源），声明来源不等于已核实；
     - kind 区分「偏好 / 事实 / 情景 / 程序 / 推断」，避免把模型推断当成事实；
-    - status + supersedes 支持「修订而不覆盖」，保证历史可追溯。
+    - status + supersedes 支持「修订而不覆盖」，保证历史可追溯；
+    - access_count / last_accessed_at 记录「被命中过几次、上次命中是什么时候」，
+      是 B5 衰减归档的判定依据（不参与检索打分，只服务于维护）。
     """
 
     memory_id: str = Field(default_factory=lambda: uuid4().hex)
@@ -42,12 +45,17 @@ class MemoryRecord(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: datetime = Field(default_factory=datetime.now)
     supersedes: Optional[str] = None
+    access_count: int = 0
+    last_accessed_at: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         data = self.model_dump()
         data["created_at"] = self.created_at.isoformat()
         data["updated_at"] = self.updated_at.isoformat()
+        data["last_accessed_at"] = (
+            self.last_accessed_at.isoformat() if self.last_accessed_at else None
+        )
         return data
 
     def to_text(self) -> str:

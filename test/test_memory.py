@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import warnings
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,6 +30,7 @@ from fast_agents.memory import (
     SQLiteProfileStore,
     UserProfile,
     lexical_score,
+    merge_similarity,
 )
 from fast_agents.tools.builtin import (
     RememberTool, RecallTool, ForgetTool, UpdateProfileTool,
@@ -502,6 +504,144 @@ def test_profile_tool():
     print("✅ test_profile_tool 通过（B3 画像工具）")
 
 
+# ===================== B5 / v1.7.0：记忆衰减与合并 =====================
+
+def test_touch_records_access():
+    """B5：命中记账 —— access_count 累加、last_accessed_at 刷新，且不动 updated_at"""
+    with tempfile.TemporaryDirectory() as d:
+        store = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1", session_id="s1")
+        r = store.add(MemoryRecord(content="用户喜欢 Python", kind="fact", source="test"))
+        first = store.get(r.memory_id)
+        assert first.access_count == 0 and first.last_accessed_at is None
+        updated_at_before = first.updated_at
+
+        assert store.touch([r.memory_id]) == 1
+        after = store.get(r.memory_id)
+        assert after.access_count == 1
+        assert after.last_accessed_at is not None, "last_accessed_at 应被刷新"
+        # 关键：touch 不能刷新 updated_at，否则时间衰减失效
+        assert after.updated_at == updated_at_before
+
+        # 再命中一次 → 累加；不存在的 id 不报错
+        assert store.touch([r.memory_id, "not-exist"]) == 1
+        assert store.get(r.memory_id).access_count == 2
+        store.close()
+
+        # 内存后端走基类默认实现，同样有效
+        mem = InMemoryStore()
+        m = mem.add(MemoryRecord(content="用户在北京", kind="fact", source="t"))
+        assert mem.touch([m.memory_id]) == 1
+        assert mem.get(m.memory_id).access_count == 1
+        assert mem.get(m.memory_id).last_accessed_at is not None
+    print("✅ test_touch_records_access 通过（B5 命中记账）")
+
+
+def test_archive_stale():
+    """B5：低重要度 + 久未命中 → 归档；不再进检索但可审计"""
+    with tempfile.TemporaryDirectory() as d:
+        store = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1", session_id="s1")
+        # 低重要度 + 200 天没动过 → 应归档
+        stale = store.add(MemoryRecord(
+            content="随口提过的咖啡馆", kind="episode", source="t", importance=0.1,
+            updated_at=datetime.now() - timedelta(days=200),
+        ))
+        # 低重要度但很新 → 不归档
+        fresh = store.add(MemoryRecord(
+            content="刚说过的偏好", kind="preference", source="t", importance=0.1,
+        ))
+        # 重要度高 + 很旧 → 不归档
+        important = store.add(MemoryRecord(
+            content="用户的职业是医生", kind="fact", source="t", importance=0.9,
+            updated_at=datetime.now() - timedelta(days=400),
+        ))
+
+        archived = store.archive_stale(max_importance=0.3, stale_days=90)
+        assert [r.memory_id for r in archived] == [stale.memory_id], [r.content for r in archived]
+        assert store.get(stale.memory_id).status == "archived"
+        assert store.get(stale.memory_id).metadata.get("archived_at")
+        assert store.get(fresh.memory_id).status == "active"
+        assert store.get(important.memory_id).status == "active"
+        # 归档后不参与检索（all 默认只返回 active），但审计仍可见
+        assert len(store.all()) == 2
+        assert len(store.all(include_inactive=True)) == 3
+        store.close()
+    print("✅ test_archive_stale 通过（B5 衰减归档）")
+
+
+def test_merge_similar_semantic():
+    """B5：合并相似度 = 语义×0.7 + 词法×0.3；无向量后端退化为纯词法（不当 0）"""
+    # 纯函数口径
+    assert merge_similarity(0.0, 1.0) == 0.7
+    assert merge_similarity(1.0, 0.0) == 0.3
+    assert merge_similarity(0.5, None) == 0.5   # ← 关键：退化，而不是压成 0.15
+
+    # 有语义后端：同簇但字面不同 → 能合并
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.db")
+        store = SemanticMemoryStore(SQLiteMemoryStore(db, user_id="u1"), _SemanticFakeLLM())
+        keep = store.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
+                                      source="t", kind="fact", importance=0.9))
+        dup = store.add(MemoryRecord(user_id="u1", session_id="s", content="公司在北京上班",
+                                     source="t", kind="fact", importance=0.4))
+        merged = store.merge_similar(threshold=0.7)
+        assert [r.memory_id for r in merged] == [dup.memory_id], [r.content for r in merged]
+        assert store.get(dup.memory_id).status == "superseded"
+        assert store.get(dup.memory_id).metadata["merged_into"] == keep.memory_id
+        # 主记录保持原样（不改内容、不改状态）
+        assert store.get(keep.memory_id).status == "active"
+        assert store.get(keep.memory_id).content == "我在上海工作"
+
+    # 无向量后端：退化口径正确 → 纯词法 Jaccard≈0.11
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.db")
+        plain = SQLiteMemoryStore(db, user_id="u1")
+        plain.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
+                               source="t", kind="fact", importance=0.9))
+        plain.add(MemoryRecord(user_id="u1", session_id="s", content="公司在北京上班",
+                               source="t", kind="fact", importance=0.4))
+        # 阈值拉到语义级别：不该合并
+        assert plain.merge_similar(threshold=0.5) == []
+        # 退化口径正确时能过 0.05；若错误地把缺失语义当成 0（0.3×0.11≈0.03），就过不了
+        assert len(plain.merge_similar(threshold=0.05)) == 1
+        plain.close()
+    print("✅ test_merge_similar_semantic 通过（B5 合并相似度）")
+
+
+def test_manager_compact_and_retrieve_touch():
+    """B5：retrieve 自动记账；compact() 一次做完归档 + 合并，后端异常只警告"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "mem.db")
+        mgr = MemoryManager(
+            long_term_store=SQLiteMemoryStore(path, user_id="u1", session_id="s1"),
+            user_id="u1", session_id="s1",
+        )
+        hit = mgr.remember("用户喜欢 Python", kind="fact", importance=0.9)
+        mgr.retrieve("Python", limit=5)
+        assert mgr.long_term.get(hit.memory_id).access_count == 1, "retrieve 应自动记账"
+
+        stale = mgr.long_term.add(MemoryRecord(
+            user_id="u1", session_id="s1", content="随口提过的咖啡馆",
+            kind="episode", source="t", importance=0.1,
+            updated_at=datetime.now() - timedelta(days=200),
+        ))
+        report = mgr.compact(max_importance=0.3, stale_days=90)
+        assert report["archived"] == 1, report
+        assert mgr.long_term.get(stale.memory_id).status == "archived"
+        assert mgr.long_term.get(hit.memory_id).status == "active"
+
+        # 后端抛异常时只警告、不抛，返回 0
+        class _Boom(InMemoryStore):
+            def archive_stale(self, **kw):
+                raise RuntimeError("boom")
+
+            def merge_similar(self, **kw):
+                raise RuntimeError("boom")
+
+        assert MemoryManager(long_term_store=_Boom()).compact() == {"archived": 0, "merged": 0}
+        mgr.close()
+    print("✅ test_manager_compact_and_retrieve_touch 通过（B5 维护入口）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -521,4 +661,8 @@ if __name__ == "__main__":
     test_profile_sqlite_persistence()
     test_profile_manager_integration()
     test_profile_tool()
+    test_touch_records_access()
+    test_archive_stale()
+    test_merge_similar_semantic()
+    test_manager_compact_and_retrieve_touch()
     print("\n🎉 全部测试通过")

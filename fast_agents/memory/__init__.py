@@ -8,7 +8,7 @@ from .profile_store import InMemoryProfileStore, ProfileStore, SQLiteProfileStor
 from .schema import ContextPacket, MemoryKind, MemoryRecord, MemoryStatus, UserProfile
 from .scoring import (
     combined_score, cosine_similarity, lexical_score, lexical_terms,
-    rank_records, score_record, time_decay,
+    merge_similarity, rank_records, score_record, time_decay,
 )
 from .semantic_store import SemanticMemoryStore
 from .session_store import InMemorySessionStore, SessionStore, SQLiteSessionStore
@@ -22,5 +22,5 @@ __all__ = [
     "SessionStore", "SQLiteSessionStore", "InMemorySessionStore",
     "BufferMemory", "MemoryManager",
     "lexical_terms", "lexical_score", "time_decay", "combined_score",
-    "cosine_similarity", "score_record", "rank_records",
+    "cosine_similarity", "score_record", "rank_records", "merge_similarity",
 ]

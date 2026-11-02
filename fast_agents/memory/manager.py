@@ -10,7 +10,7 @@ MemoryManager 是整个记忆系统的门面（facade），把短期和长期两
         ↓
     [写入] buffer.append(对话) + 可选 long_term.add(抽取出的记忆)
 
-对外只暴露 4 个动作：retrieve / record / build_context / update_profile，
+对外只暴露 5 个动作：retrieve / record / build_context / update_profile / compact，
 Agent 侧不需要知道底下是 SQLite 还是内存。
 """
 
@@ -99,8 +99,23 @@ class MemoryManager:
     # ---------- 1. 检索 ----------
 
     def retrieve(self, query: str, limit: int = 5) -> List[MemoryRecord]:
-        """按当前问题检索长期记忆"""
-        return self.long_term.search(query, limit=limit)
+        """按当前问题检索长期记忆
+
+        B5 起顺带为命中的记忆记账（access_count / last_accessed_at），
+        衰减归档才有依据可依。记账失败只警告，不影响检索结果。
+        """
+        results = self.long_term.search(query, limit=limit)
+        self._touch_accessed(results)
+        return results
+
+    def _touch_accessed(self, records: List[MemoryRecord]) -> None:
+        """命中记账的容错包装（B5）：失败不阻塞主流程"""
+        if not records:
+            return
+        try:
+            self.long_term.touch([r.memory_id for r in records])
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 记忆命中记账失败（不影响检索）: {e}")
 
     def build_context(
         self, query: str, *, limit: int = 5, required: bool = False
@@ -256,6 +271,43 @@ class MemoryManager:
     def forget_session(self) -> None:
         """清空短期记忆（会话结束调用）"""
         self.buffer.clear()
+
+    def compact(
+        self,
+        *,
+        max_importance: float = 0.3,
+        stale_days: int = 90,
+        similarity_threshold: float = 0.85,
+    ) -> Dict[str, int]:
+        """维护长期记忆：归档「低重要度 + 久未命中」的、合并高度重复的（B5）
+
+        Args:
+            max_importance: 重要度低于该值的记忆才可能被归档
+            stale_days: 距最后一次被使用超过多少天算「久未命中」
+            similarity_threshold: 合并阈值（相似度 ≥ 该值视为重复）
+
+        Returns:
+            {"archived": 归档条数, "merged": 合并条数}
+
+        建议在会话空闲时手动调用（也可以挂到定时任务），不要每轮都跑：
+        合并是两两比较，有一定开销。任一环节失败只警告、不抛异常。
+        """
+        report = {"archived": 0, "merged": 0}
+        try:
+            report["archived"] = len(
+                self.long_term.archive_stale(
+                    max_importance=max_importance, stale_days=stale_days
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 记忆衰减归档失败（已跳过）: {e}")
+        try:
+            report["merged"] = len(
+                self.long_term.merge_similar(threshold=similarity_threshold)
+            )
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 记忆合并失败（已跳过）: {e}")
+        return report
 
     # ---------- 4. 用户画像（B3） ----------
 

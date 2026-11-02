@@ -7,6 +7,10 @@
    历史永不丢失（审计友好）；
 3. 显式删除：retract 只改状态保留历史，delete 才真删。
 
+B5 新增两个记账字段 access_count / last_accessed_at：旧库在 __init__ 里自动
+ALTER TABLE 补齐（幂等），无需手动迁移；命中记账走 touch()，**不刷新 updated_at**，
+以免破坏时间衰减打分。
+
 只用标准库 sqlite3，不引入 SQLAlchemy，保持和你现有 requirements 一致的轻量风格。
 
 search 不在此处实现，由 MemoryStoreBase 通过 all() + scoring.rank_records
@@ -18,7 +22,7 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Iterable, Iterator, List, Optional
 from contextlib import contextmanager
 
 from .memory_store_base import MemoryStoreBase
@@ -69,18 +73,40 @@ class SQLiteMemoryStore(MemoryStoreBase):
                     created_at  TEXT NOT NULL,
                     updated_at  TEXT NOT NULL,
                     supersedes  TEXT,
+                    access_count    INTEGER NOT NULL DEFAULT 0,
+                    last_accessed_at TEXT,
                     metadata    TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_scope
                     ON memories(user_id, session_id, status);
                 """
             )
+            self._migrate_schema()
 
     def _scope_clause(self) -> tuple:
         """返回 (WHERE 片段, 参数列表)，所有读写都必须带上它做隔离"""
         if self.scope == "user":
             return "user_id=?", [self.user_id]
         return "user_id=? AND session_id=?", [self.user_id, self.session_id]
+
+    # B5 新增列（老库缺列时补上）
+    _ADDED_COLUMNS = (
+        ("access_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_accessed_at", "TEXT"),
+    )
+
+    def _migrate_schema(self) -> None:
+        """给 B5 之前建的旧库补上 access_count / last_accessed_at
+
+        SQLite 没有「ADD COLUMN IF NOT EXISTS」语法，所以先 PRAGMA 查一遍
+        缺哪些列，再逐个 ALTER。幂等、可重复执行，也不会动到已有数据；
+        新库因为建表语句里已经带上这两列，这里会直接跳过。
+        """
+        with self._connect() as db:
+            existing = {row["name"] for row in db.execute("PRAGMA table_info(memories)")}
+            for column, ddl in self._ADDED_COLUMNS:
+                if column not in existing:
+                    db.execute(f"ALTER TABLE memories ADD COLUMN {column} {ddl}")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -108,6 +134,11 @@ class SQLiteMemoryStore(MemoryStoreBase):
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
             supersedes=row["supersedes"],
+            access_count=row["access_count"] or 0,
+            last_accessed_at=(
+                datetime.fromisoformat(row["last_accessed_at"])
+                if row["last_accessed_at"] else None
+            ),
             metadata=json.loads(row["metadata"] or "{}"),
         )
 
@@ -116,7 +147,9 @@ class SQLiteMemoryStore(MemoryStoreBase):
         return (
             r.memory_id, r.user_id, r.session_id, r.content, r.source, r.kind,
             r.status, r.importance, r.created_at.isoformat(), r.updated_at.isoformat(),
-            r.supersedes, json.dumps(r.metadata, ensure_ascii=False),
+            r.supersedes, r.access_count,
+            r.last_accessed_at.isoformat() if r.last_accessed_at else None,
+            json.dumps(r.metadata, ensure_ascii=False),
         )
 
     # ---------- 接口实现 ----------
@@ -126,7 +159,11 @@ class SQLiteMemoryStore(MemoryStoreBase):
         record.session_id = record.session_id or self.session_id
         with self._connect() as db:
             db.execute(
-                "INSERT OR REPLACE INTO memories VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO memories"
+                " (memory_id, user_id, session_id, content, source, kind, status,"
+                "  importance, created_at, updated_at, supersedes, access_count,"
+                "  last_accessed_at, metadata)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 self._to_params(record),
             )
         return record
@@ -160,6 +197,30 @@ class SQLiteMemoryStore(MemoryStoreBase):
         """
         return super().search(query, limit, include_preferences=include_preferences)
 
+    def touch(self, memory_ids: Iterable[str]) -> int:
+        """命中记账：直接 UPDATE 自增，**不触碰 updated_at**
+
+        覆盖基类默认实现的两个理由：
+        1. 省掉一次读（基类要走 get + update 两条 SQL）；
+        2. 基类的 update() 会把 updated_at 刷成当前时间，而 updated_at 参与时间衰减
+           打分——命中一次就刷新，会让「越旧越轻」失效，这里必须绕开。
+        """
+        ids = [mid for mid in memory_ids if mid]
+        if not ids:
+            return 0
+        clause, params = self._scope_clause()
+        now = datetime.now().isoformat()
+        count = 0
+        with self._connect() as db:
+            for memory_id in ids:
+                cur = db.execute(
+                    f"UPDATE memories SET access_count = access_count + 1,"
+                    f" last_accessed_at = ? WHERE memory_id=? AND {clause}",
+                    (now, memory_id, *params),
+                )
+                count += cur.rowcount
+        return count
+
     def update(self, record: MemoryRecord) -> MemoryRecord:
         if self.get(record.memory_id) is None:
             raise KeyError(record.memory_id)
@@ -168,10 +229,13 @@ class SQLiteMemoryStore(MemoryStoreBase):
         with self._connect() as db:
             db.execute(
                 f"UPDATE memories SET content=?, source=?, kind=?, status=?, importance=?,"
-                f" updated_at=?, metadata=? WHERE memory_id=? AND {clause}",
+                f" updated_at=?, access_count=?, last_accessed_at=?, metadata=?"
+                f" WHERE memory_id=? AND {clause}",
                 (
                     record.content, record.source, record.kind, record.status,
                     record.importance, record.updated_at.isoformat(),
+                    record.access_count,
+                    record.last_accessed_at.isoformat() if record.last_accessed_at else None,
                     json.dumps(record.metadata, ensure_ascii=False),
                     record.memory_id, *params,
                 ),

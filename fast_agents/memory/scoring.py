@@ -98,6 +98,30 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     return max(0.0, min(1.0, sim))
 
 
+# ---- 记忆合并相似度（B5）----
+# 合并关心的是「两条记忆是不是同一件事」，与检索相关度不是一回事，故单独一组权重。
+# 取值与 SemanticMemoryStore 的 hybrid_weight 口径一致（语义 0.7 / 词法 0.3），不新造参数。
+MERGE_SEMANTIC_WEIGHT = 0.7
+MERGE_LEXICAL_WEIGHT = 0.3
+
+
+def merge_similarity(lexical: float, semantic: Optional[float] = None) -> float:
+    """合并用相似度：语义 × 0.7 + 词法 × 0.3
+
+    与 score_record 里「相关度」最关键的差别是**语义缺失时怎么处理**：
+    - semantic 为 None（后端没有向量能力，或批量 embedding 失败）时，
+      **直接退化为纯词法**，绝不能把语义当成 0；
+    - 否则两条内容完全相同的记忆也会因拿不到向量而只剩 0.3 倍词法分，
+      永远够不到合并阈值，合并功能会静默失效。
+
+    入参均应为 0~1，返回值截断到 0~1。
+    """
+    if semantic is None:
+        return max(0.0, min(1.0, lexical))
+    sim = MERGE_SEMANTIC_WEIGHT * semantic + MERGE_LEXICAL_WEIGHT * lexical
+    return max(0.0, min(1.0, sim))
+
+
 def score_record(query: str, record: "MemoryRecord", semantic: Optional[float] = None, *, hybrid_weight: float = 0.7) -> float:
     """单条记忆MemoryRecord计算统一得分
 
