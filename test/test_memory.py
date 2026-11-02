@@ -649,6 +649,7 @@ if __name__ == "__main__":
     test_preference_always_recalled()
     test_revise_keeps_history()
     test_scope_isolation()
+    test_scope_user_vs_session()
     test_manager_flow()
     test_dedup()
     test_memory_tool()
