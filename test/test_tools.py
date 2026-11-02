@@ -502,6 +502,139 @@ def test_nested_model_ref_expansion():
     print("✅ 嵌套模型 $ref 展开通过（嵌套 BaseModel + Enum 均内联，无残留 $ref/$defs）")
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# A25-1: 结果序列化（非字符串优先 JSON，不产出 Python repr）
+# ──────────────────────────────────────────────────────────────────────────
+def test_coerce_dict_to_json():
+    """dict 返回值应产出合法 JSON（双引号、小写 true/null），而非 Python repr。"""
+
+    class DictTool(ToolBase):
+        name = "dict_tool"
+        description = "返回 dict 的测试工具"
+        args_schema = None
+
+        def run(self):
+            return {"ok": True, "count": None, "items": [1, 2]}
+
+    r = DictTool().invoke({})
+    # 能被 json.loads 解析即证明是合法 JSON
+    parsed = json.loads(r.output)
+    assert parsed == {"ok": True, "count": None, "items": [1, 2]}, f"输出不是合法 JSON: {r.output!r}"
+    # 确保是双引号 JSON 不是 Python repr（repr 里 True/None 是大写，但 json.loads 都能吃，
+    # 所以用一个不含中文/特殊字符的简单 case 查单引号出现即可）
+    assert "'" not in r.output, f"输出是 Python repr 而非 JSON: {r.output!r}"
+    print("✅ dict → JSON 序列化通过")
+
+
+def test_coerce_ensure_ascii_false():
+    """中文字符不应被转义为 \\uXXXX，保持可读性。"""
+
+    class CnTool(ToolBase):
+        name = "cn_tool"
+        description = "返回中文 dict"
+        args_schema = None
+
+        def run(self):
+            return {"name": "张三"}
+
+    r = CnTool().invoke({})
+    assert "张三" in r.output, f"中文被转义: {r.output!r}"
+    print("✅ 中文不转义（ensure_ascii=False）通过")
+
+
+def test_coerce_list_to_json():
+    """list 返回值也应是 JSON。"""
+
+    class ListTool(ToolBase):
+        name = "list_tool"
+        description = "返回列表"
+        args_schema = None
+
+        def run(self):
+            return [1, 2, 3]
+
+    r = ListTool().invoke({})
+    assert json.loads(r.output) == [1, 2, 3], f"list 输出不是合法 JSON: {r.output!r}"
+    print("✅ list → JSON 序列化通过")
+
+
+def test_coerce_none_and_str_unchanged():
+    """None → 空串、str → 原样，行为保持兼容。"""
+
+    class NoneTool(ToolBase):
+        name = "none_tool"
+        description = "返回 None"
+        args_schema = None
+
+        def run(self):
+            return None
+
+    class StrTool(ToolBase):
+        name = "str_tool"
+        description = "返回字符串"
+        args_schema = None
+
+        def run(self):
+            return "hello world"
+
+    assert NoneTool().invoke({}).output == ""
+    assert StrTool().invoke({}).output == "hello world"
+    print("✅ None / str 原始行为保持兼容通过")
+
+
+def test_coerce_fallback_for_non_serializable():
+    """循环引用等无法 JSON 序列化的对象应兜底到 str()，不抛错。"""
+
+    class Bad:
+        def __str__(self):
+            return "<bad>"
+
+    class BadTool(ToolBase):
+        name = "bad_tool"
+        description = "返回含自引用的不可序列化对象"
+        args_schema = None
+
+        def run(self):
+            d = {}
+            d["self"] = d  # 循环引用
+            d["obj"] = Bad()
+            return d
+
+    r = BadTool().invoke({})
+    # 兜底路径不抛错即可，输出格式是 str() 结果
+    assert isinstance(r.output, str) and r.failed is False
+    print("✅ 不可序列化对象回退 str() 不抛错通过")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# A25-2: 截断语义（truncated 算 succeeded，但 is_truncated 为 True）
+# ──────────────────────────────────────────────────────────────────────────
+def test_truncated_semantics():
+    """截断态：succeeded=True、failed=False、is_truncated=True。"""
+    from fast_agents.tools.tool_result import ToolResult, ToolStatus
+
+    tr = ToolResult.truncated("abc", original_length=100, limit=3)
+    assert tr.status == ToolStatus.TRUNCATED
+    assert tr.succeeded is True, "截断应视为成功（输出被裁剪，而非失败）"
+    assert tr.failed is False, "截断不应判为失败"
+    assert tr.is_truncated is True
+    print("✅ 截断语义 succeeded/is_truncated 通过")
+
+
+def test_success_is_not_truncated():
+    """普通成功：is_truncated=False。"""
+    r = ToolResult.ok("hello")
+    assert r.succeeded is True
+    assert r.failed is False
+    assert r.is_truncated is False
+
+    err_result = ToolResult.fail("oops")
+    assert err_result.failed is True
+    assert err_result.succeeded is False
+    assert err_result.is_truncated is False
+    print("✅ SUCCESS/ERROR 态 is_truncated=False 通过")
+
+
 if __name__ == "__main__":
     from pathlib import Path  # for test_terminal
     tests = [
@@ -522,6 +655,13 @@ if __name__ == "__main__":
         test_truncation_preserves_non_dict_artifact,
         test_read_large_file_preserves_hash_for_optimistic_lock,
         test_nested_model_ref_expansion,
+        test_coerce_dict_to_json,
+        test_coerce_ensure_ascii_false,
+        test_coerce_list_to_json,
+        test_coerce_none_and_str_unchanged,
+        test_coerce_fallback_for_non_serializable,
+        test_truncated_semantics,
+        test_success_is_not_truncated,
     ]
     failed = 0
     for t in tests:

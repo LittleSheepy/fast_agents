@@ -298,7 +298,16 @@ class ToolBase(ABC):
     def _coerce_result(raw: Any) -> ToolResult:
         if isinstance(raw, ToolResult):
             return raw
-        return ToolResult.ok(str(raw) if raw is not None else "")
+        if raw is None:
+            return ToolResult.ok("")
+        if isinstance(raw, str):
+            return ToolResult.ok(raw)
+        # 非字符串结果优先 JSON 序列化，避免 str() 产出 Python repr（单引号/大写 True/None），
+        # 方便模型与下游按标准 JSON 解析；不可序列化的极端情况再兜底到 str()。
+        try:
+            return ToolResult.ok(json.dumps(raw, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            return ToolResult.ok(str(raw))
 
     def _before_run(self, args: Dict[str, Any]) -> None:
         pass
@@ -306,6 +315,11 @@ class ToolBase(ABC):
     def _after_run(self, args: Dict[str, Any], result: ToolResult) -> None:
         if result.failed:
             logger.warning("[tool:%s] 执行失败: %s", self.name, result.error)
+        elif result.is_truncated:
+            logger.debug(
+                "[tool:%s] 完成（输出已截断至 %d 字符）",
+                self.name, len(result.output),
+            )
         else:
             logger.debug("[tool:%s] 完成，输出 %d 字符", self.name, len(result.output))
 
