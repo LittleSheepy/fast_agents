@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents 的**上下文工程（context engineering）**系统，参考 **LangChain 的 `trim_messages` 与 SummarizationNode**、**LlamaIndex 的 Context 构建与召回**、**CrewAI 的上下文传递**、**Anthropic 的 compaction 与 tool result 截断**、**DeepAgents 的「会话状态外化成文件」** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.3 · 2026-11-02 · 落地《演进路线图》B4 双通道注入：`ContextBuilder.build()` 新增 `system_tail` 参数，`ReActAgent` 在两条路径（enable_context 开 / 关）都把用户画像追加到 L1 system 末尾；未配画像或画像为空时 system prompt 字节级一致
-> 适用版本：`fast_agents.context`（包内 `__version__ = "1.0.0"`）；`ReActAgent` 同步接入画像注入
-> 配套代码：`fast_agents/context/`（7 个文件，builder 新增 `system_tail` 参数）+ `fast_agents/agents/react_agent/react_agent.py`（新增 3 个内部方法 + 2 条路径注入）+ `examples/context/context_react_agent_demo.py`（5 个示例）+ `test/test_context.py`（16 项）+ `test/test_react_agent.py`（+3 项，覆盖双通道注入），均已实测通过
+> 版本：v1.4 · 2026-11-02 · **A14 文件工具单一来源治理**：删除 `context/tools.py` 里与 `tools/builtin/file_tool.py` 同名的 `WriteFileTool` / `EditFileTool`（两者工具名都是 `write_file` / `edit_file`，同时注册会互相静默覆盖）；`build_context_tools(include_filesystem=True)` 只产出 `list_files`，文件读写编辑（`read_file` / `write_file` / `edit_file` / `multi_edit_file`）统一由 `tools/builtin/file_tool.py` 提供；`ReActAgent._init_context()` 在注册完本模块工具后自动补齐 file_tool 四件套，同名工具若已由用户预注册则不覆盖
+> 适用版本：`fast_agents.context`（包内 `__version__ = "1.1.0"`）；`ReActAgent._init_context` 同步调整
+> 配套代码：`fast_agents/context/`（tools.py 删除两个类，文件数仍为 7）+ `fast_agents/agents/react_agent/react_agent.py`（`_init_context` 自动补齐 file_tool 四件套，且不覆盖已有同名工具）+ `examples/context/context_react_agent_demo.py`（示例 4/5 改用 file_tool 的 WriteTool/EditTool）+ `test/test_context.py`（16 → 17 项，新增「单一来源无重名」回归）+ `test/test_react_agent.py`（断言扩展到六件套），均已实测通过
 > 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：**零新增三方依赖**（只用标准库；`tiktoken` 为可选增强，未安装时自动降级为启发式估算）
 
 ---
@@ -32,25 +32,27 @@
 
 | 版本 | 日期 | 变更 | 作者 |
 |------|------|------|------|
+| 1.4.0 | 2026-11-02 | **A14 文件工具单一来源治理（破坏性变更）**：删除 `context/tools.py` 里的 `WriteFileTool` / `EditFileTool`（与 `tools/builtin/file_tool.py` 的 `WriteTool` / `EditTool` 工具名完全相同，同时注册会互相静默覆盖，是真实可复现的静默错误）；`build_context_tools(include_filesystem=True)` 只产出 `list_files`；`ReActAgent._init_context()` 在注册完本模块工具后自动调用 `build_file_tools(workspace=".")` 补齐 `read_file` / `write_file` / `edit_file` / `multi_edit_file` 四件套，**同名工具若已由用户预注册则不覆盖**；`fast_agents.context.__all__`、`fast_agents/__init__.py`、`examples/context/context_react_agent_demo.py` 同步调整；`test_context.py` 16→17 项（新增「单一来源无重名」回归用例）；工具模块/文件工具/context/react_agent 全部测试（14+13+17+12）与 5 个示例全绿 | — |
 | 1.3.0 | 2026-11-02 | **B4 双通道注入**：`ContextBuilder.build()` 新增 `system_tail` 可选参数，调用方可把「相对稳定但跨轮可能变化」的文本（典型：用户画像）追加到 L1 system 末尾；`ReActAgent` 在 `enable_context=True` 路径把 `MemoryManager.get_profile().to_text()` 通过 `system_tail` 传给 builder，在 `enable_context=False` 路径直接把画像块追加到工作区 system 消息末尾；用固定 marker（`## 用户画像（稳定信息，请在回答中始终遵守）`）剥离旧块，保证跨 run 不叠加；未配 `profile_store` 或画像为空时 system 字节级一致；`test/test_react_agent.py` 新增 3 项，原有 16/16 context 测试与 react_agent 12/12 测试全绿 | — |
 | 1.2.0 | 2026-11-01 | **演进路线同步**：§十二 演进路线第 4 条从「依赖 B2/llm.embed() 待做」更新为「B2/I1 均已交付，下一步是把语义召回接到 ContextBuilder 并配合 A7 RAGTool」；其余章节与 7 文件源码保持一致（16/16 测试全过） | — |
 | 1.1.0 | 2026-10-29 | 同步最新代码：读文件工具 `ReadFileTool` 已随 `read_file_tool.py` 删除而更名 `ReadTool`（`tools/builtin/file_tool.py`），文档与示例同步更正；确认 `test_context.py` 16/16、`examples/context/context_react_agent_demo.py` 全部跑通 | — |
 | 1.0.0 | 2026-10-27 | 首次编写，逐行对齐 `fast_agents/context/` 真实实现；按《XX 模块编写说明》模版 v2.0 重排章节（开篇 → 一～十三 → 附录） | — |
 
-> **破坏性变更：无。** 对 context 模块本身是**纯追加**（`ContextBuilder.build()` 只多了一个可选 kwarg `system_tail`，默认 `None` → 行为与之前字节级一致）；对 `ReActAgent` 是**零侵入增强**——未传 `profile_store` / 画像为空时 system prompt 字节级保持原样，老代码不改一行也能跑。
+> **破坏性变更：有（自 v1.3.0 起首次破坏性变更）。** `from fast_agents.context import WriteFileTool` / `EditFileTool` 会 ImportError——这两个类已删除，文件写/编辑能力由 `from fast_agents.tools.builtin import WriteTool, EditTool, build_file_tools` 统一提供。`ReActAgent(enable_context=True)` 会自动补齐四件套，用户无需再手动 `add_tool(WriteFileTool(...))`；已有预注册实现时也不会被静默顶掉。v1.3.0 的 B4 双通道注入行为保持不变。
 
-本次交付同时落地《演进路线图》**模块 F** 与 **B 系列**的若干任务：
+本次交付同时落地《演进路线图》**模块 F**、**B 系列**、**A 系列**的若干任务：
 
 | 编号 | 任务 | 本次状态 |
 |---|---|---|
 | **F1** | `TokenCounter` + 上下文预算 | ✅ 已实现（`tokens.py`，三级降级计数 + `TokenBudget`） |
 | **F2** | 工具结果卸载到磁盘 | ✅ 已实现（`offload.py` + `read_offloaded` 工具） |
-| **F3** | 文件系统工具（`ls` / `read` / `write` / `edit`） | ✅ 已实现（`tools.py` 三件套 + `read_offloaded`，`read` 复用既有 `ReadTool`） |
+| **F3** | 文件系统工具（`ls` / `read` / `write` / `edit` / `multi_edit`） | ✅ 已实现（`tools.py` 仅提供 `list_files` + `read_offloaded`，文件读写编辑**统一由 `tools/builtin/file_tool.py` 提供**，带乐观锁 / 原子写 / 备份 / 审批；`ReActAgent._init_context` 自动补齐四件套，且不覆盖已有同名工具） |
 | **F4** | 摘要 / 压缩中间件化 | 🟡 部分（三级策略已实现且可开关，但未包成通用中间件，见 [十二章](#十二下一步演进路线)） |
 | **F5** | Prompt caching 友好布局 | ✅ 进一步完善：L1 system 末尾追加画像走同一 system 消息，缓存锚点仍稳定；L2 memory / L5 user 不承载画像 |
 | **B4** | 双通道注入（偏好进 system 末尾） | ✅ 已实现：两条路径都把画像拼到 L1 system 末尾，不进 L2 / L5 |
+| **A14** | 文件工具命名空间治理（消除 `write_file` / `edit_file` 同名工具静默覆盖） | ✅ 已实现：`write_file` / `edit_file` 在全库只剩一份定义（`tools/builtin/file_tool.py`） |
 
-> **相对 v1.2.0 文档的变化**：§二补充「双通道注入」问题陈述；§五在 L1 system 节补一段 system_tail 的行为；§六 `BuildReport` / §七 `builder.py` / §八接到 ReActAgent / §九 `ContextBuilder` API / §十 10.1 设计决策 / §十一 测试清单 全部补 B4 相关内容；§十二 把 B4 标完成，F5 由「部分」提升为「已实现（画像走 system_tail）」。
+> **相对 v1.3.0 文档的变化**：版本头升到 v1.4；更新历史加 1.4.0 行并显式标注破坏性变更；§4.1 目录结构、§4.2 依赖图、§7.5 tools.py 讲解、§7.6 ReActAgent 接入、§8 快速上手、§9 API 速查、§10 坑清单、§11 测试清单、§十二 演进路线，均同步到「tools.py 只产 list_files + read_offloaded，文件读写编辑归 file_tool」的新事实；新增一节「7.5.1 为什么删 WriteFileTool/EditFileTool」说明决策背景。
 
 ---
 
@@ -162,7 +164,7 @@ fast_agents/context/          ← 单数目录，对齐 tools/ memory/ skills/ m
 ├── offload.py                治理·卸载：ContextOffloader（大结果落盘 + 按需回读）
 ├── compressor.py             治理·压缩：ContextCompressor（三级策略）+ CompressionReport
 ├── builder.py                门面：ContextBuilder（拼装 + 预算 + 压缩一键走完）
-└── tools.py                  工具：read_offloaded + write/edit/list 三件套 + 工厂
+└── tools.py                  工具：read_offloaded + list_files（ls）+ 工厂；文件读写编辑统一由 tools/builtin/file_tool.py 提供
 ```
 
 **同时涉及的既有文件（全部为追加式修改，无删除）**：
@@ -171,7 +173,7 @@ fast_agents/context/          ← 单数目录，对齐 tools/ memory/ skills/ m
 fast_agents/__init__.py                                  ← 追加 context 导出（16 个符号）
 fast_agents/agents/react_agent/react_agent.py            ← 追加 4 个构造参数 + 3 个内部方法
 examples/context/context_react_agent_demo.py             ← 新增示例（5 个）
-test/test_context.py                                     ← 新增测试（16 项）
+test/test_context.py                                     ← 测试（17 项）
 test/test_react_agent.py                                 ← 追加 2 项 context 接入回归
 ```
 
@@ -569,8 +571,8 @@ from .compressor import CompressionReport, ContextCompressor, DEFAULT_COMPACT_PR
 from .layers import LAYER_ORDER, ContextLayer, ContextWindow
 from .offload import ContextOffloader, OffloadRecord
 from .tokens import TokenBudget, TokenCounter, count_message_tokens, estimate_text_tokens
-from .tools import (EditFileTool, ListFilesTool, ReadOffloadedTool,
-                    WriteFileTool, build_context_tools)
+from .tools import (ListFilesTool, ReadOffloadedTool,
+                    build_context_tools)
 
 __version__ = "1.0.0"
 ```
@@ -892,18 +894,49 @@ builder.record_turn(user_input, answer)      # 一轮结束：可选地写回工
 
 > **你要接新层 / 调配额时最该看这里**：`build()` 里的层顺序、`layer_quotas` 默认值。
 
-### 7.7 `tools.py` —— 让模型自己管理上下文
+### 7.7 `tools.py` —— 让模型自己管理上下文（v1.4 更新）
 
-**负责什么**：4 个 `ToolBase` 工具 + 1 个工厂，让 Agent 能**自己读回卸载内容、自己读写文件**。全部继承既有 `ToolBase`，用 pydantic 定义 `args_schema`。
+**负责什么**：2 个 `ToolBase` 工具 + 1 个工厂，让 Agent 能**自己读回卸载内容、自己列目录**。
+文件读写编辑（`read_file` / `write_file` / `edit_file` / `multi_edit_file`）**统一由 `tools/builtin/file_tool.py` 提供**（带乐观锁、原子写入、备份、审批标记），不在本模块重复定义。`ReActAgent._init_context` 会在注册完本模块工具后自动补齐 file_tool 四件套。
+
+全部继承既有 `ToolBase`，用 pydantic 定义 `args_schema`。
 
 | 工具 | `name` | 入参（`args_schema`） | 作用 |
 |---|---|---|---|
 | `ReadOffloadedTool` | `read_offloaded` | `offload_id`, `start_line=1`, `max_lines=200` | 按 id 回读卸载内容，支持行区间 |
-| `WriteFileTool` | `write_file` | `path`, `content`, `append=False` | 写文件（自动建父目录） |
-| `EditFileTool` | `edit_file` | `path`, `old_text`, `new_text=""`, `count=1` | 精确字符串替换 |
 | `ListFilesTool` | `list_files` | `path="."`, `recursive=False`, `max_entries=200` | 列目录（等价 `ls`） |
 
-#### 路径沙箱：三个文件工具共用
+文件四件套的真正来源（`tools/builtin/file_tool.py`）：
+
+| 工具 | `name` | 关键能力 |
+|---|---|---|
+| `ReadTool` | `read_file` | 分片读取、二进制黑名单、缓存 |
+| `WriteTool` | `write_file` | **原子写入**（临时文件 → fsync → os.replace）+ **乐观锁**（expected_hash/size/mtime）+ **备份** + `append` + 审批标记 |
+| `EditTool` | `edit_file` | **强制 old_text 唯一出现**（避免改错位置）+ 原子写 + 备份 + 审批标记 |
+| `MultiEditTool` | `multi_edit_file` | 批量替换、单条失败整体回滚、`dry_run` 预览 |
+
+> 详细 API、参数、示例见 [`工具模块编写说明.md`](./工具模块编写说明.md) 第八章内置工具。
+
+#### 7.7.1 为什么 v1.4 删除了 WriteFileTool / EditFileTool（A14）
+
+v1.0–v1.3 里本模块曾有一份精简的 `WriteFileTool` / `EditFileTool`（工具名 `write_file` / `edit_file`），
+与 `tools/builtin/file_tool.py` 的 `WriteTool` / `EditTool` **工具名完全相同**。`ToolRegistry.register_tool`
+对同名工具是覆盖语义（只打一条 warning）：
+
+1. 用户若先 `add_tool(WriteTool(...))`（带乐观锁/原子写/备份的强版）再 `enable_context=True`，
+   `_init_context` 里的 `WriteFileTool` 会**静默顶掉**强版，Agent 实际拿到无锁无备份的简化版；
+2. 反过来先开 context 再 `add_tool(WriteTool(...))`，用户自己注册的强版会顶掉 context 版——
+   但用户看到 warning 才知道，且不知道这是预期的覆盖还是意外重名。
+
+这种「同一工具名有两份定义、静默互相覆盖」是**真实可复现的静默错误**，比显式报错更危险。
+v1.4 的处理：**让 `write_file` / `edit_file` 在全库只剩一份定义**——
+
+- 本模块保留「回读卸载结果」与「列目录」（这两样是 context 的本职，且 file_tool 里没有对应实现）；
+- 文件读写编辑能力**全部收归 `tools/builtin/file_tool.py`**（功能更强、有审批标记、有备份）；
+- `ReActAgent._init_context` 自动补齐 file_tool 四件套，**同名工具若已由用户预注册则不覆盖**，
+  既保证默认可用，又不顶掉用户自定义实现。
+
+#### 路径沙箱
 
 ```python
 def _resolve_in_workspace(workspace: Path, path: str) -> Optional[Path]:
@@ -916,25 +949,9 @@ def _resolve_in_workspace(workspace: Path, path: str) -> Optional[Path]:
     return target
 ```
 
-加一个二进制后缀黑名单，拒绝把文本糊进图片：
-
-```python
-_BINARY_EXTS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".webp",
-    ".pdf", ".zip", ".whl", ".tar", ".gz", ".so", ".pyd", ".pyc", ".db",
-}
-```
-
-**为什么限定在 workspace 内**：对齐《演进路线图》F3 的验收标准——「Agent 能读写**工作目录内**的文件」。给模型文件系统能力，是对齐 Anthropic「会话状态外化成文件」的关键一步，但**必须画死边界**，否则模型可以读写任意路径。
-
-#### 写文件：显式 `newline="\n"`
-
-```python
-            with target.open(mode, encoding="utf-8", newline="\n") as f:
-                f.write(content)
-```
-
-**为什么钉死 `newline="\n"`**：Windows 上 Python 默认会把 `\n` 转成 `\r\n`。如果不显式指定，同一个文件在 Windows 与 Linux 下会产生不同字节，`git status` 满屏假 diff（仓库的 `.gitattributes` 正是为此做了「LF 入库」约定）。工具层在这里与仓库约定保持一致。
+**为什么限定在 workspace 内**：对齐《演进路线图》F3 的验收标准——「Agent 能读写**工作目录内**的文件」。
+给模型文件系统能力是对齐 Anthropic「会话状态外化成文件」的关键一步，但**必须画死边界**，否则模型可以读写任意路径。
+> 二进制黑名单由 `file_tool.py` 的 `_BINARY_EXTS`（30+ 种后缀）统一负责，本模块不再维护独立名单。
 
 #### 工厂：按需组装
 
@@ -942,15 +959,17 @@ _BINARY_EXTS = {
 def build_context_tools(workspace=".", offloader=None, include_filesystem=True) -> List[ToolBase]:
     tools: List[ToolBase] = []
     if offloader is not None:
-        tools.append(ReadOffloadedTool(offloader))          # ← 有卸载器才有回读工具
+        tools.append(ReadOffloadedTool(offloader))
     if include_filesystem:
-        tools.extend([ListFilesTool(workspace), WriteFileTool(workspace), EditFileTool(workspace)])
+        tools.append(ListFilesTool(workspace))      # ← 本模块只产 list_files + read_offloaded
     return tools
 ```
 
-**为什么 `offloader` 是可选参数**：没有卸载器时，「回读」这个动作没有意义（没有东西可读），所以按需生成。这一条让工厂在两种场景下都成立——只想要文件工具的、和要全套的。
+**为什么 `offloader` 是可选参数**：没有卸载器时，「回读」这个动作没有意义（没有东西可读），所以按需生成。
+文件读写编辑四件套**不**由本工厂产出——它们由 `ReActAgent._init_context` 在注册完本模块工具后，
+调用 `build_file_tools(workspace=".")` 统一补齐（同名工具不覆盖已有实现）。
 
-> **你要加新工具时最该看这里**：照抄任一个类的结构（`name` / `description` / `args_schema` / `run()`），再到工厂里挂上。
+> **你要加新工具时最该看这里**：照抄任一个类的结构（`name` / `description` / `args_schema` / `run()`），再到工厂里挂上。注意：文件相关的新工具优先考虑加到 `tools/builtin/file_tool.py`，不要再在本模块新增同名/同职责工具。
 
 ### 7.8 `react_agent.py` —— 接入：context 已内置于主类
 
@@ -1181,7 +1200,7 @@ python examples\context\context_react_agent_demo.py
 示例 1  分层拼装与 token 预算    看上下文由哪几层组成、各占多少 token
 示例 2  超长工具结果卸载          2 万字符 → 落盘 → 按需 read_offloaded 回读
 示例 3  三级压缩                  卸载 → 裁剪 → 摘要，逐级降级
-示例 4  文件系统工具              write / list / edit，会话状态外化
+示例 4  文件系统工具              列目录 + file_tool 写/读/编辑，会话状态外化
 示例 5  ReActAgent 接入 context   脚本化假 LLM，离线跑通完整 ReAct 循环
 ```
 
@@ -1202,8 +1221,8 @@ Agent 本轮送进 LLM 的上下文构成：
 ### 8.5 跑测试
 
 ```powershell
-python test\test_context.py        # 预期：16/16 通过
-python test\test_react_agent.py    # 预期：全部通过（含 2 项 context 专项）
+python test\test_context.py        # 预期：17/17 通过（v1.4 起）
+python test\test_react_agent.py    # 预期：全部通过（含 context 六件套断言与 3 项双通道画像注入）
 ```
 
 ---
@@ -1315,19 +1334,26 @@ builder.close()                # 释放资源（当前无长连接，留作扩�
 ### 9.6 context 工具与工厂（`tools.py`）
 
 ```python
-from fast_agents.context import (ReadOffloadedTool, WriteFileTool, EditFileTool,
-                                 ListFilesTool, build_context_tools)
+from fast_agents.context import (ReadOffloadedTool, ListFilesTool,
+                                 build_context_tools)
+from fast_agents.tools.builtin import ReadTool, WriteTool, EditTool, MultiEditTool, build_file_tools
 
 tools = build_context_tools(workspace=".", offloader=off, include_filesystem=True)
-# → [ReadOffloadedTool, ListFilesTool, WriteFileTool, EditFileTool]
+# → [ReadOffloadedTool, ListFilesTool]
 for t in tools:
     agent.add_tool(t)
 
+# 文件读写编辑统一用 file_tool 版本（v1.4 起：context 侧不再提供）
+for t in build_file_tools(workspace="D:/code"):
+    agent.add_tool(t)  # 或让 ReActAgent(enable_context=True) 自动补齐
+
 # 也可以单独构造
 ReadOffloadedTool(off)          # name = "read_offloaded"
-WriteFileTool("D:/code")        # name = "write_file"
-EditFileTool("D:/code")         # name = "edit_file"
 ListFilesTool("D:/code")        # name = "list_files"
+ReadTool("D:/code")             # name = "read_file"  ← 来自 tools.builtin.file_tool
+WriteTool("D:/code")            # name = "write_file"
+EditTool("D:/code")             # name = "edit_file"
+MultiEditTool("D:/code")        # name = "multi_edit_file"
 ```
 
 ### 9.7 `ReActAgent` 侧参数
@@ -1394,9 +1420,9 @@ context 是可选能力，默认关闭。如果只在 `enable_context=True` 路�
 | 摘要级似乎没生效 | 摘要需要 `llm`。`ContextCompressor` 没拿到 `llm` 时，第 3 级会失败并降级为截断（会打印「上下文摘要失败，降级为截断」） |
 | 上下文里出现两条相同的 user 消息 | 接入边界被破坏。检查是否在 `_fit_context()` 之外又 `append_user()`；回归断言见 `test_context_user_input_not_duplicated` |
 | 请求报 400「tool 消息缺少配对」 | 裁剪时把 `assistant(tool_calls)` 与 `tool` 拆开了。裁剪必须走 `_group_messages()` 成组处理；可用 `window.validate()` 提前自检 |
-| 注册工具时打印「工具 'write_file' 已存在，将被覆盖」 | Agent 里已有同名工具（如你自己注册过）。`register_tool` 是覆盖语义，确认是否要覆盖 |
+| 注册工具时打印「工具 'xxx' 已存在，将被覆盖」 | Agent 里已有同名工具。v1.4 起 `_init_context` 补齐 file_tool 四件套时会先查 `existing`，同名工具不覆盖；若仍然看到 warning，一般是你在 `_init_context` 之后又手动 `add_tool` 了同名工具，需确认是否故意覆盖 |
 | 模型注册了工具却不用 `read_offloaded` | 工具注册后没刷新 system 提示词，模型看不到它。`_init_context()` 里已调 `refresh_system_prompt()`；手工注册时要自己调 |
-| Windows 下写文件产生满屏 `git diff` | 写文件时未指定换行。本模块 `WriteFileTool` 已钉死 `newline="\n"`；自写文件工具要照做 |
+| Windows 下写文件产生满屏 `git diff` | 写文件时未指定换行。`tools/builtin/file_tool.py` 的写工具走 binary 写 + 换行归一化 + fsync + 原子替换，与仓库 `.gitattributes` 约定一致；自写文件工具要统一 `encoding="utf-8"` + 换行归一化 |
 | 中文内容出现乱码方框 | 读写文件未指定编码。统一 `encoding="utf-8"`，读不可信文件时加 `errors="replace"` |
 | `.fast_agents/` 目录被 git 跟踪 | 卸载目录在 workspace 内。建议在 `.gitignore` 加 `.fast_agents/` |
 | `layer_quotas` 比例之和不为 1，是否报错 | 不报错。比例之和不必为 1，多余的视为弹性空间；`history` 拿的是剩余额度 |
@@ -1407,13 +1433,16 @@ context 是可选能力，默认关闭。如果只在 `enable_context=True` 路�
 | **v1.3 起**：run 一次之后 system 变得越来越长、画像块重复出现 | 检查你是否在 `run()` 之外手工 `append` 了 system 消息。ReActAgent 通过 `_strip_profile_block` 在每次 run 前剥旧块；若你直接改 `system_prompt_template` 把 marker 字符塞进去了，会误判为旧块——不要在自定义模板里使用 `## 用户画像（稳定信息，请在回答中始终遵守）` 这个标题 |
 | **v1.3 起**：开了 profile_store、画像也非空，但 system 里没看到画像 | 检查 `user_id`：ProfileStore 按 `user_id` 存储画像，`MemoryManager(user_id="...")` 要与写画像时的 user_id 一致；另外画像为空（`is_empty()`）时注入会被跳过——`name/role/location` 都是 None、两个 dict 都空时才算空，`language` 有默认值不算 |
 | **v1.3 起**：自己调用 `ctx.build()` 时传了 `system_tail`，但打开 context 的 ReActAgent 没显示画像 | 不要自己在 `system_prompt` 参数里拼画像，ReActAgent 会从 `memory.get_profile()` 读画像并经 `system_tail` 传入；自己拼会被 `_strip_profile_block` 剥掉再重建，反而丢 |
+| **v1.4 起**：`from fast_agents.context import WriteFileTool` 报 ImportError | 这是 v1.4 的破坏性变更（A14）：`WriteFileTool`/`EditFileTool` 已从 context 删除，文件写/编辑能力改由 `from fast_agents.tools.builtin import WriteTool, EditTool, build_file_tools` 提供；`ReActAgent(enable_context=True)` 会自动补齐四件套，无需手动 add |
+| **v1.4 起**：开 context 时突然出现「工具 'xxx' 已存在」警告 | 如果你在 `ReActAgent(...)` 构造之后又自己手动 `agent.add_tool(WriteTool(...))` 等，会覆盖 `_init_context` 自动注册的同名工具；如果这是故意的可以忽略，否则请在构造 Agent 时通过 `tool_registry=` 预注册，避免后置 add 造成覆盖 |
+| **v1.4 起**：list_files 输出里没看到刚写入的 .bak 备份文件 | 正常：`file_tool.py` 的 EditTool 默认生成 `.bak.<时间戳>` 备份，list_files 默认 `recursive=False` 且当前目录递归时可见，不是 bug——备份在同目录同级，递归或指定具体子目录时可看到 |
 
 ### 10.3 跨平台注意事项（Windows 专项）
 
 本模块涉及文件读写与路径拼接，**在 Windows 上有实际差异**，逐条给可执行解法：
 
 1. **路径分隔符**：全部用 `pathlib.Path`，**不要手工拼 `"\\"` 或 `"/"`**。`_resolve_in_workspace()` 用 `(workspace / path).resolve()`，跨平台一致；
-2. **换行符**：`WriteFileTool` 写文件时显式 `newline="\n"`，避免 Windows 默认转 `\r\n` 造成跨平台字节差异。仓库 `.gitattributes` 已声明「`.py`/`.md`/`.txt`/`.bat` 入库 LF、Windows 检出 CRLF」，工具层与之一致；
+2. **换行符**：文件写入统一交给 `tools/builtin/file_tool.py` 的 `_atomic_write`（binary + `_normalize_newlines` + fsync + os.replace），与仓库 `.gitattributes`「`.py/.md/.txt/.bat` 入库 LF、Windows 检出 CRLF」约定一致；不要再在本模块或自定义工具里用文本模式 `newline="\n"` 直接写，避免双份换行策略；
 3. **编码**：所有文件读写显式 `encoding="utf-8"`；读用户/模型可能给出的任意文件时用 `errors="replace"`，避免一个坏字节导致整次读取抛异常；
 4. **卸载目录位置**：默认 `workspace="."` 是**进程启动目录**。在 Windows 上用 IDE 运行时启动目录常是项目根或 IDE 安装目录，务必确认；建议显式指定 `workspace`；
 5. **路径空格**：`workspace` 含空格（如 `D:\My Code\...`）时，`pathlib` 本身没问题，但**不要把未加引号的路径拼进 shell 命令**；本模块不调 shell，风险主要在你的自定义工具里；
@@ -1427,8 +1456,8 @@ context 是可选能力，默认关闭。如果只在 `enable_context=True` 路�
 
 | 测试文件 | 项数 | 覆盖点 | 运行命令 |
 |---|---|---|---|
-| `test/test_context.py` | 16/16 | 见下 | `python test\test_context.py` |
-| `test/test_react_agent.py` | 15/15 | 含 2 项 context 专项 + 3 项画像双通道（B4） | `python test\test_react_agent.py` |
+| `test/test_context.py` | 17/17 | 见下（v1.4 起新增「单一来源无重名」回归） | `python test\test_context.py` |
+| `test/test_react_agent.py` | 全部 | 含 context 六件套断言 + 3 项画像双通道（B4） | `python test\test_react_agent.py` |
 
 `test/test_context.py` 覆盖点（不依赖真实 LLM、不依赖网络）：
 
@@ -1446,8 +1475,9 @@ context 是可选能力，默认关闭。如果只在 `enable_context=True` 路�
 12. `ContextCompressor` 第 3 级：LLM 摘要替换历史（`test_compressor_summary_level`）；
 13. `ContextBuilder` 的完整分层拼装顺序（`test_builder_pipeline_and_order`）；
 14. `ContextBuilder` 的预算裁剪（历史被压掉）（`test_builder_budget_trims`）；
-15. context 工具：write / edit / list（`test_context_filesystem_tools`）；
-16. context 工具：read_offloaded 与工厂（`test_read_offloaded_tool_and_factory`）。
+15. 文件工具统一由 `build_file_tools` 提供：WriteTool/ListFilesTool/EditTool（`test_file_tools_via_builtin`）；
+16. context 工具：read_offloaded 与工厂（只产出 read_offloaded + list_files）（`test_read_offloaded_tool_and_factory`）；
+17. **【A14 回归】** 文件工具单一来源无重名：`context` 不再导出 WriteFileTool/EditFileTool、context 工具与 file_tool 工具互不重叠、file_tool 四件套齐全（`test_file_tools_single_source_no_overlap`）。
 
 `test/test_react_agent.py` 中与 context / 画像双通道相关的覆盖点（v1.3 起）：
 
@@ -1473,7 +1503,7 @@ context 是可选能力，默认关闭。如果只在 `enable_context=True` 路�
 | `test_profile_injected_into_system_tail_non_context_path` | **B4 非 context 路径**：画像追加到 system 末尾，跨 run 不叠加，改画像后下次生效 |
 | `test_profile_injected_via_system_tail_in_context_path` | **B4 context 路径**：画像走 system_tail 拼到 L1 system 末尾，不污染 L2 / L5，跨 run 不叠加 |
 | `test_react_agent.py::test_context_user_input_not_duplicated` | 接入边界一：**本轮 user 输入只注入一次**，不随工具步数累积 |
-| `test_react_agent.py::test_context_enabled_builds_and_registers_tools` | 接入边界二：开启 context 后 4 个工具确实注册、`agent.ctx` 非空 |
+| `test_react_agent.py::test_context_enabled_builds_and_registers_tools` | 接入边界二：开启 context 后 **6 个工具**（`read_offloaded` + `list_files` + `read_file`/`write_file`/`edit_file`/`multi_edit_file`）确实注册、`agent.ctx` 非空 |
 
 其中 `test_context_user_input_not_duplicated` 是本模块的**头号回归断言**——它锁住「单一数据源」不被后续改动破坏（与记忆模块的 `test_no_duplicate_history_injection` 同一思路）。
 
@@ -1484,7 +1514,7 @@ context 是可选能力，默认关闭。如果只在 `enable_context=True` 路�
 ```text
 $ python test\test_context.py
 ...
-✅ context 模块测试全部通过：16/16 项
+✅ context 模块测试全部通过：17/17 项
 
 $ python test\test_react_agent.py
 ...
@@ -1507,7 +1537,7 @@ $ python examples\context\context_react_agent_demo.py
 - [ ] 未配 `profile_store` 或画像为空时，system 内容与升级前字节级一致（用 `test_profile_noop_when_empty_or_unconfigured` 自动断言）；
 - [ ] 跨两次 `run()`，system 里「## 用户画像」标记只出现 1 次，没有叠加。
 
-> **测试与实现是否同步**：本模块测试与实现**同步**——`test/test_context.py` 16/16、`test/test_react_agent.py` 15/15（含新增 3 项 B4 双通道注入）全绿。若你后续改了裁剪或画像注入逻辑，请同步更新对应断言，不要直接删断言。
+> **测试与实现是否同步**：本模块测试与实现**同步**——`test/test_context.py` 17/17、`test/test_react_agent.py` 全部通过（含 context 六件套断言 + 3 项 B4 双通道注入）。若你后续改了裁剪、画像注入或文件工具注册逻辑，请同步更新对应断言，不要直接删断言。
 
 ---
 

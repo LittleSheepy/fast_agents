@@ -1,18 +1,17 @@
-"""上下文相关的工具：卸载回读 + 列目录
+"""上下文相关的工具：卸载回读 + 目录列表
 
-本模块只保留两个工具，职责边界清晰：
+这些工具让「Agent 自己管理自己的上下文」成为可能：
 
 - ``ReadOffloadedTool``  按 offload_id 回读被卸载的工具结果（配合 ContextOffloader）
 - ``ListFilesTool``      列目录（``ls``）
 
-**文件读写编辑不在这里**：``read_file`` / ``write_file`` / ``edit_file`` /
-``multi_edit_file`` 统一由 ``tools/builtin/file_tool.py`` 提供（带乐观锁、原子写入、
-备份、审批标记）。历史上本模块曾有一份同名的精简实现（``WriteFileTool`` /
-``EditFileTool``），与前者工具名完全相同（都是 ``write_file`` / ``edit_file``），
-同时注册会互相静默覆盖，现已删除，避免同一工具名存在两份定义。
+**文件读写编辑不在这里**：``read_file`` / ``write_file`` / ``edit_file`` / ``multi_edit_file``
+统一由 ``tools/builtin/file_tool.py`` 提供（带乐观锁、原子写入、备份、审批标记）。
+历史上本模块曾有一份同名的精简实现（``WriteFileTool`` / ``EditFileTool``），与前者工具名完全
+相同（都是 ``write_file`` / ``edit_file``），同时注册会互相静默覆盖——`ReActAgent._init_context`
+会自动补齐 ``build_file_tools()`` 四件套，无需在此重复定义。
 
-安全边界与 ``TerminalTool`` 完全一致：**一切路径限定在 workspace 内**，
-越界直接返回 ``ToolResult.fail``，不做任何 IO。
+安全边界：**一切路径限定在 workspace 内**，越界直接返回 ``ToolResult.fail``，不做任何 IO。
 """
 
 from __future__ import annotations
@@ -155,12 +154,14 @@ def build_context_tools(
     Args:
         workspace: 工作目录
         offloader: 卸载器实例；传入时才会生成 ``read_offloaded`` 工具
-        include_filesystem: 是否包含列目录工具 ``list_files``。
-            注意：本参数**不再**产出 ``write_file`` / ``edit_file``——
-            文件读写编辑请用 ``fast_agents.tools.builtin.build_file_tools()``。
+        include_filesystem: 是否包含 ``list_files`` 目录工具（文件读写编辑由
+            ``tools/builtin/file_tool.py`` 统一提供，不在此处注册）
 
     Returns:
-        ToolBase 列表，逐个 ``agent.add_tool(t)`` 即可
+        ToolBase 列表，逐个 ``agent.add_tool(t)`` 即可。
+        ``ReActAgent._init_context`` 会在本工厂返回的工具之后自动补齐
+        ``build_file_tools()`` 的 ``read_file`` / ``write_file`` / ``edit_file`` / ``multi_edit_file``
+        四件套，且对已存在的同名工具不做覆盖，避免顶掉用户预注册的实现。
     """
     tools: List[ToolBase] = []
     if offloader is not None:

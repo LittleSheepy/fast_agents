@@ -1,4 +1,4 @@
-"""context 模块 —— 上下文工程（token 预算 / 分层拼装 / 压缩 / 卸载 / 文件系统）
+"""context 模块 —— 上下文工程（token 预算 / 分层拼装 / 压缩 / 卸载 / 目录浏览）
 
 分层与数据流：
 
@@ -17,6 +17,10 @@
 
 外加一组让 Agent 自己管理上下文的工具（``build_context_tools``），
 与 ``memory_tool`` / ``mcp_tool`` 同层级、同风格。
+
+文件读写编辑（``read_file`` / ``write_file`` / ``edit_file`` / ``multi_edit_file``）
+统一由 ``tools/builtin/file_tool.py`` 提供（带乐观锁、原子写入、备份、审批标记）。
+``ReActAgent._init_context`` 会在注册完本模块工具后自动补齐 file_tool 四件套。
 """
 
 from .builder import BuildReport, ContextBuilder
@@ -45,4 +49,4 @@ __all__ = [
     "build_context_tools",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

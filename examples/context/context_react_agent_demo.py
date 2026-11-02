@@ -37,7 +37,7 @@ from fast_agents.context import (
     TokenBudget,
     TokenCounter,
 )
-from fast_agents.tools.builtin import build_file_tools
+from fast_agents.tools.builtin import WriteTool, EditTool, build_file_tools
 from fast_agents.messages.message import Message, MsgToolCall
 from fast_agents.agents.react_agent.react_agent import ReActAgent
 
@@ -219,9 +219,9 @@ def demo_compression(workspace: str) -> None:
 def demo_filesystem(workspace: str) -> None:
     _banner("示例 4：文件系统工具（write / list / edit）", "把会话状态外化成文件")
 
-    # 写 / 编辑来自 tools/builtin/file_tool.py（带乐观锁 + 原子写）；context 侧只保留 list_files
-    _reader, write_tool, edit_tool, _multi = build_file_tools(workspace)
+    write_tool = WriteTool(workspace)
     list_tool = ListFilesTool(workspace)
+    edit_tool = EditTool(workspace)
 
     r = write_tool.invoke({
         "path": "notes/todo.md",
@@ -265,12 +265,12 @@ def demo_agent_with_context(workspace: str) -> None:
         llm=llm,
         enable_memory=False,       # 本例聚焦 context，关掉记忆看更清楚
         enable_skills=False,
-        enable_context=True,       # ← 打开上下文工程
+        enable_context=True,       # ← 打开上下文工程（会自动注册 list_files + file_tool 四件套）
         context_budget=32_000,
         context_offload_threshold=2_000,
     )
-    agent.add_tools(build_file_tools(workspace))
-    agent.add_tool(ListFilesTool(workspace))
+    # enable_context=True 时，ReActAgent._init_context 已经自动注册了
+    # list_files + read_file/write_file/edit_file/multi_edit_file，这里无需再重复 add_tool。
     agent.refresh_system_prompt()
 
     names = sorted(t.name for t in agent.tool_registry.list_tools())
@@ -289,10 +289,10 @@ def demo_agent_with_context(workspace: str) -> None:
             extra = " (+tool_calls)" if m.get("tool_calls") else ""
             print(f"    - [{role:<9}] {text}{extra}")
 
-    ctx_tools = [n for n in names if n in {"read_offloaded", "list_files"}]
-    print(f"\n其中由 context 自动注册的工具：{ctx_tools}")
-    file_ts = [n for n in names if n in {"read_file", "write_file", "edit_file", "multi_edit_file"}]
-    print(f"由 file_tool 提供的文件工具：{file_ts}")
+    ctx_builtin = [n for n in names if n in {"read_offloaded", "list_files"}]
+    file_builtin = [n for n in names if n in {"read_file", "write_file", "edit_file", "multi_edit_file"}]
+    print(f"\n其中由 context 自动注册的工具：{ctx_builtin}")
+    print(f"其中由 file_tool 提供的文件四件套（_init_context 自动补齐）：{file_builtin}")
     print(f"当前上下文统计：{agent.ctx.stats()}")
 
 

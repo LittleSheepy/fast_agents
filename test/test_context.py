@@ -1,6 +1,6 @@
 """context 模块测试：不依赖真实 LLM、不依赖网络
 
-覆盖（16 项）：
+覆盖（17 项）：
 1.  TokenCounter 的启发式估算与消息计数
 2.  TokenBudget 的预算换算与描述
 3.  ContextWindow 的分层顺序与 flatten
@@ -15,8 +15,9 @@
 12. ContextCompressor 第 3 级：LLM 摘要替换历史
 13. ContextBuilder 的完整分层拼装顺序
 14. ContextBuilder 的预算裁剪（历史被压掉）
-15. context 工具：list / read_offloaded（文件读写编辑统一由 tools/builtin/file_tool.py 提供）
-16. 文件工具单一来源：context 不再导出 WriteFileTool / EditFileTool，注册不重名
+15. context 工具：list / read_offloaded；文件读写改由 file_tool 统一提供
+16. build_context_tools 工厂输出 + file 工具单一来源（A14）
+17. file_tool 与 context 工具不重名（不会互相静默覆盖）
 """
 
 import os
@@ -39,8 +40,7 @@ from fast_agents.context import (
     estimate_text_tokens,
 )
 from fast_agents.messages.message import Message, MsgToolCall
-from fast_agents.tools.builtin import build_file_tools
-from fast_agents.tools.tool_registry import ToolRegistry
+from fast_agents.tools.builtin import WriteTool, EditTool, build_file_tools
 
 
 # ============================================================
@@ -412,16 +412,15 @@ def test_builder_budget_trims():
 
 
 # ============================================================
-# 15. context 工具
+# 15. 文件工具 + context 工具
 # ============================================================
 
-def test_context_filesystem_tools():
-    """context 侧只保留 list_files；写 / 编辑由 tools/builtin/file_tool.py 统一提供"""
+def test_file_tools_via_builtin():
+    """文件读写编辑统一由 tools/builtin/file_tool.py 提供（A14 后唯一来源）"""
     with tempfile.TemporaryDirectory() as tmp:
+        write_tool = WriteTool(tmp)
         list_tool = ListFilesTool(tmp)
-        file_tools = {t.name: t for t in build_file_tools(tmp)}
-        write_tool = file_tools["write_file"]
-        edit_tool = file_tools["edit_file"]
+        edit_tool = EditTool(tmp)
 
         # 写文件
         r = write_tool.invoke({"path": "notes/a.md", "content": "第一行\n第二行\n"})
@@ -432,7 +431,7 @@ def test_context_filesystem_tools():
         r = list_tool.invoke({"path": "notes"})
         assert r.succeeded and "a.md" in r.output, r.output
 
-        # 编辑文件（精确替换）
+        # 编辑文件（精确替换；file_tool 的 EditTool 要求 old_text 唯一出现）
         r = edit_tool.invoke({"path": "notes/a.md", "old_text": "第二行", "new_text": "第二行(改)"})
         assert r.succeeded, r.error
         content = open(os.path.join(tmp, "notes", "a.md"), encoding="utf-8").read()
@@ -446,7 +445,7 @@ def test_context_filesystem_tools():
         # 沙箱：越界路径必须拒绝
         r = write_tool.invoke({"path": "../escape.txt", "content": "x"})
         assert not r.succeeded and "工作目录外" in (r.error or ""), r.error
-    print("✅ test_context_filesystem_tools 通过")
+    print("✅ test_file_tools_via_builtin 通过")
 
 
 def test_read_offloaded_tool_and_factory():
@@ -464,7 +463,8 @@ def test_read_offloaded_tool_and_factory():
         r = tool.invoke({"offload_id": "ffffffffffffffff"})
         assert not r.succeeded, "不存在的 id 应当失败"
 
-        # 工厂：传 offloader 时包含 read_offloaded + 文件三件套
+        # 工厂：传 offloader + include_filesystem=True 时只产出 read_offloaded + list_files
+        # （write/edit 已从 context 移除，统一由 file_tool 提供）
         tools = build_context_tools(workspace=tmp, offloader=offloader)
         names = {t.name for t in tools}
         assert names == {"read_offloaded", "list_files"}, names
@@ -476,27 +476,32 @@ def test_read_offloaded_tool_and_factory():
     print("✅ test_read_offloaded_tool_and_factory 通过")
 
 
-def test_file_tools_single_source():
-    """文件工具单一来源：context 不再导出 WriteFileTool / EditFileTool；
-    同时注册 context 工具与文件四件套时不应出现同名覆盖"""
-    import fast_agents.context as ctx_pkg
+def test_file_tools_single_source_no_overlap():
+    """【A14 回归】context 工具与 file_tool 工具不重名，不会互相静默覆盖；
+    fast_agents.context 不再导出 WriteFileTool/EditFileTool。
+    """
+    # 1) fast_agents.context 不再导出被删类
+    import fast_agents.context as ctx_mod
+    assert not hasattr(ctx_mod, "WriteFileTool"), "context 模块不应再导出 WriteFileTool"
+    assert not hasattr(ctx_mod, "EditFileTool"), "context 模块不应再导出 EditFileTool"
 
-    assert not hasattr(ctx_pkg, "WriteFileTool"), "context 不应再导出 WriteFileTool"
-    assert not hasattr(ctx_pkg, "EditFileTool"), "context 不应再导出 EditFileTool"
-
+    # 2) build_context_tools 与 build_file_tools 的工具名互不重叠
     with tempfile.TemporaryDirectory() as tmp:
-        offloader = ContextOffloader(workspace=tmp, threshold=20)
-        tools = build_context_tools(workspace=tmp, offloader=offloader) + build_file_tools(tmp)
-        names = [t.name for t in tools]
-        assert len(names) == len(set(names)), f"存在重名工具: {names}"
+        offloader = ContextOffloader(workspace=tmp, threshold=100)
+        ctx_tools = build_context_tools(workspace=tmp, offloader=offloader)
+        file_tools = build_file_tools(workspace=tmp)
+        ctx_names = {t.name for t in ctx_tools}
+        file_names = {t.name for t in file_tools}
+        overlap = ctx_names & file_names
+        assert overlap == set(), f"context 与 file_tool 不应有同名工具，冲突: {overlap}"
 
-        registry = ToolRegistry()
-        registry.register_tools(*tools)
-        assert {t.name for t in registry.list_tools()} == {
-            "read_offloaded", "list_files",
-            "read_file", "write_file", "edit_file", "multi_edit_file",
-        }, "注册后工具集合与预期不符"
-    print("✅ test_file_tools_single_source 通过")
+        # 3) 写/编辑的唯一来源是 file_tool 里的 WriteTool/EditTool
+        assert "write_file" in file_names and "edit_file" in file_names
+        assert "write_file" not in ctx_names and "edit_file" not in ctx_names
+
+        # 4) file_tool 四件套齐全：read / write / edit / multi_edit
+        assert file_names >= {"read_file", "write_file", "edit_file", "multi_edit_file"}
+    print("✅ test_file_tools_single_source_no_overlap 通过")
 
 
 # ============================================================
@@ -519,9 +524,9 @@ def main():
         test_compressor_summary_level,
         test_builder_pipeline_and_order,
         test_builder_budget_trims,
-        test_context_filesystem_tools,
+        test_file_tools_via_builtin,
         test_read_offloaded_tool_and_factory,
-        test_file_tools_single_source,
+        test_file_tools_single_source_no_overlap,
     ]
     passed = 0
     for t in tests:

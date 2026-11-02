@@ -274,10 +274,11 @@ def test_context_enabled_builds_and_registers_tools():
     # 1) context 已就绪
     assert agent.ctx is not None, "开启 context 后 agent.ctx 不应为 None"
 
-    # 2) 文件系统 / 回读工具已注册
+    # 2) context 回读 / 目录工具 + file_tool 四件套均已注册（A14：文件读写编辑统一由 file_tool 提供）
     tool_names = {t["function"]["name"] for t in agent.tool_registry.to_openai_tools()}
-    for expected in ("read_offloaded", "write_file", "edit_file", "list_files"):
-        assert expected in tool_names, f"context 工具 {expected} 未注册"
+    for expected in ("read_offloaded", "list_files",
+                     "read_file", "write_file", "edit_file", "multi_edit_file"):
+        assert expected in tool_names, f"context/file_tool 工具 {expected} 未注册"
 
     # 3) 跑一轮后仍只有一条 system，且本轮 user 只出现一次
     out = agent.run("你好")
