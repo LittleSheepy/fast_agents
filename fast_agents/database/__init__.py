@@ -12,7 +12,7 @@
 from .database_client_base import DatabaseClientBase
 from .query import Filter, FilterOp, Query, SortOrder
 from .schema import Column, ColumnType, Index, Schema
-from .sqlite_client import SQLiteClient
+from .sqlite_client import SqlExpr, SQLiteClient
 
 __all__ = [
     # 客户端
@@ -28,4 +28,6 @@ __all__ = [
     "Filter",
     "FilterOp",
     "SortOrder",
+    # 写侧 SQL 表达式包装
+    "SqlExpr",
 ]

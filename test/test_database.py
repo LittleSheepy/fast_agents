@@ -21,6 +21,7 @@ from fast_agents.database import (
     Query,
     Schema,
     SortOrder,
+    SqlExpr,
     SQLiteClient,
 )
 
@@ -778,3 +779,194 @@ def test_batch_insert_invalid_table():
         assert False, "应该抛错"
     except ValueError:
         pass
+
+
+# ==================== 条件写入：upsert / update_where / delete_where ====================
+def _make_kv_db():
+    """构造一个带主键的单表内存库，供条件写入用例复用。"""
+    db = SQLiteClient(":memory:")
+    db.ensure_table("kv", {"k": "TEXT PRIMARY KEY", "v": "TEXT", "n": "INTEGER DEFAULT 0"})
+    return db
+
+
+def test_busy_timeout_matches_timeout():
+    """busy_timeout 与连接 timeout 同口径：默认 5s，显式 10s 时同步。"""
+    db = SQLiteClient(":memory:")
+    assert int(db.query("PRAGMA busy_timeout", fetch_one=True)["timeout"]) == 5000
+    db.close()
+
+    db2 = SQLiteClient(":memory:", timeout=10.0)
+    assert int(db2.query("PRAGMA busy_timeout", fetch_one=True)["timeout"]) == 10000
+    db2.close()
+
+
+def test_upsert_inserts_new_row():
+    """upsert 目标行不存在时按插入处理。"""
+    db = _make_kv_db()
+    assert db.upsert("kv", {"k": "a", "v": "1", "n": 1}, conflict_keys="k") == 1
+    assert db.select_one("kv", {"k": "a"})["v"] == "1"
+    db.close()
+
+
+def test_upsert_conflict_updates_row():
+    """upsert 命中冲突时更新，且不新插入行。"""
+    db = _make_kv_db()
+    db.insert("kv", {"k": "a", "v": "1", "n": 1})
+    assert db.upsert("kv", {"k": "a", "v": "2", "n": 9}, conflict_keys="k") == 1
+    row = db.select_one("kv", {"k": "a"})
+    assert row["v"] == "2" and row["n"] == 9
+    assert db.count("kv") == 1
+    db.close()
+
+
+def test_upsert_partial_update_columns():
+    """update_columns 限定后，未列出的列在冲突时保持原值。"""
+    db = _make_kv_db()
+    db.insert("kv", {"k": "a", "v": "1", "n": 1})
+    db.upsert("kv", {"k": "a", "v": "new", "n": 100}, conflict_keys="k", update_columns=["v"])
+    row = db.select_one("kv", {"k": "a"})
+    assert row["v"] == "new"
+    assert row["n"] == 1
+    db.close()
+
+
+def test_upsert_conflict_key_missing_in_data():
+    """conflict_keys 必须出现在 data 中，否则报 ValueError。"""
+    db = _make_kv_db()
+    with pytest.raises(ValueError):
+        db.upsert("kv", {"v": "x", "n": 1}, conflict_keys="k")
+    db.close()
+
+
+def test_upsert_invalid_ident_rejected():
+    """非法表名被白名单拦截。"""
+    db = _make_kv_db()
+    with pytest.raises(ValueError):
+        db.upsert("kv; DROP TABLE kv--", {"k": "a"}, conflict_keys="k")
+    db.close()
+
+
+def test_update_where_with_filter():
+    """update_where 支持比较谓词（GTE）。"""
+    db = _make_kv_db()
+    db.batch_insert("kv", [{"k": f"k{i}", "v": "x", "n": i} for i in range(5)])
+    n = db.update_where(
+        "kv", {"v": "hit"}, Query(table_name="kv", filters=[Filter(field="n", op=FilterOp.GTE, value=3)])
+    )
+    assert n == 2
+    assert db.count("kv", {"v": "hit"}) == 2
+    db.close()
+
+
+def test_update_where_in_filter():
+    """update_where 支持 IN 谓词。"""
+    db = _make_kv_db()
+    db.batch_insert("kv", [{"k": f"k{i}", "v": "x", "n": i} for i in range(5)])
+    n = db.update_where(
+        "kv", {"v": "in"}, Query(table_name="kv", filters=[Filter(field="k", op=FilterOp.IN, value=["k0", "k2"])])
+    )
+    assert n == 2
+    assert db.count("kv", {"v": "in"}) == 2
+    db.close()
+
+
+def test_update_where_expression():
+    """SQL 表达式（自增）通过 SqlExpr 显式包裹后可用。"""
+    db = _make_kv_db()
+    db.insert("kv", {"k": "a", "v": "x", "n": 5})
+    n = db.update_where(
+        "kv", {"n": SqlExpr("n + 1")}, Query(table_name="kv", filters=[Filter(field="k", op=FilterOp.EQ, value="a")])
+    )
+    assert n == 1
+    assert db.select_one("kv", {"k": "a"})["n"] == 6
+    db.close()
+
+
+def test_update_where_requires_filters():
+    """空 filters 直接报错，防止误更新全表。"""
+    db = _make_kv_db()
+    with pytest.raises(ValueError):
+        db.update_where("kv", {"v": "x"}, Query(table_name="kv"))
+    db.close()
+
+
+def test_update_where_value_parameterized():
+    """值走参数化：注入串被原样存入而非当 SQL 执行。"""
+    db = _make_kv_db()
+    db.insert("kv", {"k": "a", "v": "1", "n": 1})
+    payload = "x' OR '1'='1"
+    db.update_where(
+        "kv", {"v": payload}, Query(table_name="kv", filters=[Filter(field="k", op=FilterOp.EQ, value="a")])
+    )
+    assert db.select_one("kv", {"k": "a"})["v"] == payload
+    db.close()
+
+
+def test_delete_where_with_filter():
+    """delete_where 支持比较谓词（LT）。"""
+    db = _make_kv_db()
+    db.batch_insert("kv", [{"k": f"k{i}", "v": "x", "n": i} for i in range(5)])
+    n = db.delete_where("kv", Query(table_name="kv", filters=[Filter(field="n", op=FilterOp.LT, value=2)]))
+    assert n == 2
+    assert db.count("kv") == 3
+    db.close()
+
+
+def test_delete_where_in_filter():
+    """delete_where 支持 IN 谓词。"""
+    db = _make_kv_db()
+    db.batch_insert("kv", [{"k": f"k{i}", "v": "x", "n": i} for i in range(5)])
+    n = db.delete_where("kv", Query(table_name="kv", filters=[Filter(field="k", op=FilterOp.IN, value=["k4", "k3"])]))
+    assert n == 2
+    assert db.count("kv") == 3
+    db.close()
+
+
+def test_delete_where_requires_filters():
+    """空 filters 直接报错，且不会误删数据。"""
+    db = _make_kv_db()
+    db.insert("kv", {"k": "a", "v": "1", "n": 1})
+    with pytest.raises(ValueError):
+        db.delete_where("kv", Query(table_name="kv"))
+    assert db.count("kv") == 1
+    db.close()
+
+
+def test_multi_column_sort():
+    """sort_by 支持多字段，方向对每列统一应用。"""
+    db = _make_kv_db()
+    db.batch_insert("kv", [
+        {"k": "a", "v": "x", "n": 2},
+        {"k": "b", "v": "x", "n": 1},
+        {"k": "c", "v": "y", "n": 9},
+    ])
+    asc = db.select_where(Query(table_name="kv", sort_by=["v", "n"], sort_order=SortOrder.ASC))
+    assert [r["k"] for r in asc] == ["b", "a", "c"]
+    desc = db.select_where(Query(table_name="kv", sort_by=["v", "n"], sort_order=SortOrder.DESC))
+    assert [r["k"] for r in desc] == ["c", "a", "b"]
+    db.close()
+
+
+def test_sort_by_single_str_still_works():
+    """单字段 str 写法保持兼容。"""
+    db = _make_kv_db()
+    db.batch_insert("kv", [{"k": f"k{i}", "v": "x", "n": i} for i in range(3)])
+    rows = db.select_where(Query(table_name="kv", sort_by="n", sort_order=SortOrder.DESC))
+    assert [r["n"] for r in rows] == [2, 1, 0]
+    db.close()
+
+
+def test_sort_by_empty_list_rejected():
+    """空 sort_by 列表直接报错。"""
+    db = _make_kv_db()
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="kv", sort_by=[]))
+    db.close()
+
+
+def test_sql_expr_empty_rejected():
+    """SqlExpr 不接受空表达式。"""
+    with pytest.raises(ValueError):
+        SqlExpr("")
+    with pytest.raises(ValueError):
+        SqlExpr("   ")
