@@ -1,0 +1,362 @@
+"""TraceLogger —— 全链路记录器（路线图 G1 初版）。
+
+借鉴 LangChain CallbackManager / OpenTelemetry Tracer / OpenAI Agents SDK Tracing
+的核心概念（Trace / Span / 父子关系 / 钩子），但只保留最小可跑闭环：
+
+- **默认关闭**：不构造 TraceLogger 或不传给 LLM/Agent，行为与改动前完全一致；
+- **一条 Trace = 一次 run**，一个 Trace 下多个 Span（llm/tool/decision/agent）；
+- **最小字段集**：时间戳 / 类型 / 输入 / 输出 / 耗时 / session_id + 推荐补充：
+  trace_id / span_id / parent_id / name / status / error / metadata；
+- **默认 JsonlStore 落盘**（路径可配），存储层通过 TraceStoreBase 抽象，
+  预留切 SQLite / 远端上报扩展位；
+- **零侵入接入**：
+  - 工具打点：``tool_registry.add_hook(tracer.tool_hook)`` 或 ``attach_to_tool_registry(reg)``；
+  - LLM / Agent：构造时传 ``tracer=...`` 即可自动打点（可选参数，默认 None 行为不变）。
+"""
+from __future__ import annotations
+
+import contextvars
+import threading
+import time
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, List, Optional
+
+from .jsonl_store import MEMORY_PATH, JsonlStore
+from .models import SpanKind, SpanRecord, SpanStatus, _new_id, _now_ts
+from .store_base import TraceStoreBase
+
+
+# ContextVar：当前激活的 Span id（支持线程/上下文传递，初版不做 async，线程内够用）
+_active_span_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "trace_active_span_id", default=None
+)
+_active_trace_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "trace_active_trace_id", default=None
+)
+
+
+class TraceLogger:
+    """全链路 Trace 记录器。
+
+    Args:
+        store: TraceStoreBase 后端；默认 JsonlStore(path, append=True)。
+        path: 当 store=None 时，传给 JsonlStore 的路径；默认 ``":memory:"``（仅内存，不落盘）；
+              传文件路径（如 ``"traces/runs.jsonl"``）时按行追加。
+        session_id: 会话 id；不传则自动生成；可通过 ``set_session_id`` 随时切换。
+        enabled: 是否实际打点；False 时所有方法都是空操作（与不传 tracer 等价）。
+    """
+
+    def __init__(
+        self,
+        store: Optional[TraceStoreBase] = None,
+        *,
+        path: Optional[str] = None,
+        session_id: Optional[str] = None,
+        enabled: bool = True,
+    ):
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        # 存储后端
+        if store is not None:
+            self._store = store
+        else:
+            self._store = JsonlStore(path if path is not None else MEMORY_PATH, append=True)
+        # 会话 id
+        self._session_id = session_id or f"sess_{_new_id()[:12]}"
+        # 线程本地：每个线程自己维护当前 trace / span 栈（ContextVar 初版用 threading.local 做兜底更稳）
+        self._local = threading.local()
+
+    # ---------- 配置 ----------
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    def set_session_id(self, session_id: str) -> None:
+        """切换/设置 session_id。"""
+        self._session_id = session_id
+
+    @property
+    def store(self) -> TraceStoreBase:
+        """获取底层存储后端（便于读/回放/close）。"""
+        return self._store
+
+    # ---------- Trace 生命周期 ----------
+    def start_trace(self, name: str = "root", session_id: Optional[str] = None) -> str:
+        """开启一条新 Trace，返回 trace_id；新 Trace 开始后调用 start_span 会作为根 Span。"""
+        trace_id = f"trace_{_new_id()}"
+        if not hasattr(self._local, "trace_stack"):
+            self._local.trace_stack = []
+            self._local.span_stack = []
+        self._local.trace_stack.append(trace_id)
+        _active_trace_id.set(trace_id)
+        if session_id is not None:
+            self._session_id = session_id
+        return trace_id
+
+    def end_trace(self) -> None:
+        """结束当前 Trace（仅弹栈；实际写入由每个 Span.finish 完成）。"""
+        if hasattr(self._local, "trace_stack") and self._local.trace_stack:
+            self._local.trace_stack.pop()
+            new_trace = self._local.trace_stack[-1] if self._local.trace_stack else None
+            _active_trace_id.set(new_trace)
+
+    @contextmanager
+    def trace(self, name: str = "root", session_id: Optional[str] = None) -> Iterator[str]:
+        """with 语法开启/结束一条 Trace，yield trace_id。"""
+        tid = self.start_trace(name=name, session_id=session_id)
+        try:
+            yield tid
+        finally:
+            self.end_trace()
+
+    # ---------- Span 生命周期 ----------
+    def _current_trace_id(self) -> str:
+        if hasattr(self._local, "trace_stack") and self._local.trace_stack:
+            return self._local.trace_stack[-1]
+        t = _active_trace_id.get()
+        if t:
+            return t
+        # 懒启动一条默认 trace
+        return self.start_trace(name="default")
+
+    def _current_parent_id(self) -> Optional[str]:
+        if hasattr(self._local, "span_stack") and self._local.span_stack:
+            return self._local.span_stack[-1]
+        return _active_span_id.get()
+
+    def start_span(
+        self,
+        name: str,
+        kind: SpanKind | str = SpanKind.CUSTOM,
+        *,
+        input: Any = None,
+        metadata: Optional[dict] = None,
+        session_id: Optional[str] = None,
+    ) -> SpanRecord:
+        """创建并返回一个 SpanRecord（未 finish），同时压入栈。"""
+        if not self.enabled:
+            # 返回一个占位 Span，让调用方可以无脑 .finish()，但不会写入
+            placeholder = SpanRecord(
+                trace_id="disabled",
+                name=name,
+                kind=SpanKind.CUSTOM,
+                session_id=session_id or self._session_id,
+                input=input,
+                metadata=dict(metadata or {}),
+            )
+            return placeholder
+
+        if isinstance(kind, str):
+            try:
+                kind = SpanKind(kind)
+            except ValueError:
+                kind = SpanKind.CUSTOM
+
+        if not hasattr(self._local, "span_stack"):
+            self._local.span_stack = []
+        if not hasattr(self._local, "trace_stack") or not self._local.trace_stack:
+            self.start_trace(name="default")
+
+        span = SpanRecord(
+            trace_id=self._current_trace_id(),
+            parent_id=self._current_parent_id(),
+            session_id=session_id or self._session_id,
+            name=name,
+            kind=kind,
+            input=input,
+            metadata=dict(metadata or {}),
+        )
+        self._local.span_stack.append(span.span_id)
+        _active_span_id.set(span.span_id)
+        return span
+
+    def end_span(
+        self,
+        span: SpanRecord,
+        output: Any = None,
+        status: SpanStatus = SpanStatus.SUCCESS,
+        error: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """结束一个 Span 并写入 store。
+
+        调用前可以手动修改 span.input/metadata；error 非空时自动置 status=ERROR。
+        """
+        if not self.enabled:
+            return
+        if error is not None and status == SpanStatus.SUCCESS:
+            status = SpanStatus.ERROR
+        span.finish(output=output, status=status, error=error, metadata=metadata)
+        # 弹栈
+        if hasattr(self._local, "span_stack") and self._local.span_stack:
+            if self._local.span_stack[-1] == span.span_id:
+                self._local.span_stack.pop()
+                new_parent = self._local.span_stack[-1] if self._local.span_stack else None
+                _active_span_id.set(new_parent)
+        # 写入 store（底层已保证异常不抛）
+        try:
+            self._store.write(span)
+        except Exception:
+            pass
+
+    @contextmanager
+    def span(
+        self,
+        name: str,
+        kind: SpanKind | str = SpanKind.CUSTOM,
+        *,
+        input: Any = None,
+        metadata: Optional[dict] = None,
+    ) -> Iterator[SpanRecord]:
+        """with 语法自动 start/finish 一个 Span，异常时自动 error。"""
+        s = self.start_span(name, kind, input=input, metadata=metadata)
+        try:
+            yield s
+        except Exception as e:
+            self.end_span(s, output=None, error=f"{type(e).__name__}: {e}")
+            raise
+        else:
+            # 若调用方已手动 finish，则 end_time 已有值，这里直接写入
+            if s.end_time is None:
+                self.end_span(s, output=s.output, status=s.status, error=s.error, metadata=s.metadata)
+            else:
+                # 已经 finish 过，直接写
+                if self.enabled:
+                    try:
+                        self._store.write(s)
+                    except Exception:
+                        pass
+                if hasattr(self._local, "span_stack") and self._local.span_stack:
+                    if self._local.span_stack[-1] == s.span_id:
+                        self._local.span_stack.pop()
+                        new_parent = self._local.span_stack[-1] if self._local.span_stack else None
+                        _active_span_id.set(new_parent)
+
+    # ---------- 工具钩子（对齐 ToolRegistry.add_hook 签名） ----------
+    def tool_hook(self, name: str, tool_args: dict, result: Any) -> None:
+        """传给 ``ToolRegistry.add_hook`` 的回调。
+
+        钩子签名：``hook(tool_name: str, tool_args: dict, result: ToolResult)``；
+        内部会自动开启一个 tool Span 记录输入/输出/耗时/状态，不抛异常。
+
+        注意：ToolRegistry 钩子是工具执行**完成后**才调用的，
+        所以这里我们用「后钩子」记一条完整记录——入参就是执行前快照，
+        耗时从 ToolResult 里取（若有），没有就用 0 占位。
+        """
+        if not self.enabled:
+            return
+        # 工具执行后钩子拿不到开始时间戳，用 ToolResult.duration_ms（若有）
+        duration_ms = None
+        output_data = None
+        status = SpanStatus.SUCCESS
+        error_msg = None
+        try:
+            # ToolResult 有 status/error/output/duration_ms 属性
+            status_val = getattr(result, "status", None)
+            # ToolStatus.SUCCESS/ERROR/TRUNCATED
+            status_str = str(status_val.value) if hasattr(status_val, "value") else str(status_val) if status_val else "success"
+            if "error" in status_str:
+                status = SpanStatus.ERROR
+            err = getattr(result, "error", None)
+            if err:
+                error_msg = str(err)
+                status = SpanStatus.ERROR
+            output_data = getattr(result, "output", str(result) if result is not None else None)
+            duration_ms = getattr(result, "duration_ms", None)
+        except Exception:
+            output_data = str(result) if result is not None else None
+
+        # 直接构造并 finish 一条 Span（不通过 start_span，避免父子关系错位——
+        # 因为后钩子触发时上层 decision Span 仍是当前活跃 Span，
+        # 所以 tool Span 会自然成为 decision 的子 Span，关系是对的）
+        s = self.start_span(
+            name=f"tool.{name}",
+            kind=SpanKind.TOOL,
+            input=tool_args if isinstance(tool_args, dict) else {"raw": str(tool_args)},
+            metadata={"tool_name": name},
+        )
+        # 如果 ToolResult 没给 duration_ms，用 start_span 的 start_time 做近似
+        # （后钩子立刻 finish，这个近似其实偏差很小）
+        if duration_ms is not None:
+            s.duration_ms = float(duration_ms)
+            s.end_time = s.start_time + s.duration_ms / 1000.0
+        self.end_span(s, output=output_data, status=status, error=error_msg)
+
+    def attach_to_tool_registry(self, registry: Any) -> None:
+        """把 ``self.tool_hook`` 注册到给定 ToolRegistry；一行接入工具打点。"""
+        if not self.enabled:
+            return
+        try:
+            registry.add_hook(self.tool_hook)
+        except Exception:
+            pass
+
+    # ---------- 读取 / 回放 ----------
+    def read_spans(
+        self,
+        session_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[SpanRecord]:
+        """从底层 store 读取 Span 列表（用于回放 / 分析）。"""
+        return self._store.read(session_id=session_id, trace_id=trace_id, kind=kind, limit=limit)
+
+    def replay(
+        self,
+        trace_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[dict]:
+        """回放一条 Trace 或一次会话，按时间顺序返回可打印的 dict 列表。
+
+        默认回放当前活跃 trace；若没有则返回空列表。
+        """
+        tid = trace_id
+        if tid is None:
+            if hasattr(self._local, "trace_stack") and self._local.trace_stack:
+                tid = self._local.trace_stack[0]
+            else:
+                tid = _active_trace_id.get()
+        spans = self._store.read(session_id=session_id, trace_id=tid)
+        spans.sort(key=lambda s: (s.start_time, s.span_id))
+        return [
+            {
+                "span_id": s.span_id,
+                "parent_id": s.parent_id,
+                "kind": s.kind.value if isinstance(s.kind, SpanKind) else s.kind,
+                "name": s.name,
+                "status": s.status.value if isinstance(s.status, SpanStatus) else s.status,
+                "duration_ms": round(s.duration_ms, 2) if s.duration_ms is not None else None,
+                "error": s.error,
+                "input": s.input,
+                "output": s.output,
+                "metadata": s.metadata,
+            }
+            for s in spans
+        ]
+
+    # ---------- 生命周期 ----------
+    def flush(self) -> None:
+        """刷盘。"""
+        try:
+            self._store.flush()
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        """关闭底层 store；多次调用安全。"""
+        try:
+            self._store.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "TraceLogger":
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self.flush()
+        self.close()
+        return False
+
+
+__all__ = ["TraceLogger", "SpanKind", "SpanStatus", "SpanRecord"]
