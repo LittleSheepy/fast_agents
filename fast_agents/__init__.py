@@ -25,6 +25,15 @@ from .mcp import (
     StdioTransport, SSETransport, make_stdio,
     MCPConfig,
 )
+from .database import (
+    SQLiteClient, DatabaseClientBase,
+    Schema, Column, ColumnType, Index,
+    Query, Filter, FilterOp, SortOrder,
+)
+from .trace import (
+    TraceLogger, SpanKind, SpanStatus, SpanRecord,
+    TraceStoreBase, JsonlStore, MEMORY_PATH,
+)
 
 __all__ = [
     # 版本信息
@@ -52,4 +61,13 @@ __all__ = [
     "MCPRegistry", "MCPClient", "MCPToolAdapter", "MCPServerTool",
     "MCPError", "MCPConnectionError", "MCPProtocolError", "MCPCallError",
     "StdioTransport", "SSETransport", "make_stdio", "MCPConfig",
+
+    # Database（持久化层）
+    "SQLiteClient", "DatabaseClientBase",
+    "Schema", "Column", "ColumnType", "Index",
+    "Query", "Filter", "FilterOp", "SortOrder",
+
+    # Trace（可观测性，G1 初版）
+    "TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
+    "TraceStoreBase", "JsonlStore", "MEMORY_PATH",
 ]
