@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents **Database（持久化层）**系统，参考 **Python DB-API 2.0（PEP 249）**、**SQLAlchemy Core 的 Table/MetaData 抽象**、**SQLModel 的声明式模型**、**Peewee 的轻量 Schema** 等方案的共性设计，给出本模块的完整说明、源码解析与自定义教程。同时对齐 fast_agents 已交付的 tools / memory / mcp / skills / context 模块文档骨架，做到「翻开任何一份模块说明，都知道在哪一节能找到什么」。
 
-> **版本**：v1.0.0 · 2026-11-03 · 初版：三种声明式建表 + 幂等迁移 + CRUD/事务 + 谓词下推 + 统计/批量写入
+> **版本**：v1.0.0 · 2026-11-03 · 初版：三种声明式建表 + 幂等迁移 + CRUD/事务 + 谓词下推（读/写两侧）+ upsert + 统计/批量写入
 > **适用版本**：`fast_agents.database`
-> **配套代码**：`fast_agents/database/`（5 个源码文件）+ `test/test_database.py`（**64 项**用例，全绿）+ `examples/database/`（**3 个**可运行示例）
+> **配套代码**：`fast_agents/database/`（5 个源码文件）+ `test/test_database.py`（**82 项**用例，全绿）+ `examples/database/`（**4 个**可运行示例）
 > **运行环境**：Python 3.10+（仓库 `.python-version` = 3.10），Windows / macOS / Linux
 > **依赖**：零新增依赖，仅标准库 `sqlite3` + 全框架已有的 `pydantic>=2.14.1`；无 SQLAlchemy / Alembic / peewee 等 ORM
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分放在第十二章，并与 `docs/演进路线图.md` 的 J 模块独立编号对齐。
@@ -34,7 +34,7 @@
 
 | **版本** | 日期 | 变更 | 作者 |
 |------|------|------|------|
-| **1.0.0** | 2026-11-03 | **初版**：`fast_agents/database/` 作为独立持久化层模块交付（`__init__.py` / `schema.py` / `query.py` / `database_client_base.py` / `sqlite_client.py` 共 5 个文件）。`SQLiteClient` 提供：连接与上下文事务；`execute / executemany / executescript / query` 基础 SQL 通道；三种声明式建表（dict / list[Column] / Schema）+ 幂等建索引 + `ensure_schema(migrate=True)` 自动 `ALTER TABLE ADD COLUMN` 补列；CRUD（`insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete`）；谓词下推（9 种 `FilterOp` + 多条件 AND + 排序 + `limit/offset`，值一律参数化）；标识符走 `check_ident` 白名单防注入，异常统一包 `ValueError`，非内存库默认 `WAL + foreign_keys=ON`。查询命名对齐仓库既有 `select / select_one` 家族，定为 `select_where / select_one_where`。**零新增依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic`）；`test/test_database.py` **64/64** 全绿，配套 3 个可运行示例。 | — |
+| **1.0.0** | 2026-11-03 | **初版**：`fast_agents/database/` 作为独立持久化层模块交付（`__init__.py` / `schema.py` / `query.py` / `database_client_base.py` / `sqlite_client.py` 共 5 个文件）。`SQLiteClient` 提供：连接与上下文事务；`execute / executemany / executescript / query` 基础 SQL 通道；三种声明式建表（dict / list[Column] / Schema）+ 幂等建索引 + `ensure_schema(migrate=True)` 自动 `ALTER TABLE ADD COLUMN` 补列；CRUD（`insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete`）；读侧谓词下推（9 种 `FilterOp` + 多条件 AND + 单/多列排序 + `limit/offset`，值一律参数化）；写侧条件写入（`upsert` 插入或更新、`update_where / delete_where` 带谓词批量改删，`SqlExpr` 支持自增等表达式且非空 filters 兜底防误改全表）；标识符走 `check_ident` 白名单防注入，异常统一包 `ValueError`，非内存库默认 `WAL + foreign_keys=ON`。查询命名对齐仓库既有 `select / select_one` 家族，定为 `select_where / select_one_where`。**零新增依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic`）；`test/test_database.py` **82/82** 全绿，配套 4 个可运行示例。 | — |
 
 > 后续版本迭代更新时在此表追加，保持「使用者可见的变更」倒序排列；内部重构不在此记录。
 
@@ -115,7 +115,7 @@ fast_agents/database/                 ← 单数目录（对齐 tools/memory/ski
 - `examples/database/basic_usage.py` —— CRUD + 事务最小闭环示例；
 - `examples/database/create_table_usage.py` —— 三种建表写法 + migrate + drop 完整示例；
 - `examples/database/query_filter_usage.py` —— 谓词下推：9 种 FilterOp + AND 组合 + 排序分页 + 注入安全完整示例；
-- `test/test_database.py` —— **64 项**单测（纯内存数据库，无外部依赖，全绿基线）。
+- `test/test_database.py` —— **82 项**单测（纯内存数据库，无外部依赖，全绿基线）。
 
 ### 4.2 分层
 
@@ -270,7 +270,7 @@ with db:                      → __enter__ 执行 BEGIN，置 _in_transaction=T
 | IS NULL / IS NOT NULL 不传 value | 漏传 value 直接报错；传 None 给二元操作符也报错 | 避免把 `= NULL` 这种"永远为假"的坑暴露给调用方 |
 | IN 要求非空 list/tuple | `value=[a,b,c]` 展开成 `IN (:f0_0, :f0_1, :f0_2)` | 空列表会变成 `IN ()` 语法错误，提前拦截 |
 | LIKE 不替用户补 `%` | `value` 原样传入，要模糊必须自己写 `%name%` | 避免"隐式加通配符"导致的不精确匹配（最小惊讶） |
-| sort_by 只允许单字段 + ASC/DESC | 多字段排序留到后续版本 | 当前上层（memory/trace）都是单字段排序，多字段先不做 |
+| sort_by 支持单字段 str 或多字段 list[str] | 单字段按原样拼；多字段按列顺序展开为 `ORDER BY c1 dir, c2 dir`，方向对每列统一应用 | 知识库的 `ORDER BY updated_at DESC, memory_id` 这类稳定排序需要多列；单字段写法保持兼容 |
 | offset 无 limit 时自动补 `LIMIT -1` | SQLite 语法要求 OFFSET 必须配 LIMIT；`-1` 在 SQLite 里表示"无上限" | 允许 `select_where(Query(..., offset=100))` 这种"从第 N 条开始取全部"用法 |
 | limit/offset 强制非负 int | `< 0` 直接报错 | 防御性校验，避免拼接出语法错误或翻页逻辑翻车 |
 
@@ -286,6 +286,21 @@ with db:                      → __enter__ 执行 BEGIN，置 _in_transaction=T
 | 多表 JOIN / 聚合 / 子查询 / 复杂表达式 | `db.query("SELECT ...", params)`（回退到裸 SQL，不假装 ORM） |
 
 > **诚实声明能力边界**：本模块不做 OR、不做 JOIN、不做 GROUP BY/HAVING、不做子查询、不做 BETWEEN 语法糖（用 `GTE + LTE` 两个 Filter AND 即可表达）。这些在 Agent 框架的持久化场景里使用频率极低，一旦做了就要持续维护方言差异，违反「零重型依赖、最小可用」原则。
+
+### 5.5 写侧谓词下推：upsert 与 update_where / delete_where
+
+读侧用 `Query` 表达过滤（`select_where`）；写侧同样提供三个方法，避免上层自己拼 `ON CONFLICT` / `UPDATE ... IN (...)`：
+
+| 方法 | 场景 | 关键点 |
+|---|---|---|
+| `upsert(table, data, conflict_keys, update_columns=None)` | 有则更新、无则插入 | 编译为 `INSERT ... ON CONFLICT(keys) DO UPDATE SET col = excluded.col`；`update_columns` 不传则更新除冲突键外的全部列，传空列表则 `DO NOTHING`；值全走命名参数 |
+| `update_where(table, values, query)` | 带谓词的批量更新 | `values` 普通值走参数化；需要「自增 / 函数计算」时用 `SqlExpr("access_count + 1")` 显式包裹（**只有它会被原样拼入 SQL**） |
+| `delete_where(table, query)` | 带谓词的批量删除 | 条件全部来自 `query.filters`，与读侧共用同一套 `Filter` 语义 |
+
+**两条硬约定**：
+
+1. `update_where` / `delete_where` 的 `query.filters` **必须非空**，空条件直接 `ValueError`——与 `delete(table, where)` 同一条「防手滑清全表」的安全线；真要全表改删请显式写 `db.execute("UPDATE ...")` / `db.execute("DELETE FROM ...")`。
+2. `SqlExpr` 是**唯一**会把内容原样拼进 SQL 的入口，因此**只允许传程序里写死的固定片段**，严禁拼接任何外部输入；普通值一律直接传、走参数化。
 
 ---
 
@@ -368,13 +383,13 @@ class Filter(BaseModel):
 class Query(BaseModel):
     table_name:  str
     filters:     Optional[list[Filter]] = None  # AND 关系；由 select_where 编译
-    sort_by:     Optional[str] = None            # 单字段，必须是合法标识符
+    sort_by:     Optional[str | list[str]] = None  # 单字段 str 或多字段 list[str]，每列都须是合法标识符
     sort_order:  SortOrder = SortOrder.ASC
     limit:       Optional[int] = None            # 非负 int
     offset:      Optional[int] = None            # 非负 int；单独使用时 SQLite 后端会自动补 LIMIT -1
 ```
 
-> **谓词下推**：`SQLiteClient.select_where(query)` 和 `select_one_where(query)` 把上面这套模型编译为参数化 SQL，覆盖 9 种 `FilterOp`、多条件 AND、排序与分页，详见 §5.4 编译规则与 §9.1 API 速查。等值简单场景仍然推荐用更短的 `select(where=dict)`，两种写法共存。OR / JOIN / 聚合 / 多字段排序 / BETWEEN 糖衣语法**刻意不做**，保持零重型依赖。
+> **谓词下推**：`SQLiteClient.select_where(query)` 和 `select_one_where(query)` 把上面这套模型编译为参数化 SQL，覆盖 9 种 `FilterOp`、多条件 AND、单/多列排序与分页；写侧 `update_where / delete_where` 复用同一套 `Filter` 语义。详见 §5.4 / §5.5 与 §9.1 API 速查。等值简单场景仍然推荐用更短的 `select(where=dict)`，两种写法共存。OR / JOIN / 聚合 / BETWEEN 糖衣语法**刻意不做**，保持零重型依赖。
 
 ### 6.6 `DatabaseClientBase`（抽象基类，子类必须实现）
 
@@ -500,18 +515,19 @@ class SQLiteClient(DatabaseClientBase):
 
 - **负责什么**：把标准库 sqlite3 封装成上层好用的客户端——字典行结果、自动重连、WAL/外键默认开启、事务上下文、声明式建表三写法分派、幂等 migrate、便捷 CRUD。
 - **关键实现**（按方法块）：
-  - **连接** `_connect()`：`sqlite3.connect(..., detect_types=PARSE_DECLTYPES)` + `row_factory=Row`（返回字典）+ `PRAGMA foreign_keys=ON`；非内存库自动开 `PRAGMA journal_mode=WAL`（并发读写更友好，呼应 B9 待办）；连接失败统一抛 `ValueError(f"连接 SQLite 失败: {e}")`。
+  - **连接** `_connect()`：`sqlite3.connect(..., detect_types=PARSE_DECLTYPES)` + `row_factory=Row`（返回字典）+ `PRAGMA foreign_keys=ON` + `PRAGMA busy_timeout=<timeout*1000>`（写锁等待与连接 timeout 同口径，默认 5s）；非内存库自动开 `PRAGMA journal_mode=WAL`（并发读写更友好，呼应 B9 待办）；连接失败统一抛 `ValueError(f"连接 SQLite 失败: {e}")`。
   - **基础执行**：`execute/executemany/executescript/query` 四个方法是最底层通道，自动管理事务边界（在 `with db:` 事务内不 commit，由 `__exit__` 统一提交/回滚；不在事务内则单次语句自动 commit，失败自动 rollback）。SQLite 异常统一包成 `ValueError` 抛出，让上层不用 `import sqlite3` 就能 catch。
   - **DDL**：`table_exists` 查 `sqlite_master`；`create_table` 按 `isinstance(columns, Schema/list/dict)` 分派；`ensure_table` 就是 `create_table(if_not_exists=True)`；`ensure_schema` 先走 `table_exists` 判断，不存在就 `_create_table_from_schema`，已存在且 `migrate=True` 则 PRAGMA 拿现有列集合逐列 ALTER ADD；索引语句始终幂等执行；`drop_table` 默认 IF EXISTS。
   - **CRUD**：insert 返回 lastrowid；select 的 where 用命名占位符 `:w_k` 防冲突，order_by 走 `^[A-Za-z_][A-Za-z0-9_]*(\s+(ASC|DESC))?$` 白名单校验；update 用 `:set_k / :w_k` 前缀区分 set 和 where 参数避免冲突；delete **必须传 where**，否则抛 ValueError（防止 `DELETE FROM users` 清空全表的低级错误）。
   - **统计与批量写入**：`count(table, where=None)` 做等值条件计数（where 为 None 返回表总行数，值为 None 时按 IS NULL 处理）；`batch_insert(table, rows)` 先校验各行字段一致，再用 `executemany` 参数化批量插入，空列表返回 0。
+  - **条件写入**：`upsert` 编译 `INSERT ... ON CONFLICT(keys) DO UPDATE SET col = excluded.col`（`update_columns` 为空则 `DO NOTHING`）；`update_where / delete_where` 复用 `_compile_filters` 把 Filter 编译成 WHERE（与读侧共用 `_compile_filter`），SET 值默认参数化、显式 `SqlExpr` 才原样拼入；两者都要求 `filters` 非空防误改全表。
   - **事务**：`__enter__` 显式 `BEGIN` 置 `_in_transaction=True`；`__exit__` 根据是否异常 commit/rollback，finally 里复位标志；`__del__` 尝试 close，不抛异常。
 - **为什么这么写**：
   - **row_factory=Row + 手动 dict(row)**：标准库 sqlite3 的 Row 是tuple-like，直接给上层用不方便；转 dict 让上层 `row["name"]` 访问，对齐记忆模块现有数据结构。
   - **dict 列定义也要 check_ident**：dict 写法最宽松，更要做表名/列名白名单，否则一行 `"name; DROP TABLE x;--": "TEXT"` 就能注入（虽然参数化只能防值注入、防不了标识符注入，这也是为什么必须做 check_ident）。
   - **migrate 让 sqlite3 自己报错**：不支持的场景（如 ADD COLUMN NOT NULL 无默认值）直接让 sqlite3 抛错向上冒泡，比静默跳过或瞎猜默认值安全——调用方看到报错就知道该写显式迁移脚本。
   - **execute 包成 ValueError**：不让上层 import sqlite3 去 catch sqlite3.Error，贯彻"上层不依赖驱动"的分层原则；所有数据库错误都是 ValueError 的子类消息里能看到原始 SQL，便于排查。
-- **你要改的时候最该看的地方**：加新的便捷方法（如 `count / exists / upsert`）时，先想清楚是不是能通过组合 `query/execute` 实现，如果只是个别业务场景需要，加在业务层不要加到公共客户端里；加新后端时，直接对照 `DatabaseClientBase` 新增一个 `xxx_client.py`，不要在 SQLiteClient 里塞方言判断。
+- **你要改的时候最该看的地方**：加新的便捷方法（如 `count / exists / upsert`）时，先想清楚是不是能通过组合 `query/execute` 实现，如果只是个别业务场景需要，加在业务层不要加到公共客户端里；加新后端时，直接对照 `DatabaseClientBase` 新增一个 `xxx_client.py`，不要在 SQLiteClient 里塞方言判断；改谓词编译时记住**读侧 `_compile_query` 与写侧 `_compile_filters` 都收敛到 `_compile_filter`**，改一处要同时回归 `select_where / update_where / delete_where`。
 
 ---
 
@@ -525,13 +541,14 @@ cd D:\path\to\fast_agents
 # 依赖（database 模块本身零新增依赖，只要装好仓库 requirements 即可）
 pip install -r requirements.txt
 
-# 跑测试（64/64 全过才算装好）
+# 跑测试（82/82 全过才算装好）
 python test\test_database.py
 
-# 跑三个示例（全部用内存/临时库，跑完不留脏文件）
+# 跑四个示例（全部用内存/临时库，跑完不留脏文件）
 python examples\database\basic_usage.py
 python examples\database\create_table_usage.py
 python examples\database\query_filter_usage.py
+python examples\database\conditional_write_usage.py
 ```
 
 > **命令必须按 Windows PowerShell 写**：项目里的 `test/` 目录和标准库 `test` 包同名，所以用 `python test\xxx.py` **直接执行**，不要用 `python -m test.xxx`（那会跑成标准库测试）。
@@ -655,7 +672,7 @@ db.ensure_schema(Schema(
 python test\test_database.py
 ```
 
-预期输出末尾为 `64 passed`（具体数字随版本更新）。任何一个 FAILED 都说明环境有问题（Python 版本过低 / 文件被占用 / 磁盘只读等），按报错定位即可。
+预期输出末尾为 `82 passed`（具体数字随版本更新）。任何一个 FAILED 都说明环境有问题（Python 版本过低 / 文件被占用 / 磁盘只读等），按报错定位即可。
 
 ---
 
@@ -709,6 +726,7 @@ db = SQLiteClient("app.db")              # 文件库；":memory:" 是内存库
 | 方法 | 参数 | 返回 | 说明 |
 |---|---|---|---|
 | `insert(table, data)` | data: dict（非空） | int（lastrowid） | 插入一行；列名走 quote_ident + 命名占位符 |
+| `upsert(table, data, conflict_keys, update_columns=None)` | data: dict；conflict_keys: str \| list[str]（须都在 data 中）；update_columns: list[str] \| None | int（rowcount） | **插入或更新**（`ON CONFLICT DO UPDATE`）；`update_columns` 不传则更新除冲突键外的全部列，传空列表则 DO NOTHING；值全参数化 |
 | `batch_insert(table, rows)` | rows: list[dict]（各行字段须一致） | int（插入行数） | 批量插入；空列表返回 0；字段不一致抛 ValueError |
 | `select(table, where=None, order_by=None, limit=None)` | where: dict（等值 AND）；order_by: str（白名单，支持 `"id DESC"`）；limit: int | `list[dict]` | **等值查询**的简洁 API；复杂过滤用 `select_where` |
 | `select_one(table, where=None, order_by=None)` | 同上 | `dict \| None` | 查询单行，无结果返回 None |
@@ -717,6 +735,8 @@ db = SQLiteClient("app.db")              # 文件库；":memory:" 是内存库
 | `update(table, data, where)` | data: dict（非空）；where: dict（非空） | int（rowcount，影响行数） | 更新行 |
 | `count(table, where=None)` | where: dict（等值，值为 None 时按 IS NULL）；None 表示全表 | int | 统计行数 |
 | `delete(table, where)` | where: dict（**必填**） | int（rowcount） | 删除行；**不传 where 直接抛 ValueError** 防止误删全表 |
+| `update_where(table, values, query)` | values: dict（非空，值可为 `SqlExpr`）；query: `Query`（filters **必填**） | int（rowcount） | **写侧谓词下推**：按 Filter 条件批量更新；普通值参数化，`SqlExpr("n + 1")` 才原样拼入 |
+| `delete_where(table, query)` | query: `Query`（filters **必填**） | int（rowcount） | **写侧谓词下推**：按 Filter 条件批量删除；空 filters 抛 ValueError 防误删全表 |
 
 #### 事务
 
@@ -740,7 +760,8 @@ with db:
 | `SortOrder` | ASC / DESC | 查询排序方向 |
 | `FilterOp` | EQ/NEQ/GT/GTE/LT/LTE/LIKE/IN/NOT_NULL/IS_NULL | 过滤操作符（由 `select_where` 编译，共 9 种） |
 | `Filter(field, op, value=None)` | — | 单个过滤条件；IN 时 value 必须是非空 list/tuple；IS_NULL/NOT_NULL 无需 value |
-| `Query(table_name, filters=None, sort_by=None, sort_order=ASC, limit=None, offset=None)` | — | 查询对象，`select_where` / `select_one_where` 的入参 |
+| `Query(table_name, filters=None, sort_by=None, sort_order=ASC, limit=None, offset=None)` | — | 查询对象；`sort_by` 支持单字段 str 或多字段 list[str]；`select_where` / `select_one_where` / `update_where` / `delete_where` 的入参 |
+| `SqlExpr(sql)` | sql: str（非空） | 写侧 SQL 表达式包装，仅 `update_where` 用；内容原样拼入 SQL，只传程序写死的固定片段 |
 
 ### 9.3 已废弃/暂未开放的写法
 
@@ -748,10 +769,12 @@ with db:
 - 以下能力**刻意不开放**，不要传参期望生效：
   - OR / NOT / 括号分组（多 Filter 当前固定 AND）；
   - JOIN / 子查询 / 聚合 / GROUP BY / HAVING；
-  - 多字段排序（`sort_by` 当前只支持单字段）；
+  - `sort_by` 的按表达式排序（只支持列名；多列已支持，但 `ORDER BY random()` 这类要写裸 SQL）；
   - BETWEEN 语法糖（用 `GTE + LTE` 两个 Filter AND 表达，效果等价）。
 
 需要这些能力时直接用 `db.query(sql, params)` 写裸 SQL，模块不假装自己是完整 ORM。
+
+另外，`update_where` / `delete_where` 的 `query.filters` **必填**（空条件直接报错），这是安全约定而非能力缺失；要全表改删请显式写裸 SQL。
 
 ---
 
@@ -775,7 +798,13 @@ with db:
    上层业务模块（memory / trace）不应该 `import sqlite3` 去 catch `sqlite3.Error`，否则分层就破了——将来换 Postgres 后端就会冒出 `psycopg2.Error`，上层要改一串 except。统一包成 ValueError（带原始 SQL 和错误消息），上层只需要 catch 标准异常即可；如果要细分错误类型，后续可以在 database 模块内定义 `DatabaseError` 基类再派生（第十二章 J5 候选）。
 
 6. **为什么默认开 WAL 和 foreign_keys？**
-   `PRAGMA foreign_keys=ON` 是 SQLite 默认关闭但几乎所有人都想开的设置（否则外键约束形同虚设）；`PRAGMA journal_mode=WAL` 让并发读写互不阻塞（B9 待办），这也是 J3 跨模块迁移任务里要给 memory 三个 SQLite 后端统一收口的设置（B9 随 J3 自然落地）——database 模块先以身作则。内存数据库不开 WAL（WAL 在 :memory: 上无意义）。
+   `PRAGMA foreign_keys=ON` 是 SQLite 默认关闭但几乎所有人都想开的设置（否则外键约束形同虚设）；`PRAGMA journal_mode=WAL` 让并发读写互不阻塞（B9 待办），这也是 J3 跨模块迁移任务里要给 memory 三个 SQLite 后端统一收口的设置（B9 随 J3 自然落地）——database 模块先以身作则。内存数据库不开 WAL（WAL 在 :memory: 上无意义）。此外 `_connect()` 里显式设 `PRAGMA busy_timeout = timeout * 1000`，让写锁等待与构造参数同口径（默认 5s），memory 迁移时传 `timeout=10.0` 即可对齐其原有 10s。
+
+7. **为什么写侧谓词下推单独开 `update_where / delete_where`，而不改 `update / delete`？**
+   既有 `update(table, data, where)` / `delete(table, where)` 只支持等值 where 且签名被上层依赖，直接改签名会破坏调用方。新增方法走 `Query` 谓词，与读侧 `select_where` 对称，新旧并存、各取所需——这也是本模块一贯的「能加不改」策略。
+
+8. **为什么 `update_where / delete_where` 强制 filters 非空，而 `SqlExpr` 又要显式包裹？**
+   两条都是「防手滑」：前者的痛点是「忘写条件 → 全表被改/被删」，与 `delete` 必须带 where 是同一条安全线；后者的痛点是「把外部输入拼进 SQL → 注入」，所以只有显式 `SqlExpr` 包装的内容才允许原样拼入，普通值一律参数化。宁可多写一点，也不给「图方便」留口子。
 
 ### 10.2 常见坑与排查
 
@@ -784,9 +813,9 @@ with db:
 | `ValueError: 非法表名/列名: xxx` | 表名/列名不符合 `^[A-Za-z_][A-Za-z0-9_]*$`，含中文/横线/空格/点号/以数字开头都会被拒。改名字，或在需要时走 `db.execute(...)` 自己拼（不推荐） |
 | `ValueError: delete 必须传 where 防止误删全表` | 写了 `db.delete("users")` / `db.delete("users", {})`。真要删全表用 `db.execute("DELETE FROM users")`；按条件删必须传非空 where dict |
 | `ValueError: insert 数据不能为空` / `update 需要 data 和 where` | 空 dict 调用 insert/update。检查调用方 data 是不是被覆盖成 `{}` |
-| `database is locked` | SQLite 并发写冲突。一是确认所有连接都开了 WAL（SQLiteClient 默认开），二是加大 `timeout` 参数（默认 5 秒），三是检查是否有进程泄漏了连接未 close；多进程高并发写入场景建议迁移到 Postgres/MySQL（第十二章） |
+| `database is locked` | SQLite 并发写冲突。一是确认所有连接都开了 WAL（SQLiteClient 默认开），二是加大 `timeout` 参数（默认 5 秒，`_connect()` 会同步设为 `PRAGMA busy_timeout`），三是检查是否有进程泄漏了连接未 close；多进程高并发写入场景建议迁移到 Postgres/MySQL（第十二章） |
 | `ALTER TABLE ADD COLUMN` 报错 "Cannot add a NOT NULL column with default value NULL" | migrate 补列时新加了 `nullable=False` 且没给 default 的列，SQLite 不允许。要么给 `default=...`，要么把列声明为 `nullable=True` 再应用层校验；老数据需要非空的，先加可空列 → 回填 UPDATE → 再单独脚本改约束（SQLite 不支持后加 NOT NULL 约束） |
-| `UNIQUE constraint failed: xxx.yyy` | 插入/更新违反唯一约束。这是业务层要处理的重复问题，本模块不做 upsert；需要 upsert 请用 `db.execute("INSERT ... ON CONFLICT(yyy) DO UPDATE SET ...")` |
+| `UNIQUE constraint failed: xxx.yyy` | 插入/更新违反唯一约束。若要「有则更新、无则插入」，直接用 `db.upsert(table, data, conflict_keys="yyy")`（`ON CONFLICT DO UPDATE`），不要手拼 SQL；注意 `conflict_keys` 对应的列必须有 PRIMARY KEY / UNIQUE 约束，否则 SQLite 会报 "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint" |
 | `executeSQL失败: ...SQL: ...` 但看不出哪错 | 异常消息里附带了完整 SQL，复制到 DB Browser for SQLite / sqlite3 CLI 里单跑一遍即可定位。params 没拼错的话，大概率是列名/表名写错、类型不匹配 |
 | 多次实例化 `SQLiteClient("app.db")` 互相阻塞 | 同一个 .db 文件开了多个连接并发写会撞锁。推荐**整个进程内共享一个 client 实例**（模块级单例或用依赖注入），不要在每次函数调用里新建 |
 | `Column(index=True)` 没有看到建索引 | 主键列 / UNIQUE 列 SQLite 已自动建索引，模块会跳过避免冗余（`column_index_stmt` 里显式判断）。不是 bug |
@@ -812,7 +841,7 @@ with db:
 
 | 测试文件 | 项数 | 覆盖点 | 运行命令 |
 |---|---|---|---|
-| `test/test_database.py` | **64 / 64**（初版基线，2026-11-03） | 连接与基本 CRUD / 字典返回 / 事务提交 / 事务回滚 / 异常后可继续使用 / select order_by 与 limit / 列名注入防护 / 非法 order_by 拦截 / delete 必须传 where / 内存库 / 文件库持久化 / close 后自动重连 / **dict 方式建表** / **list[Column] 方式建表** / **Schema 方式建表** / table_exists 幂等 / 列级索引自动建 / 复合索引 / 唯一约束 / default 值类型映射（布尔/数字/字符串/None） / BOOLEAN→0/1 / VARCHAR→TEXT / TIMESTAMP→TEXT / ensure_table 幂等重复调用 / ensure_schema 重复调用幂等 / **migrate=True 补列** / migrate=False 不补列 / drop_table / 手写 CREATE TABLE 仍可用（向后兼容） / 上下文管理器嵌套报错语义 / 批量 executemany / executescript 多语句 / 标识符非法名报错 / **谓词下推**：EQ/NEQ/GT/GTE/LT/LTE 六类比较 / LIKE 模糊 / IN 集合匹配（含空列表/非列表值拦截） / IS NULL / IS NOT NULL / 二元操作符漏 value 报错 / 多 Filter AND 组合 / 同字段多 Filter 参数名不冲突 / sort_by + ASC/DESC + limit + offset 组合 / 仅 offset 无 limit 自动补 LIMIT -1 / limit/offset 负数拦截 / 字段名非法注入拦截 / value 参数化（SQL 片段不会被执行） / select_one_where 单行返回与 None / select_one_where 不污染原 Query 对象 / 无 filters 全量返回 / select_where 入参类型检查 / 原 select(where=dict) 等值写法继续可用 / **count**：总行数 / 带条件计数（含 IS NULL）/ 非法表名拦截 / **batch_insert**：基础批量插入 / 空列表返回 0 / 字段不一致拦截 / 非法表名拦截 | `python test\test_database.py` |
+| `test/test_database.py` | **82 / 82**（初版基线，2026-11-03） | 连接与基本 CRUD / 字典返回 / 事务提交 / 事务回滚 / 异常后可继续使用 / select order_by 与 limit / 列名注入防护 / 非法 order_by 拦截 / delete 必须传 where / 内存库 / 文件库持久化 / close 后自动重连 / **dict 方式建表** / **list[Column] 方式建表** / **Schema 方式建表** / table_exists 幂等 / 列级索引自动建 / 复合索引 / 唯一约束 / default 值类型映射（布尔/数字/字符串/None） / BOOLEAN→0/1 / VARCHAR→TEXT / TIMESTAMP→TEXT / ensure_table 幂等重复调用 / ensure_schema 重复调用幂等 / **migrate=True 补列** / migrate=False 不补列 / drop_table / 手写 CREATE TABLE 仍可用（向后兼容） / 上下文管理器嵌套报错语义 / 批量 executemany / executescript 多语句 / 标识符非法名报错 / **谓词下推**：EQ/NEQ/GT/GTE/LT/LTE 六类比较 / LIKE 模糊 / IN 集合匹配（含空列表/非列表值拦截） / IS NULL / IS NOT NULL / 二元操作符漏 value 报错 / 多 Filter AND 组合 / 同字段多 Filter 参数名不冲突 / sort_by + ASC/DESC + limit + offset 组合 / 仅 offset 无 limit 自动补 LIMIT -1 / limit/offset 负数拦截 / 字段名非法注入拦截 / value 参数化（SQL 片段不会被执行） / select_one_where 单行返回与 None / select_one_where 不污染原 Query 对象 / 无 filters 全量返回 / select_where 入参类型检查 / 原 select(where=dict) 等值写法继续可用 / **count**：总行数 / 带条件计数（含 IS NULL）/ 非法表名拦截 / **batch_insert**：基础批量插入 / 空列表返回 0 / 字段不一致拦截 / 非法表名拦截 / **upsert**：插入新行 / 冲突更新且不新增行 / update_columns 限定列 / conflict_keys 缺失拦截 / 非法表名拦截 / **update_where**：比较谓词 GTE / IN 谓词 / SqlExpr 自增表达式 / 空 filters 拦截 / 值参数化防注入 / **delete_where**：比较谓词 LT / IN 谓词 / 空 filters 拦截且不误删 / **多列排序**：sort_by list 升序与降序 / 单字段 str 排序兼容 / 空 sort_by 列表拦截 / busy_timeout 与 timeout 同口径 / SqlExpr 空表达式拦截 | `python test\test_database.py` |
 
 **关键回归断言**（这几条锁住了核心设计承诺，改代码时必须保留）：
 
@@ -827,14 +856,14 @@ with db:
 - `test_select_one_where` + 末尾 `q.limit is None` 断言 —— 锁死 select_one_where 的 limit=1 是内部行为，不污染调用方传入的 Query 对象（避免共享 Query 复用时被意外改 limit）；
 - `test_select_where_still_works` —— 锁死原 dict 等值 API 在引入 select_where 后**不被破坏、不被替换**。
 
-**全绿基线**：在 Windows PowerShell + Python 3.10+（仓库 `.python-version` = 3.10）+ 干净 venv（只装 requirements.txt）环境下，`python test\test_database.py` 必须输出末尾显示 `64 passed`；任何一条红都视为环境或代码问题，不应合并。
+**全绿基线**：在 Windows PowerShell + Python 3.10+（仓库 `.python-version` = 3.10）+ 干净 venv（只装 requirements.txt）环境下，`python test\test_database.py` 必须输出末尾显示 `82 passed`；任何一条红都视为环境或代码问题，不应合并。
 
-**跨模块回归**：database 改动后，除了本模块 64 项，还要跑一遍 `test_memory.py` 里涉及 SQLiteMemoryStore 的用例（虽然 memory 目前没直接用 ensure_schema 或 select_where，但共用 sqlite3 驱动，方言/默认 PRAGMA 变动可能影响），以及 `test_context.py` / `test_react_agent.py` 全套，确认没有隐式依赖被破坏。
+**跨模块回归**：database 改动后，除了本模块 82 项，还要跑一遍 `test_memory.py` 里涉及 SQLiteMemoryStore 的用例（虽然 memory 目前没直接用 ensure_schema 或 select_where，但共用 sqlite3 驱动，方言/默认 PRAGMA 变动可能影响），以及 `test_context.py` / `test_react_agent.py` 全套，确认没有隐式依赖被破坏。
 
 **当前测试与实现的已知差异**（如实写明，不粉饰）：
 
 - `connect()` 作为基类接口目前只在 `__init__` 和 `close()` 后被调用，没有独立单测；由于 `__init__` 已经调用 `_connect`，功能等价，风险低；
-- `select_where` 的 `sort_by` 当前只支持单字段 + ASC/DESC，多字段排序、按表达式排序**没有测试也没有实现**，这是刻意为之的能力边界（见 §5.4 / §9.3）；
+- `select_where` 的 `sort_by` 已支持单字段与多字段；「按表达式排序」（如 `ORDER BY random()`）**没有实现**，这是刻意为之的能力边界（见 §5.4 / §9.3）；
 - OR / NOT / 括号分组 / JOIN / 聚合 / GROUP BY / 子查询**没有测试也不打算做**，保持零重型依赖。
 
 ---
@@ -845,17 +874,17 @@ with db:
 
 ### 12.1 初版已交付
 
-- **初版**（v1.0.0，2026-11-03）：`fast_agents/database/` 5 个源码文件；SQLiteClient 支持连接与上下文事务、基础 SQL 通道（execute / executemany / executescript / query）、三种声明式建表 + 幂等建索引 + `migrate=True` 补列、CRUD（insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete）、谓词下推（9 种 FilterOp + AND + 排序 + limit/offset）、标识符白名单防注入；非内存库默认开启 WAL + foreign_keys；`test/test_database.py` **64/64** 全绿；配套 3 个示例。
+- **初版**（v1.0.0，2026-11-03）：`fast_agents/database/` 5 个源码文件；SQLiteClient 支持连接与上下文事务、基础 SQL 通道（execute / executemany / executescript / query）、三种声明式建表 + 幂等建索引 + `migrate=True` 补列、CRUD（insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete）、读侧谓词下推（9 种 FilterOp + AND + 单/多列排序 + limit/offset）、写侧条件写入（`upsert` + `update_where` / `delete_where` + `SqlExpr`）、标识符白名单防注入；非内存库默认开启 WAL + foreign_keys，并显式设 `PRAGMA busy_timeout`；`test/test_database.py` **82/82** 全绿；配套 4 个示例。
 
 ### 12.2 待办（按优先级）
 
-1. **J2 · 连接池 / 线程安全 + busy_timeout 收口**（P2，依赖 G2 异步并发）—— 现状：`SQLiteClient` 是单连接，线程不安全；跨线程用会偶发 `database is locked`；构造器 `timeout` 默认 5 秒，没有显式 `PRAGMA busy_timeout`。目标：用 `threading.local` 给每个线程一个连接（或简单连接池）；构造器新增 `busy_timeout=`（默认 10s），`_connect()` 里显式 `PRAGMA busy_timeout=xxx`；配合 WAL 缓解并发锁。**为什么现在不做**：fast_agents 当前是单线程同步模型（ReActAgent 顺序跑），连接池是 G2 异步并发之后的需求，提前做是过度设计。
+1. **J2 · 连接池 / 线程安全 + busy_timeout 收口**（P2，依赖 G2 异步并发）—— 现状：`SQLiteClient` 是单连接，线程不安全；跨线程用会偶发 `database is locked`。**部分已落地**：`_connect()` 已显式 `PRAGMA busy_timeout = timeout * 1000`（与构造参数同口径，默认 5s；上层传 `timeout=10.0` 即可对齐 10s 口径）。**剩余目标**：用 `threading.local` 给每个线程一个连接（或简单连接池）；单独暴露 `busy_timeout` 参数以便与连接 timeout 解耦。**为什么连接池现在不做**：fast_agents 当前是单线程同步模型（ReActAgent 顺序跑），连接池是 G2 异步并发之后的需求，提前做是过度设计。
 2. **J3 · memory/trace/profile 三模块迁移到 SQLiteClient（含 B9 落地）**（**P1**，可分步推进）—— 现状：database 模块已经默认开 WAL + foreign_keys + select_where 谓词能力，但 memory 里三个 SQLite 后端（`sqlite_store.py` / `session_store.py` / `profile_store.py`）还在各自手写 `CREATE TABLE` + PRAGMA + `user_version` 迁移；未来 G1 TraceLogger 也需要落盘。目标：让它们逐步迁移到使用 `db.ensure_schema(..., migrate=True)` 建表/迁移、`db.select_where()` 做范围/模糊查询，统一 PRAGMA（foreign_keys / WAL / busy_timeout），消除重复 SQL 样板；B9（SQLite WAL + 并发安全）**随本任务自然落地**——迁移过去的后端自动享受 database 模块默认的 WAL 设置。**为什么现在不做**：这是跨模块破坏性重构，需要先确保 SQLiteClient 的能力覆盖 memory 全部现有用法（含 `user_version` 迁移、事务边界、`RETURNING` 行为），切换时不能破坏记忆数据；建议作为"阶段一夯实底座"的下一批工程债处理。
 3. **J4 · MySQL / Postgres 后端**（P2，依赖 G4 打包发布）—— 现状：`DatabaseClientBase` 抽象基类已经定义契约（含 `select_where / select_one_where`），但只有 SQLite 实现。目标：新增 `fast_agents/database/mysql_client.py` / `postgres_client.py`，通过同一套 Schema/Column/Query 模型，让上层 0 改动切换后端（走 `pip install fast-agents[mysql]` / `[postgres]` 装可选驱动）。**为什么现在不做**：现阶段 fast_agents 的目标场景是个人 / 小团队本地 Agent，SQLite 单文件零运维更合适；等 G4 PyPI 发布、有服务端部署需求时再做。
 4. **J5 · 统一异常体系**（P2）—— 现状：所有异常包成 ValueError。目标：定义 `DatabaseError` 基类，派生 `IntegrityError / NotFoundError / MigrationError / ConnectionError / IdentifierError / QueryCompileError`，上层能按错误类型 catch。**为什么现在不做**：目前上层只有 database 自身 + 未来 J3 迁移过来的 memory，一律 `except ValueError` 够用；等 G1 trace / A12 审计等更多模块接入时再细分异常类型收益更大。
-5. **J6 · 批量 upsert**（P3）—— 现状：`batch_insert(table, rows)` 已提供参数化批量插入（初版已交付），但尚无原生 upsert（`INSERT OR REPLACE` / `ON CONFLICT DO UPDATE`）便捷方法。目标：加 `upsert(table, data, conflict_keys)`。**为什么现在不做**：memory 模块目前逐条写入，单 Agent QPS 不高，冲突更新不是瓶颈。
+5. **J6 · upsert**（P3）—— **单条已落地**：`upsert(table, data, conflict_keys, update_columns=None)` 已提供 `ON CONFLICT DO UPDATE`；`batch_insert` 提供参数化批量插入。**剩余目标**：批量 upsert（一次多条冲突更新），等 memory 迁移后出现真实批量冲突写场景再做。
 
-当前初版最明显的空缺：**跨模块迁移（memory/trace/profile 仍各自手写建表，J3）**——database 模块的建表 / CRUD / 谓词下推能力已足以支撑 TraceLogger 的时间范围与模糊查询需求，下一个阻塞点就是把上层真正接进来。
+当前初版最明显的空缺：**跨模块迁移（memory/trace/profile 仍各自手写建表，J3）**——database 模块的建表 / CRUD / 读侧谓词下推 / 写侧条件写入（upsert + update_where/delete_where）已足以覆盖 memory 三个 SQLite 后端的全部现有用法，下一个阻塞点就是把上层真正接进来。
 
 ---
 
@@ -889,7 +918,7 @@ with db:
 - [x] API 速查按类分小节（SQLiteClient 连/DDL/CRUD/事务 + 数据模型速查），无已废弃旧 API 需迁移；
 - [x] 第十章三块齐全：设计决策 6 条（每条都是"为什么不是另一种做法"）、常见坑 11 条（每条都是"现象 + 可执行解法"）、跨平台注意事项 6 条（无平台差异的内容不留"无"占位）；
 - [x] 跨平台注意事项已并入 10.3（按 v2.0 模板要求不再独立成章）；
-- [x] 测试章节列出 64 项覆盖点 + 关键回归断言（每条锁死一个设计承诺）+ 全绿基线；未单测 / 刻意不做的能力边界如实写明；
+- [x] 测试章节列出 82 项覆盖点 + 关键回归断言（每条锁死一个设计承诺）+ 全绿基线；未单测 / 刻意不做的能力边界如实写明；
 - [x] 演进路线 J2–J6 每条都说明"现状是什么、为什么现在不做"，与《演进路线图.md》的 G / J / B 系列编号一致；
 - [x] 章节数量、顺序、编号（开篇 → 一～十三 → 附录）与工具/记忆/Skill/MCP/context 五份成品文档完全一致；
 - [x] 全文无"待补充 / TBD"残留，无大段与 README 重复的安装/特性介绍（README 讲怎么用，本文讲怎么实现/怎么扩展，分工明确）；
