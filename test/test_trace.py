@@ -9,9 +9,11 @@
     - start_span/end_span/with span（正常路径 + 异常路径）
     - 父子关系（parent_id 正确串联）
     - tool_hook 签名对齐 ToolRegistry.add_hook（ToolResult 成功/失败/截断）
+    - tool_hook 耗时取自 ToolResult.metadata['duration_ms'] 并回推 start_time（v1.0.1 修正）
     - attach_to_tool_registry 一行接入
     - LLM.invoke/stream_invoke/embed_query/embed_documents 在 tracer=None 时不打点、
       传 tracer 时正确记录 llm Span（mock 底层 _client，无需真 API Key）
+    - LLM 打点写入 token 用量元数据（usage / prompt_tokens / completion_tokens / total_tokens）
     - ReActAgent tracer 接入（mock llm.invoke + 简单工具）：agent/decision/tool/llm 四类 Span 都有
     - replay() 能按时间顺序返回可打印列表
     - 存储层预留位：用户可自定义 TraceStoreBase 子类
@@ -388,6 +390,71 @@ def test_tool_hook_records_error():
     t.close()
 
 
+def test_tool_hook_uses_real_duration_from_metadata():
+    """tool_hook 从 ``ToolResult.metadata['duration_ms']`` 取真实耗时，并回推 start_time。
+
+    这是 v1.0.1 修复点：修复前误读 ToolResult 的顶层 duration_ms 属性（不存在），
+    导致 tool span 耗时恒为 ~0。
+    """
+    t = TraceLogger()
+    r = ToolResult.ok("5")
+    r.metadata["duration_ms"] = 120  # 模拟 tool_base 写入的实测耗时（int 毫秒）
+    with t.trace("tool-dur"):
+        t.tool_hook("add", {"a": 2, "b": 3}, r)
+    spans = t.read_spans(kind="tool")
+    assert len(spans) == 1
+    s = spans[0]
+    # 耗时直接取工具自报值（修复前恒为 ~0）
+    assert abs(s.duration_ms - 120.0) < 5.0, f"duration_ms={s.duration_ms}"
+    # start_time 被回推，时间区间长度 ≈ 120ms（修复前区间塌缩在结束时刻附近）
+    assert s.end_time is not None
+    assert abs((s.end_time - s.start_time) * 1000.0 - 120.0) < 5.0
+    assert s.metadata["tool_name"] == "add"
+    assert s.metadata["tool_status"] == "success"
+    assert "duration_source" not in s.metadata
+    t.close()
+
+
+def test_tool_hook_marks_duration_unavailable_when_missing():
+    """工具未上报 duration_ms 时降级：仍记录 Span，并在 metadata 标记来源。"""
+    t = TraceLogger()
+    r = ToolResult.ok("ok")  # metadata 里没有 duration_ms
+    with t.trace("tool-nodur"):
+        t.tool_hook("noop", {}, r)
+    spans = t.read_spans(kind="tool")
+    assert len(spans) == 1
+    s = spans[0]
+    assert s.metadata["duration_source"] == "unavailable"
+    assert s.duration_ms is not None and s.duration_ms >= 0.0
+    t.close()
+
+
+def test_tool_hook_records_real_duration_via_registry_end_to_end():
+    """端到端：真实工具经 registry.invoke_tool 执行，tool span 耗时 ≈ 工具真实耗时。"""
+    reg = ToolRegistry()
+
+    @StructuredTool.from_function
+    def slow() -> str:
+        """慢工具"""
+        import time as _time
+        _time.sleep(0.02)
+        return "done"
+
+    reg.register_tool(slow)
+    t = TraceLogger()
+    t.attach_to_tool_registry(reg)
+    with t.trace("tool-e2e"):
+        r = reg.invoke_tool("slow", {})
+    assert r.status == ToolStatus.SUCCESS
+    spans = t.read_spans(kind="tool")
+    assert len(spans) == 1
+    s = spans[0]
+    # 真实测量值 ≥ 20ms（留 5ms 容差），而不是修复前的 ~0ms
+    assert s.duration_ms >= 15.0, f"duration_ms={s.duration_ms}"
+    assert s.metadata["tool_status"] == "success"
+    t.close()
+
+
 def test_attach_to_tool_registry_is_noop_when_disabled():
     """enabled=False 时 attach_to_tool_registry 不挂任何 hook，不影响 registry。"""
     reg = _make_registry_with_tools()
@@ -400,13 +467,19 @@ def test_attach_to_tool_registry_is_noop_when_disabled():
 
 # ==================== LLM 门面打点（mock 底层 _client）====================
 class _FakeClient:
-    """模拟 OpenAIClient，不发网络请求。"""
+    """模拟 OpenAIClient，不发网络请求。
+
+    与真实 OpenAIClient 行为对齐：识别可选关键字 ``usage_sink`` 并回填 token 用量，
+    用于验证 LLM 打点是否把 token 元数据写进 Span。
+    """
     def __init__(self):
         self.model = "fake-model"
         self.calls = []
 
-    def invoke(self, messages, tools=None, **kwargs):
+    def invoke(self, messages, tools=None, usage_sink=None, **kwargs):
         self.calls.append(("invoke", messages, tools, kwargs))
+        if usage_sink is not None:
+            usage_sink.update({"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18})
         from fast_agents.messages.message import Message
         return Message("assistant", "mock answer")
 
@@ -415,12 +488,16 @@ class _FakeClient:
         for ch in ["hello", " world"]:
             yield ch
 
-    def embed_query(self, text, **kwargs):
+    def embed_query(self, text, usage_sink=None, **kwargs):
         self.calls.append(("embed_query", text, kwargs))
+        if usage_sink is not None:
+            usage_sink.update({"prompt_tokens": 5, "total_tokens": 5})
         return [0.1, 0.2, 0.3]
 
-    def embed_documents(self, texts, **kwargs):
+    def embed_documents(self, texts, usage_sink=None, **kwargs):
         self.calls.append(("embed_documents", texts, kwargs))
+        if usage_sink is not None:
+            usage_sink.update({"prompt_tokens": 8, "total_tokens": 8})
         return [[0.1, 0.2], [0.3, 0.4]]
 
 
@@ -510,6 +587,81 @@ def test_llm_embed_documents_with_tracer_records_span():
     assert spans[0].name == "llm.embed_documents"
     assert spans[0].output["batch"] == 2
     assert spans[0].output["dim"] == 2
+    t.close()
+
+
+# ==================== LLM 打点：token / model 元数据（v1.0.1）====================
+def test_llm_invoke_records_token_metadata():
+    """LLM.invoke 打点把底层回传的 token 用量写进 Span.metadata（model + usage 平铺字段）。"""
+    t = TraceLogger()
+    llm = _make_fake_llm(tracer=t)
+    with t.trace("llm-token"):
+        llm.invoke([{"role": "user", "content": "hi"}])
+    spans = t.read_spans(kind="llm")
+    assert len(spans) == 1
+    md = spans[0].metadata
+    assert md["model"] == "fake-model"
+    assert md["prompt_tokens"] == 11
+    assert md["completion_tokens"] == 7
+    assert md["total_tokens"] == 18
+    assert md["usage"] == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    t.close()
+
+
+def test_llm_invoke_without_usage_adds_no_token_keys():
+    """底层不回填 usage 时，metadata 里不出现 token 字段（避免 null 噪音）。"""
+    class _NoUsageClient(_FakeClient):
+        def invoke(self, messages, tools=None, usage_sink=None, **kwargs):
+            from fast_agents.messages.message import Message
+            return Message("assistant", "mock answer")
+
+    t = TraceLogger()
+    llm = _make_fake_llm(tracer=t)
+    llm._client = _NoUsageClient()
+    with t.trace("llm-token"):
+        llm.invoke([{"role": "user", "content": "hi"}])
+    md = t.read_spans(kind="llm")[0].metadata
+    assert "usage" not in md
+    assert "total_tokens" not in md
+    assert md["model"] == "fake-model"
+    t.close()
+
+
+def test_llm_embed_query_records_token_metadata():
+    """embed_query 打点同样把 token 用量写进 metadata。"""
+    t = TraceLogger()
+    llm = _make_fake_llm(tracer=t)
+    with t.trace("emb"):
+        llm.embed_query("hello")
+    md = t.read_spans(kind="llm")[0].metadata
+    assert md["op"] == "embed_query"
+    assert md["prompt_tokens"] == 5
+    assert md["total_tokens"] == 5
+    t.close()
+
+
+def test_llm_embed_documents_records_token_metadata():
+    """embed_documents 打点把 token 用量写进 metadata。"""
+    t = TraceLogger()
+    llm = _make_fake_llm(tracer=t)
+    with t.trace("emb"):
+        llm.embed_documents(["a", "b"])
+    md = t.read_spans(kind="llm")[0].metadata
+    assert md["op"] == "embed_documents"
+    assert md["total_tokens"] == 8
+    t.close()
+
+
+def test_llm_stream_invoke_has_no_token_metadata():
+    """流式接口默认不产生 token 元数据（底层流式不返回 usage），但 Span 仍正常记录。"""
+    t = TraceLogger()
+    llm = _make_fake_llm(tracer=t)
+    with t.trace("s"):
+        list(llm.stream_invoke([{"role": "user", "content": "hi"}]))
+    s = t.read_spans(kind="llm")[0]
+    assert s.name == "llm.stream_invoke"
+    assert "usage" not in s.metadata
+    assert "total_tokens" not in s.metadata
     t.close()
 
 

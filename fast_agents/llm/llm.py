@@ -8,6 +8,21 @@ if TYPE_CHECKING:
     from ..trace import TraceLogger
 
 
+def _merge_usage_metadata(metadata: dict, usage: dict) -> None:
+    """把底层回传的 token 用量合并进 Span 的 metadata（仅在拿到数据时写入）。
+
+    写入内容：整个 ``usage`` 明细 + ``prompt_tokens`` / ``completion_tokens`` /
+    ``total_tokens`` 三个平铺字段，便于直接过滤、聚合统计（如成本分析）。
+    拿不到 usage 时（例如自定义 client 不回填、或流式接口）不写入任何键。
+    """
+    if not usage or metadata is None:
+        return
+    metadata["usage"] = dict(usage)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        if key in usage:
+            metadata[key] = usage[key]
+
+
 class LLM:
     def __init__(
         self,
@@ -66,24 +81,29 @@ class LLM:
         from ..trace import SpanKind
         # 先从 kwargs 里 pop tracer 相关，避免传给底层 openai.create
         _ = kwargs.pop("tracer", None)
+        _ = kwargs.pop("usage_sink", None)
+        used_model = kwargs.get("model", self.model)
         input_snapshot = {
-            "model": kwargs.get("model", self.model),
+            "model": used_model,
             "messages_count": len(messages) if messages else 0,
             "tools_count": len(tools) if tools else 0,
         }
+        # usage_sink：底层把本次响应的 token 用量回填进来（不改动底层返回值语义）
+        usage_sink: dict = {}
         with effective_tracer.span(
             name="llm.invoke",
             kind=SpanKind.LLM,
             input=input_snapshot,
-            metadata={"model": kwargs.get("model", self.model), "has_tools": bool(tools)},
+            metadata={"model": used_model, "has_tools": bool(tools)},
         ) as s:
-            response = self._client.invoke(messages=messages, tools=tools, **kwargs)
+            response = self._client.invoke(messages=messages, tools=tools, usage_sink=usage_sink, **kwargs)
             s.output = {
                 "role": response.role,
                 "has_content": bool(response.content),
                 "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
                 "content_preview": (response.content[:200] if response.content else None),
             }
+            _merge_usage_metadata(s.metadata, usage_sink)
             return response
 
     def stream_invoke(self, messages: list[dict[str, str]], tools=None, tracer: Optional["TraceLogger"] = None, **kwargs) -> Iterator[str]:
@@ -158,15 +178,19 @@ class LLM:
             return self._client.embed_query(text, **kwargs)
         from ..trace import SpanKind
         _ = kwargs.pop("tracer", None)
-        input_snapshot = {"text_length": len(text) if isinstance(text, str) else 0, "model": kwargs.get("model", self.embedding_model)}
+        _ = kwargs.pop("usage_sink", None)
+        used_model = kwargs.get("model", self.embedding_model)
+        input_snapshot = {"text_length": len(text) if isinstance(text, str) else 0, "model": used_model}
+        usage_sink: dict = {}
         with effective_tracer.span(
             name="llm.embed_query",
             kind=SpanKind.LLM,
             input=input_snapshot,
-            metadata={"model": kwargs.get("model", self.embedding_model), "op": "embed_query"},
+            metadata={"model": used_model, "op": "embed_query"},
         ) as s:
-            vec = self._client.embed_query(text, **kwargs)
+            vec = self._client.embed_query(text, usage_sink=usage_sink, **kwargs)
             s.output = {"dim": len(vec) if vec else 0}
+            _merge_usage_metadata(s.metadata, usage_sink)
             return vec
 
     def embed_documents(self, texts: list[str], tracer: Optional["TraceLogger"] = None, **kwargs) -> list[list[float]]:
@@ -188,13 +212,17 @@ class LLM:
             return self._client.embed_documents(texts, **kwargs)
         from ..trace import SpanKind
         _ = kwargs.pop("tracer", None)
-        input_snapshot = {"batch_size": len(texts) if texts else 0, "model": kwargs.get("model", self.embedding_model)}
+        _ = kwargs.pop("usage_sink", None)
+        used_model = kwargs.get("model", self.embedding_model)
+        input_snapshot = {"batch_size": len(texts) if texts else 0, "model": used_model}
+        usage_sink: dict = {}
         with effective_tracer.span(
             name="llm.embed_documents",
             kind=SpanKind.LLM,
             input=input_snapshot,
-            metadata={"model": kwargs.get("model", self.embedding_model), "op": "embed_documents"},
+            metadata={"model": used_model, "op": "embed_documents"},
         ) as s:
-            vecs = self._client.embed_documents(texts, **kwargs)
+            vecs = self._client.embed_documents(texts, usage_sink=usage_sink, **kwargs)
             s.output = {"batch": len(vecs) if vecs else 0, "dim": len(vecs[0]) if vecs and vecs[0] else 0}
+            _merge_usage_metadata(s.metadata, usage_sink)
             return vecs

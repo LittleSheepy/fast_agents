@@ -239,47 +239,70 @@ class TraceLogger:
         钩子签名：``hook(tool_name: str, tool_args: dict, result: ToolResult)``；
         内部会自动开启一个 tool Span 记录输入/输出/耗时/状态，不抛异常。
 
-        注意：ToolRegistry 钩子是工具执行**完成后**才调用的，
-        所以这里我们用「后钩子」记一条完整记录——入参就是执行前快照，
-        耗时从 ToolResult 里取（若有），没有就用 0 占位。
+        计时说明（v1.0.1 修正）：ToolRegistry 的钩子是工具执行**完成后**才调用的，
+        「后钩子」里拿不到真实开始时刻。工具的真实耗时由 ``tool_base`` 写进
+        ``ToolResult.metadata["duration_ms"]``（int 毫秒），这里读取该值，
+        并用「当前时刻（≈ 执行结束时刻）− duration_ms」回推 ``start_time``，
+        使 tool Span 的时间区间与父子的包含关系都正确；若工具未上报耗时，
+        则退化为一次近零耗时记录，并在 metadata 标记 ``duration_source``。
         """
         if not self.enabled:
             return
-        # 工具执行后钩子拿不到开始时间戳，用 ToolResult.duration_ms（若有）
         duration_ms = None
         output_data = None
         status = SpanStatus.SUCCESS
         error_msg = None
+        tool_status_str = None
         try:
-            # ToolResult 有 status/error/output/duration_ms 属性
+            # ToolResult 有 status/error/output/metadata 属性
             status_val = getattr(result, "status", None)
             # ToolStatus.SUCCESS/ERROR/TRUNCATED
-            status_str = str(status_val.value) if hasattr(status_val, "value") else str(status_val) if status_val else "success"
-            if "error" in status_str:
+            if hasattr(status_val, "value"):
+                tool_status_str = str(status_val.value)
+            elif status_val is not None:
+                tool_status_str = str(status_val)
+            else:
+                tool_status_str = "success"
+            if tool_status_str == "error":
                 status = SpanStatus.ERROR
             err = getattr(result, "error", None)
             if err:
                 error_msg = str(err)
                 status = SpanStatus.ERROR
             output_data = getattr(result, "output", str(result) if result is not None else None)
-            duration_ms = getattr(result, "duration_ms", None)
+            # 真实耗时在 metadata 里（tool_base 写入），不是 ToolResult 的顶层属性
+            result_meta = getattr(result, "metadata", None)
+            if isinstance(result_meta, dict):
+                duration_ms = result_meta.get("duration_ms")
         except Exception:
             output_data = str(result) if result is not None else None
 
-        # 直接构造并 finish 一条 Span（不通过 start_span，避免父子关系错位——
-        # 因为后钩子触发时上层 decision Span 仍是当前活跃 Span，
-        # 所以 tool Span 会自然成为 decision 的子 Span，关系是对的）
+        # 回推 start_time：后钩子触发时刻 ≈ 工具执行结束时刻
+        start_time = _now_ts()
+        if duration_ms is not None:
+            try:
+                start_time = _now_ts() - float(duration_ms) / 1000.0
+            except (TypeError, ValueError):
+                duration_ms = None
+
+        span_metadata = {"tool_name": name}
+        if tool_status_str is not None:
+            span_metadata["tool_status"] = tool_status_str
+        if duration_ms is None:
+            # 工具未上报真实耗时：退化为近零耗时记录，并显式标记来源
+            span_metadata["duration_source"] = "unavailable"
+
+        # 直接构造并 finish 一条 Span（后钩子触发时上层 decision Span 仍是当前
+        # 活跃 Span，所以这里 start_span 出来的 tool Span 会自然成为其子 Span）
         s = self.start_span(
             name=f"tool.{name}",
             kind=SpanKind.TOOL,
             input=tool_args if isinstance(tool_args, dict) else {"raw": str(tool_args)},
-            metadata={"tool_name": name},
+            metadata=span_metadata,
         )
-        # 如果 ToolResult 没给 duration_ms，用 start_span 的 start_time 做近似
-        # （后钩子立刻 finish，这个近似其实偏差很小）
+        # 覆盖默认 start_time，让 finish() 算出的 duration_ms ≈ 工具自报耗时
         if duration_ms is not None:
-            s.duration_ms = float(duration_ms)
-            s.end_time = s.start_time + s.duration_ms / 1000.0
+            s.start_time = start_time
         self.end_span(s, output=output_data, status=status, error=error_msg)
 
     def attach_to_tool_registry(self, registry: Any) -> None:

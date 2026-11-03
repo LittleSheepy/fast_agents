@@ -10,6 +10,36 @@ from ..messages.message import Message, MsgToolCall
 _EMBED_BATCH_SIZE = 2048
 
 
+def _dump_usage(usage) -> Optional[dict]:
+    """把 SDK 的 usage 对象转成普通 dict；拿不到时返回 None。"""
+    if usage is None:
+        return None
+    try:
+        if hasattr(usage, "model_dump"):
+            return usage.model_dump()
+        if hasattr(usage, "to_dict"):
+            return usage.to_dict()
+        if isinstance(usage, dict):
+            return dict(usage)
+        return dict(vars(usage))
+    except Exception:
+        return None
+
+
+def _merge_usage(sink: Optional[dict], usage: Optional[dict]) -> None:
+    """把 usage 明细累加进 sink（用于 embed_documents 多批次汇总）。
+
+    仅累加数值型字段（prompt_tokens / total_tokens 等），非数值字段跳过，
+    不引入任何新依赖。
+    """
+    if sink is None or not usage:
+        return
+    for key, val in usage.items():
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        sink[key] = sink.get(key, 0) + val
+
+
 class OpenAIClient(OpenAI):
     def __init__(
             self,
@@ -39,10 +69,14 @@ class OpenAIClient(OpenAI):
     # Chat（对话）                                                         #
     # ------------------------------------------------------------------ #
 
-    def invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Message:
+    def invoke(self, messages: list[dict[str, str]], tools=None, *, usage_sink: Optional[dict] = None, **kwargs) -> Message:
         """
         非流式调用LLM，返回完整响应。
         适用于不需要流式输出的场景。
+
+        可选参数 ``usage_sink``：传入一个 dict 时，会把本次响应的 token 用量
+        （prompt_tokens/completion_tokens/total_tokens）写入其中，供上层打点使用；
+        不传时行为与改动前完全一致（不产生任何额外副作用）。
         """
         try:
             chat_model = kwargs.pop("model", self.model)
@@ -56,6 +90,10 @@ class OpenAIClient(OpenAI):
                 **{k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']},
                 extra_body={"enable_thinking": False}
             )
+            if usage_sink is not None:
+                usage = _dump_usage(getattr(response, "usage", None))
+                if usage:
+                    usage_sink.update(usage)
             message = response.choices[0].message
             response_msg = Message(role="assistant", content=message.content)
             if response.choices[0].finish_reason == "tool_calls":
@@ -122,7 +160,7 @@ class OpenAIClient(OpenAI):
     # Embeddings（语义向量）                                               #
     # ------------------------------------------------------------------ #
 
-    def embed_query(self, text: str, **kwargs) -> list[float]:
+    def embed_query(self, text: str, *, usage_sink: Optional[dict] = None, **kwargs) -> list[float]:
         """
         对单条「查询侧」文本生成 embedding 向量。
 
@@ -150,7 +188,7 @@ class OpenAIClient(OpenAI):
         except Exception as e:
             raise Exception(f"Embedding 调用失败（query）: {str(e)}")
 
-    def embed_documents(self, texts: list[str], **kwargs) -> list[list[float]]:
+    def embed_documents(self, texts: list[str], *, usage_sink: Optional[dict] = None, **kwargs) -> list[list[float]]:
         """
         对一批「文档侧」文本生成 embedding 向量。
 
@@ -159,6 +197,8 @@ class OpenAIClient(OpenAI):
 
         为避免超过 OpenAI API 单次 2048 条 input 的上限，内部自动按 2048 分片，
         并通过线程池并发请求，保持顺序一致。
+
+        可选参数 ``usage_sink``：传入 dict 时把各批次 token 用量累加写入其中。
         """
         if not isinstance(texts, (list, tuple)):
             raise TypeError(
@@ -171,7 +211,7 @@ class OpenAIClient(OpenAI):
 
         embed_model = kwargs.pop("model", self.embedding_model)
 
-        def _one_batch(batch: list[str]) -> list[list[float]]:
+        def _one_batch(batch: list[str]):
             resp = self.embeddings.create(
                 model=embed_model,
                 input=batch,
@@ -179,7 +219,8 @@ class OpenAIClient(OpenAI):
             )
             # API 返回的 data 按 index 排序，用它来对齐顺序
             ordered = sorted(resp.data, key=lambda d: d.index)
-            return [list(d.embedding) for d in ordered]
+            vectors = [list(d.embedding) for d in ordered]
+            return vectors, _dump_usage(getattr(resp, "usage", None))
 
         # 按 _EMBED_BATCH_SIZE 切分
         batches = [
@@ -189,16 +230,15 @@ class OpenAIClient(OpenAI):
 
         try:
             if len(batches) == 1:
-                return _one_batch(batches[0])
-            # 多批次并发
-            results: list[list[list[float]]] = []
-            with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
-                for part in pool.map(_one_batch, batches):
-                    results.append(part)
-            # 按顺序拼接
+                vectors, usage = _one_batch(batches[0])
+                _merge_usage(usage_sink, usage)
+                return vectors
+            # 多批次并发；token 用量在汇总阶段统一累加，避免多线程写同一 dict 竞态
             merged: list[list[float]] = []
-            for part in results:
-                merged.extend(part)
+            with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
+                for part, usage in pool.map(_one_batch, batches):
+                    merged.extend(part)
+                    _merge_usage(usage_sink, usage)
             return merged
         except Exception as e:
             raise Exception(f"Embedding 调用失败（documents）: {str(e)}")

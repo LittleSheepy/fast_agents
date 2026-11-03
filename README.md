@@ -980,25 +980,28 @@ agent = ReActAgent(
 
 > **状态说明**：本模块已并入主分支（`fast_agents/trace/`），对应演进路线图 **G1**。完整说明见 [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md)。
 
-默认**关闭**（`enabled=False`），显式打开才记录；零新增依赖（标准库 + 仓库已有的 pydantic）。借鉴 OpenTelemetry 的 Trace/Span 模型、LangChain callback、OpenAI Agents SDK tracing 的核心概念，但不引入这些依赖。
+默认**不收集**（不构造 `TraceLogger`、或不把它传给 LLM/Agent 即零开销），构造出实例即启用、可用 `enabled=False` 显式关闭；零新增依赖（标准库 + 仓库已有的 pydantic）。借鉴 OpenTelemetry 的 Trace/Span 模型、LangChain callback、OpenAI Agents SDK tracing 的核心概念，但不引入这些依赖。
 
 | 能力 | 类 / 方法 | 说明 |
 |------|----|------|
-| 记录模型 | `SpanRecord` / `SpanKind` / `SpanStatus` | 每条 Span 记录 trace_id/span_id/parent_span_id/session_id/name/kind/inputs/outputs/起止时间/耗时/状态 |
-| 记录器 | `TraceLogger` | 手动 span、with 上下文、trace() 新建根 span、失败安全（打点异常不阻塞主业务）|
+| 记录模型 | `SpanRecord` / `SpanKind` / `SpanStatus` | 每条 Span 记录 trace_id/span_id/parent_id/session_id/name/kind/input/output/起止时间/耗时/状态/metadata |
+| 记录器 | `TraceLogger` | 手动 span、with 上下文、trace() 开新 Trace、失败安全（打点异常不阻塞主业务）|
 | 默认落盘 | `JsonlStore` | jsonl 逐行追加写，路径可配置；支持 `:memory:` 内存模式；为切 SQLite 预留抽象位 |
 | 工具打点 | `tracer.attach_to_tool_registry(registry)` | 走 `ToolRegistry.add_hook`，不改注册表逻辑，一行接入所有工具调用 |
-| 查询 | `tracer.read_spans(trace_id/session_id/kind/时间范围)` | 按条件过滤，按 start_time 升序返回 |
-| 回放 | `tracer.replay(trace_id)` | 按 parent_span_id 组装调用树，缩进打印 |
+| 查询 | `tracer.read_spans(session_id/trace_id/kind/limit)` | 按条件过滤，按 store 原始（写入）顺序返回 |
+| 回放 | `tracer.replay(trace_id)` | 返回按时间排序、字段稳定的可打印 dict 列表 |
+| token 元数据 | LLM span 的 `metadata` | **v1.0.1**：invoke/embed 记录 `model` + `usage`/`prompt_tokens`/`completion_tokens`/`total_tokens`（成本分析用） |
+| tool 耗时 | tool span 的 `duration_ms` | **v1.0.1**：取 `ToolResult.metadata["duration_ms"]` 实测值并回推 start_time |
 
 ```python
 from fast_agents import LLM, ReActAgent, ToolRegistry, TraceLogger
 
-tracer = TraceLogger(output_path="logs/agent_run.jsonl", enabled=True, session_id="chat-001")
+tracer = TraceLogger(path="logs/agent_run.jsonl", enabled=True, session_id="chat-001")
 agent = ReActAgent(name="助手", llm=LLM(), tool_registry=registry, tracer=tracer)
 
 result = agent.run("3 的平方是多少？")  # 自动记录 agent / decision / tool span
-print(tracer.replay(tracer.read_spans()[0].trace_id))
+for row in tracer.replay(tracer.read_spans()[0].trace_id):
+    print(row)
 ```
 
 > **接入硬约束**：LLM/ReActAgent 只新增可选 `tracer=None` 参数，默认 None 时行为与改动前逐字节一致；工具打点走 `ToolRegistry.add_hook`，不修改注册表源码。
