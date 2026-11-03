@@ -270,7 +270,19 @@ fast_agents/
 │   │   ├── compressor.py         #    ContextCompressor：三级压缩策略
 │   │   ├── builder.py            #    ContextBuilder：对 Agent 的门面
 │   │   └── tools.py              #    read_offloaded / list_files（文件读写编辑见 builtin/file_tool.py）
-│   └── utils/                    # ⑨ 通用工具（当前为空占位）
+│   ├── database/                 # ⑨ 持久化层（对齐 db 模块编写说明）
+│   │   ├── __init__.py
+│   │   ├── database_client_base.py
+│   │   ├── schema.py
+│   │   ├── query.py
+│   │   └── sqlite_client.py
+│   ├── trace/                    # ⑩ TraceLogger 全链路记录（G1 · 默认 jsonl 落盘、可回放）
+│   │   ├── __init__.py
+│   │   ├── models.py             #    SpanRecord / SpanKind / SpanStatus
+│   │   ├── store_base.py         #    TraceStoreBase 抽象基类
+│   │   ├── jsonl_store.py        #    JsonlStore：jsonl 逐行落盘 + 内存模式
+│   │   └── trace_logger.py       #    TraceLogger 门面
+│   └── utils/                    # ⑪ 通用工具（当前为空占位）
 ├── .skills/                      # 项目级技能目录（默认扫描位置）
 │   └── web-research/
 │       ├── SKILL.md
@@ -280,8 +292,10 @@ fast_agents/
 ├── docs/                         # 模块编写说明 + 路线图
 ├── examples/
 │   ├── context/                  # context 示例（离线可跑，不需要 API Key）
+│   ├── database/                 # database 示例（内存/临时库，不需要 API Key）
 │   ├── mcp/                      # MCP 示例（echo_server / quickstart / agent demo）
-│   └── tools/                    # 工具示例（file_tools_demo.py）
+│   ├── tools/                    # 工具示例（file_tools_demo.py）
+│   └── trace/                    # trace 示例（memory/jsonl 落盘 + 回放，离线可跑，不需要 API Key）
 ├── test/                         # 测试与示例脚本
 ├── pyproject.toml
 ├── requirements.txt
@@ -961,6 +975,33 @@ agent = ReActAgent(
 > **为什么「本轮问题永远最后」**：prompt caching 是前缀匹配。把每轮都变的记忆 / 历史写进 prompt 中段，后面的缓存会全部失效，长会话成本翻倍。
 
 > **`read_offloaded` 与 `ReadTool` 的分工**：前者回读「被卸载的工具结果」，后者读普通文件（`fast_agents.tools.builtin.ReadTool`），两者互不替代。
+
+### 9. Trace（可观测性 / TraceLogger 全链路记录）
+
+> **状态说明**：本模块已并入主分支（`fast_agents/trace/`），对应演进路线图 **G1**。完整说明见 [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md)。
+
+默认**关闭**（`enabled=False`），显式打开才记录；零新增依赖（标准库 + 仓库已有的 pydantic）。借鉴 OpenTelemetry 的 Trace/Span 模型、LangChain callback、OpenAI Agents SDK tracing 的核心概念，但不引入这些依赖。
+
+| 能力 | 类 / 方法 | 说明 |
+|------|----|------|
+| 记录模型 | `SpanRecord` / `SpanKind` / `SpanStatus` | 每条 Span 记录 trace_id/span_id/parent_span_id/session_id/name/kind/inputs/outputs/起止时间/耗时/状态 |
+| 记录器 | `TraceLogger` | 手动 span、with 上下文、trace() 新建根 span、失败安全（打点异常不阻塞主业务）|
+| 默认落盘 | `JsonlStore` | jsonl 逐行追加写，路径可配置；支持 `:memory:` 内存模式；为切 SQLite 预留抽象位 |
+| 工具打点 | `tracer.attach_to_tool_registry(registry)` | 走 `ToolRegistry.add_hook`，不改注册表逻辑，一行接入所有工具调用 |
+| 查询 | `tracer.read_spans(trace_id/session_id/kind/时间范围)` | 按条件过滤，按 start_time 升序返回 |
+| 回放 | `tracer.replay(trace_id)` | 按 parent_span_id 组装调用树，缩进打印 |
+
+```python
+from fast_agents import LLM, ReActAgent, ToolRegistry, TraceLogger
+
+tracer = TraceLogger(output_path="logs/agent_run.jsonl", enabled=True, session_id="chat-001")
+agent = ReActAgent(name="助手", llm=LLM(), tool_registry=registry, tracer=tracer)
+
+result = agent.run("3 的平方是多少？")  # 自动记录 agent / decision / tool span
+print(tracer.replay(tracer.read_spans()[0].trace_id))
+```
+
+> **接入硬约束**：LLM/ReActAgent 只新增可选 `tracer=None` 参数，默认 None 时行为与改动前逐字节一致；工具打点走 `ToolRegistry.add_hook`，不修改注册表源码。
 
 ---
 
