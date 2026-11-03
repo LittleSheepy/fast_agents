@@ -15,8 +15,12 @@ import pytest
 from fast_agents.database import (
     Column,
     ColumnType,
+    Filter,
+    FilterOp,
     Index,
+    Query,
     Schema,
+    SortOrder,
     SQLiteClient,
 )
 
@@ -446,6 +450,331 @@ def test_raw_create_table_still_works(db):
     assert db.select_one("raw_t", {"v": "hello"}) is not None
 
 
+# ==================== 谓词下推：select_where / select_one_where ====================
+def _seed_users_for_query(db):
+    """给 test_users 造一份有区分度的数据，覆盖各操作符。"""
+    db.insert("test_users", {"name": "Alice",   "age": 30, "score": 88.5})
+    db.insert("test_users", {"name": "Bob",     "age": 25, "score": 72.0})
+    db.insert("test_users", {"name": "Charlie", "age": 35, "score": 95.0})
+    db.insert("test_users", {"name": "David",   "age": 40, "score": 60.0})
+    db.insert("test_users", {"name": "Eve",     "age": 28, "score": 88.5})
+
+
+def test_select_where_eq(db):
+    """FilterOp.EQ 等价于 dict 等值查询。"""
+    _seed_users_for_query(db)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="name", op=FilterOp.EQ, value="Alice")],
+    ))
+    assert len(rows) == 1 and rows[0]["name"] == "Alice"
+
+
+def test_select_where_neq(db):
+    """FilterOp.NEQ：排除等于指定值的行。"""
+    _seed_users_for_query(db)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="age", op=FilterOp.NEQ, value=30)],
+        sort_by="id", sort_order=SortOrder.ASC,
+    ))
+    names = [r["name"] for r in rows]
+    assert "Alice" not in names and len(names) == 4
+
+
+def test_select_where_gt_gte_lt_lte(db):
+    """GT/GTE/LT/LTE 四种比较运算正确。"""
+    _seed_users_for_query(db)
+    # age > 30 → Charlie, David
+    rows = db.select_where(Query(table_name="test_users",
+                             filters=[Filter(field="age", op=FilterOp.GT, value=30)],
+                             sort_by="age"))
+    assert [r["name"] for r in rows] == ["Charlie", "David"]
+
+    # age >= 30 → Alice, Charlie, David
+    rows = db.select_where(Query(table_name="test_users",
+                             filters=[Filter(field="age", op=FilterOp.GTE, value=30)],
+                             sort_by="age"))
+    assert [r["name"] for r in rows] == ["Alice", "Charlie", "David"]
+
+    # age < 30 → Bob, Eve
+    rows = db.select_where(Query(table_name="test_users",
+                             filters=[Filter(field="age", op=FilterOp.LT, value=30)],
+                             sort_by="age"))
+    assert [r["name"] for r in rows] == ["Bob", "Eve"]
+
+    # score <= 72 → Bob(72), David(60)
+    rows = db.select_where(Query(table_name="test_users",
+                             filters=[Filter(field="score", op=FilterOp.LTE, value=72.0)],
+                             sort_by="score"))
+    assert [r["name"] for r in rows] == ["David", "Bob"]
+
+
+def test_select_where_like(db):
+    """FilterOp.LIKE：支持 % / _ 通配符（调用方自己写通配符，不替用户补）。"""
+    _seed_users_for_query(db)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="name", op=FilterOp.LIKE, value="A%")],
+    ))
+    assert len(rows) == 1 and rows[0]["name"] == "Alice"
+
+    # 不带通配符 → 等价于精确匹配
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="name", op=FilterOp.LIKE, value="Bob")],
+    ))
+    assert len(rows) == 1 and rows[0]["name"] == "Bob"
+
+
+def test_select_where_in(db):
+    """FilterOp.IN：展开成 IN (?, ?, ?) 形式。"""
+    _seed_users_for_query(db)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="name", op=FilterOp.IN, value=["Alice", "Eve", "Nobody"])],
+        sort_by="id",
+    ))
+    assert [r["name"] for r in rows] == ["Alice", "Eve"]
+
+
+def test_select_where_in_empty_list_rejected(db):
+    """IN 的 value 必须是非空 list/tuple，空值/非列表必须报错。"""
+    _seed_users_for_query(db)
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="test_users",
+                          filters=[Filter(field="name", op=FilterOp.IN, value=[])]))
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="test_users",
+                          filters=[Filter(field="name", op=FilterOp.IN, value="Alice")]))  # type: ignore[arg-type]
+
+
+def test_select_where_is_null_is_not_null(db):
+    """IS_NULL / NOT_NULL 不要求 value。"""
+    _seed_users_for_query(db)
+    # 新插入一条 age=NULL 的
+    db.insert("test_users", {"name": "NullGuy", "score": 50})
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="age", op=FilterOp.IS_NULL)],
+    ))
+    assert len(rows) == 1 and rows[0]["name"] == "NullGuy"
+
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="age", op=FilterOp.NOT_NULL)],
+    ))
+    assert all(r["age"] is not None for r in rows)
+    assert len(rows) == 5  # 最初 5 人都有 age
+
+
+def test_select_where_binary_op_without_value_rejected(db):
+    """EQ/NEQ/... 等二元操作符漏传 value 必须报错。"""
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="test_users",
+                          filters=[Filter(field="age", op=FilterOp.EQ)]))
+
+
+def test_select_where_and_combination(db):
+    """多个 Filter 之间固定 AND。"""
+    _seed_users_for_query(db)
+    # age > 25 AND score >= 88 → Alice(30,88.5)、Charlie(35,95)、Eve(28,88.5)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[
+            Filter(field="age",   op=FilterOp.GT,  value=25),
+            Filter(field="score", op=FilterOp.GTE, value=88.5),
+        ],
+        sort_by="id",
+    ))
+    assert [r["name"] for r in rows] == ["Alice", "Charlie", "Eve"]
+
+
+def test_select_where_sort_limit_offset(db):
+    """sort_by/sort_order/limit/offset 能正确组合。"""
+    _seed_users_for_query(db)
+    # 按 age DESC，取前 2 → David(40), Charlie(35)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        sort_by="age", sort_order=SortOrder.DESC,
+        limit=2,
+    ))
+    assert [r["name"] for r in rows] == ["David", "Charlie"]
+
+    # 按 score ASC，offset=2，limit=2 → Alice/Eve(88.5 并列，按插入序), Charlie(95)
+    # 为避免依赖插入序，只验 offset+limit 行数约束
+    rows = db.select_where(Query(
+        table_name="test_users",
+        sort_by="score", sort_order=SortOrder.ASC,
+        limit=2, offset=2,
+    ))
+    assert len(rows) == 2
+
+    # 仅 offset 无 limit：自动补 LIMIT -1，SQLite 支持"无上限"
+    rows = db.select_where(Query(
+        table_name="test_users",
+        sort_by="id",
+        offset=3,
+    ))
+    assert len(rows) == 2
+
+
+def test_select_where_limit_offset_negative_rejected(db):
+    """limit/offset 为负数必须报错。"""
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="test_users", limit=-1))
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="test_users", offset=-1))
+
+
+def test_select_where_invalid_field_rejected(db):
+    """字段名非法（含特殊字符、数字开头）必须被白名单拦截。"""
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="test_users",
+                          filters=[Filter(field="age; DROP TABLE test_users;--",
+                                          op=FilterOp.EQ, value=1)]))
+    with pytest.raises(ValueError):
+        db.select_where(Query(table_name="test_users",
+                          filters=[Filter(field="1bad", op=FilterOp.EQ, value=1)]))
+
+
+def test_select_where_value_is_parameterized(db):
+    """value 部分必须走参数化（传包含 SQL 片段的字符串不会被执行）。"""
+    _seed_users_for_query(db)
+    # 若把 value 拼进 SQL，下面这行就会把所有行查出来；参数化时只会找 name 精确等于字符串 'Alice' OR '1'='1' 的人
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="name", op=FilterOp.EQ, value="Alice' OR '1'='1")],
+    ))
+    assert len(rows) == 0
+
+
+def test_select_one_where(db):
+    """select_one_where 单行版本：无结果返回 None，有结果返回首行。"""
+    _seed_users_for_query(db)
+    row = db.select_one_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="name", op=FilterOp.EQ, value="Charlie")],
+    ))
+    assert row is not None and row["age"] == 35
+
+    assert db.select_one_where(Query(
+        table_name="test_users",
+        filters=[Filter(field="name", op=FilterOp.EQ, value="Nobody")],
+    )) is None
+
+    # select_one_where 不应把 limit=1 污染到原 Query 对象
+    q = Query(table_name="test_users", sort_by="id")
+    db.select_one_where(q)
+    assert q.limit is None and q.offset is None
+
+
+def test_select_where_no_filters_returns_all(db):
+    """不传 filters 等价于 SELECT *，能正常配合 sort/limit。"""
+    _seed_users_for_query(db)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        sort_by="id", limit=3,
+    ))
+    assert len(rows) == 3
+
+
+def test_select_where_type_check(db):
+    """select_where 必须传 Query 实例，其他类型抛 TypeError。"""
+    with pytest.raises(TypeError):
+        db.select_where("not a query")  # type: ignore[arg-type]
+    with pytest.raises(TypeError):
+        db.select_one_where({"table_name": "test_users"})  # type: ignore[arg-type]
+
+
+def test_select_where_same_field_multiple_filters(db):
+    """同字段多个 Filter 自动 AND（例如 BETWEEN 写法），参数名不冲突。"""
+    _seed_users_for_query(db)
+    # 25 <= age <= 35 → Alice(30), Bob(25), Charlie(35), Eve(28)
+    rows = db.select_where(Query(
+        table_name="test_users",
+        filters=[
+            Filter(field="age", op=FilterOp.GTE, value=25),
+            Filter(field="age", op=FilterOp.LTE, value=35),
+        ],
+        sort_by="age",
+    ))
+    assert [r["name"] for r in rows] == ["Bob", "Eve", "Alice", "Charlie"]
+
+
+def test_select_where_still_works(db):
+    """原 select(where=dict) 等值写法完全保留，不受 select_where 影响。"""
+    _seed_users_for_query(db)
+    rows = db.select("test_users", where={"age": 30})
+    assert len(rows) == 1 and rows[0]["name"] == "Alice"
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ---------- count / batch_insert 测试 ----------
+def test_count_empty():
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT"})
+    assert db.count("t") == 0
+
+def test_count_total():
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT", "age": "INTEGER"})
+    for i in range(5):
+        db.insert("t", {"name": f"u{i}", "age": 20 + i})
+    assert db.count("t") == 5
+
+def test_count_where():
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT", "age": "INTEGER"})
+    db.insert("t", {"name": "A", "age": 17})
+    db.insert("t", {"name": "B", "age": 21})
+    db.insert("t", {"name": "C", "age": 21})
+    assert db.count("t", {"age": 21}) == 2
+
+def test_count_invalid_table():
+    db = SQLiteClient(":memory:")
+    try:
+        db.count("t; DROP TABLE t--")
+        assert False, "应该抛错"
+    except ValueError:
+        pass
+
+def test_batch_insert_empty():
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT"})
+    assert db.batch_insert("t", []) == 0
+    assert db.count("t") == 0
+
+def test_batch_insert_basic():
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT", "age": "INTEGER"})
+    rows = [{"name": f"u{i}", "age": 20+i} for i in range(10)]
+    n = db.batch_insert("t", rows)
+    assert n == 10
+    assert db.count("t") == 10
+    assert db.select_one("t", {"name": "u5"})["age"] == 25
+
+def test_batch_insert_inconsistent_fields():
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT", "age": "INTEGER"})
+    rows = [
+        {"name": "A", "age": 20},
+        {"name": "B"},  # 缺 age
+    ]
+    try:
+        db.batch_insert("t", rows)
+        assert False, "应该抛错"
+    except ValueError as e:
+        assert "age" in str(e)
+
+def test_batch_insert_invalid_table():
+    db = SQLiteClient(":memory:")
+    try:
+        db.batch_insert("t; DROP TABLE t--", [{"x": 1}])
+        assert False, "应该抛错"
+    except ValueError:
+        pass

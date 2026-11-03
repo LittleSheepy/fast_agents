@@ -39,6 +39,7 @@ import sqlite3
 from typing import Any, Optional
 
 from .database_client_base import DatabaseClientBase
+from .query import Filter, FilterOp, Query, SortOrder
 from .schema import (
     Column,
     Index,
@@ -317,6 +318,113 @@ class SQLiteClient(DatabaseClientBase):
             sql += f" LIMIT {int(limit)}"
         return self.query(sql, params)  # type: ignore
 
+    # ---------- 谓词下推：Query / Filter → 参数化 SQL ----------
+    @staticmethod
+    def _compile_filter(f: Filter, idx: int) -> tuple[str, dict[str, Any]]:
+        """把单个 Filter 编译成 (SQL 片段, 参数字典)。
+
+        - 列名必须过 _check_ident 白名单；
+        - 值一律通过命名参数 ``:f{idx}...`` 传入，杜绝拼接注入；
+        - 每个参数名用 idx 后缀唯一名，避免同列多条件时参数名冲突。
+        """
+        if not isinstance(f, Filter):
+            raise TypeError(f"filters 列表元素必须是 Filter，收到 {type(f)}")
+        _check_ident(f.field, "字段名")
+        col = _quote_ident(f.field)
+        op = f.op
+        p_name = f"f{idx}"
+
+        # IS NULL / IS NOT NULL：无参
+        if op is FilterOp.IS_NULL:
+            return f"{col} IS NULL", {}
+        if op is FilterOp.NOT_NULL:
+            return f"{col} IS NOT NULL", {}
+
+        # IN：需要列表值，展开成 (:f0_0, :f0_1, ...)
+        if op is FilterOp.IN:
+            if not isinstance(f.value, (list, tuple)) or len(f.value) == 0:
+                raise ValueError(
+                    f"Filter(field={f.field!r}, op=IN) 的 value 必须是非空 list/tuple，"
+                    f"收到 {type(f.value).__name__}"
+                )
+            keys: list[str] = []
+            params: dict[str, Any] = {}
+            for i, v in enumerate(f.value):
+                k = f"{p_name}_{i}"
+                keys.append(f":{k}")
+                params[k] = v
+            return f"{col} IN ({', '.join(keys)})", params
+
+        # 其它二元操作符（= != > >= < <= LIKE）：需要一个 value
+        if f.value is None:
+            raise ValueError(
+                f"Filter(field={f.field!r}, op={op.value}) 必须提供 value；"
+                f"判空请用 IS_NULL / NOT_NULL"
+            )
+        # 允许 LIKE 的 value 带 % / _，不替用户补，保持最小惊讶
+        return f"{col} {op.value} :{p_name}", {p_name: f.value}
+
+    @staticmethod
+    def _compile_query(q: Query) -> tuple[str, dict[str, Any]]:
+        """把 Query 对象编译成 (SQL 语句, 命名参数字典)。
+
+        编译规则（严格保守、不做 OR / JOIN / 子查询，保持最小可用）：
+        - 表名 / sort_by 字段名全部走 _check_ident 白名单；
+        - 多个 Filter 之间固定 AND；
+        - sort_by 只允许单字段 + ASC/DESC 枚举方向；多字段排序留到后续版本；
+        - limit / offset 强制 int 并校验非负；
+        - LIKE 的通配符由调用方在 value 里自带，不替用户加 %，避免"隐式模糊"。
+        """
+        _check_ident(q.table_name, "表名")
+        sql_parts: list[str] = [f"SELECT * FROM {_quote_ident(q.table_name)}"]
+        params: dict[str, Any] = {}
+
+        if q.filters:
+            conds: list[str] = []
+            for i, f in enumerate(q.filters):
+                frag, p = SQLiteClient._compile_filter(f, i)
+                conds.append(frag)
+                params.update(p)
+            sql_parts.append("WHERE " + " AND ".join(conds))
+
+        if q.sort_by is not None:
+            _check_ident(q.sort_by, "排序字段名")
+            direction = "ASC" if q.sort_order is SortOrder.ASC else "DESC"
+            sql_parts.append(f"ORDER BY {_quote_ident(q.sort_by)} {direction}")
+
+        if q.limit is not None:
+            n = int(q.limit)
+            if n < 0:
+                raise ValueError(f"limit 不能为负数: {n}")
+            sql_parts.append(f"LIMIT {n}")
+
+        if q.offset is not None:
+            m = int(q.offset)
+            if m < 0:
+                raise ValueError(f"offset 不能为负数: {m}")
+            # SQLite 里 OFFSET 必须先有 LIMIT；为最小惊讶，没 LIMIT 时自动补一个大数兜底
+            if q.limit is None:
+                sql_parts.append("LIMIT -1")  # SQLite 支持 LIMIT -1 表示"无上限"
+            sql_parts.append(f"OFFSET {m}")
+
+        return " ".join(sql_parts), params
+
+    def select_where(self, query: Query) -> list[dict[str, Any]]:
+        """按声明式 Query 查询（谓词下推入口）。"""
+        if not isinstance(query, Query):
+            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
+        sql, params = self._compile_query(query)
+        return self.query(sql, params)  # type: ignore[return-value]
+
+    def select_one_where(self, query: Query) -> dict[str, Any] | None:
+        """按声明式 Query 查询单行（自动 LIMIT 1）。"""
+        if not isinstance(query, Query):
+            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
+        # 不修改传入对象，构造一个只带 limit=1 的副本用于 SQL 生成
+        limited = query.model_copy(update={"limit": 1, "offset": None})
+        rows = self.select_where(limited)
+        return rows[0] if rows else None
+
     def select_one(
         self,
         table: str,
@@ -366,6 +474,57 @@ class SQLiteClient(DatabaseClientBase):
         finally:
             self._in_transaction = False
         return False
+
+
+    # ---------- 统计与批量写入：count / batch_insert ----------
+    def count(self, table: str, where: dict[str, Any] | None = None) -> int:
+        """按等值条件统计行数，where=None 返回表总行数。"""
+        _check_ident(table, "表名")
+        sql = f"SELECT COUNT(*) AS cnt FROM {_quote_ident(table)}"
+        params: list[Any] = []
+        conditions: list[str] = []
+        if where:
+            for k, v in where.items():
+                _check_ident(k, "字段名")
+                if v is None:
+                    conditions.append(f"{_quote_ident(k)} IS NULL")
+                else:
+                    conditions.append(f"{_quote_ident(k)} = ?")
+                    params.append(v)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        row = self.query(sql, tuple(params), fetch_one=True)
+        return int(row["cnt"]) if row else 0
+
+    def batch_insert(self, table: str, rows: list[dict[str, Any]]) -> int:
+        """批量插入多行，返回插入行数；空列表直接返回0。"""
+        if not rows:
+            return 0
+        _check_ident(table, "表名")
+        columns = list(rows[0].keys())
+        for col in columns:
+            _check_ident(col, "字段名")
+        expected_cols = set(columns)
+        for i, row in enumerate(rows):
+            row_cols = set(row.keys())
+            if row_cols != expected_cols:
+                missing = expected_cols - row_cols
+                extra = row_cols - expected_cols
+                msg = f"第 {i} 行字段与首行不一致"
+                if missing:
+                    msg += f"，缺少字段: {sorted(missing)}"
+                if extra:
+                    msg += f"，多余字段: {sorted(extra)}"
+                raise ValueError(msg)
+        col_sql_str = ", ".join(_quote_ident(c) for c in columns)
+        placeholders = ", ".join("?" for _ in columns)
+        sql = f"INSERT INTO {_quote_ident(table)} ({col_sql_str}) VALUES ({placeholders})"
+        params_list = [tuple(row[c] for c in columns) for row in rows]
+        try:
+            self.conn.executemany(sql, params_list)
+        except sqlite3.Error as e:
+            raise ValueError(f"批量插入失败: {e}") from e
+        return len(rows)
 
     def __del__(self) -> None:
         """析构时尝试关闭连接。"""

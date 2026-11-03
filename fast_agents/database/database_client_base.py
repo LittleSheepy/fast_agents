@@ -77,10 +77,26 @@ class DatabaseClientBase(ABC):
     def insert(self, table: str, data: dict) -> int: ...
 
     @abstractmethod
+    def batch_insert(self, table: str, rows: list[dict]) -> int:
+        """批量插入多行，返回插入行数；空列表直接返回0。"""
+
+    @abstractmethod
     def select(self, table: str, where: dict | None = None, limit: int | None = None) -> list[dict]: ...
 
     @abstractmethod
     def select_one(self, table: str, where: dict) -> dict | None: ...
+
+    @abstractmethod
+    def select_where(self, query: Any) -> list[dict]:
+        """按声明式 Query 对象查询，支持 EQ/NEQ/GT/GTE/LT/LTE/LIKE/IN/IS[NOT]_NULL。"""
+
+    @abstractmethod
+    def select_one_where(self, query: Any) -> dict | None:
+        """select_where 的单行版本，limit=1，无结果返回 None。"""
+
+    @abstractmethod
+    def count(self, table: str, where: dict | None = None) -> int:
+        """按等值条件统计行数，where=None 返回表总行数。"""
 
     @abstractmethod
     def update(self, table: str, data: dict, where: dict) -> int: ...
