@@ -204,7 +204,7 @@ fast_agents/
 │   ├── version.py                # 版本信息
 │   ├── llm/                      # ① LLM 客户端层
 │   │   ├── __init__.py
-│   │   ├── llm.py                #    LLM：invoke / stream_invoke
+│   │   ├── llm.py                #    LLM：invoke / stream_invoke / embed_query / embed_documents
 │   │   └── openai_client.py      #    对 OpenAI SDK 的封装
 │   ├── messages/                 # ② 消息系统
 │   │   ├── __init__.py
@@ -269,7 +269,7 @@ fast_agents/
 │   │   ├── offload.py            #    ContextOffloader：超长结果落盘 + 按需回读
 │   │   ├── compressor.py         #    ContextCompressor：三级压缩策略
 │   │   ├── builder.py            #    ContextBuilder：对 Agent 的门面
-│   │   └── tools.py              #    read_offloaded / write_file / edit_file / list_files
+│   │   └── tools.py              #    read_offloaded / list_files（文件读写编辑见 builtin/file_tool.py）
 │   └── utils/                    # ⑨ 通用工具（当前为空占位）
 ├── .skills/                      # 项目级技能目录（默认扫描位置）
 │   └── web-research/
@@ -280,7 +280,8 @@ fast_agents/
 ├── docs/                         # 模块编写说明 + 路线图
 ├── examples/
 │   ├── context/                  # context 示例（离线可跑，不需要 API Key）
-│   └── mcp/                      # MCP 示例（echo_server / quickstart / agent demo）
+│   ├── mcp/                      # MCP 示例（echo_server / quickstart / agent demo）
+│   └── tools/                    # 工具示例（file_tools_demo.py）
 ├── test/                         # 测试与示例脚本
 ├── pyproject.toml
 ├── requirements.txt
@@ -305,6 +306,8 @@ fast_agents/
 |------|------|------|
 | `invoke` | `(messages, tools=None, **kwargs) -> Message` | 一次性调用，返回 `Message`（可直接取 `tool_calls`） |
 | `stream_invoke` | `(messages, tools=None, **kwargs) -> str` | 流式调用，逐块产出文本 |
+| `embed_query` | `(text, **kwargs) -> list[float]` | 单条文本转向量（查询侧）；语义检索前置能力（I1） |
+| `embed_documents` | `(texts, **kwargs) -> list[list[float]]` | 批量文本转向量（文档侧），自动 2048 分片并发、按 `index` 对齐顺序 |
 
 ```python
 from fast_agents import LLM
@@ -442,7 +445,7 @@ registry.register_tool(QueryTool())
 | `handle_tool_error` | `bool` | `True` | 是否把异常转成 `ToolResult.fail` |
 | `tags` | `List[str]` | `[]` | 分类标签 |
 | `metadata` | `Dict` | `{}` | 自定义元数据 |
-| `return_direct` | `bool` | `False` | 为真时直接把结果作为最终答案 |
+| `return_direct` | `bool` | `False` | 为真时直接把结果作为最终答案（⚠️ **字段已定义，但主循环尚未接入，待办 A18**） |
 
 #### 方式四：裸函数直接注册
 
@@ -458,11 +461,11 @@ registry.register_tool(now)    # 自动包成 StructuredTool
 
 | 工具 | `name` | 参数 | 说明 |
 |------|--------|------|------|
-| `CalculatorTool` | `python_calculator` | `expression` | 数学表达式，支持 `+-*/` 和 `sqrt/sin/cos/tan/log/exp/abs/round/max/min`。**`^` 是按位异或** |
+| `CalculatorTool` | `python_calculator` | `expression` | 数学表达式：运算符 `+ - * / ** // %`（`^` 是按位异或、**不是幂**）；函数 `sqrt/sin/cos/tan/log/log2/log10/exp/abs/round/max/min/sum/ceil/floor`；常量 `pi` / `e` |
 | `TerminalTool` | `terminal` | `command` | 执行 Windows shell 命令（`dir` / `type` / `findstr` 等只读白名单，`allow_exec=True` 才放开代码执行） |
 | `SearchTool` | `web_search` | `query` / `max_results` | 联网搜索（provider 见 [配置](#配置)） |
 | `ReadTool` | `read_file` | `path` / `start_line` / `end_line` / `max_lines` / `use_cache` | 读工作目录内文本文件；返回 `size` / `mtime` / `content_hash` 作为乐观锁凭证 |
-| `WriteTool` | `write_file` | `path` / `content` / `overwrite` / `expected_hash` / `expected_size` / `expected_mtime` / `backup` | 原子写入 + 冲突检测（`expected_*` 不匹配即拒绝） |
+| `WriteTool` | `write_file` | `path` / `content` / `overwrite` / `append` / `expected_*` / `backup` | 原子写入 + 冲突检测（`expected_*` 不匹配即拒绝）；`append=True` 追加到文件末尾 |
 | `EditTool` | `edit_file` | `path` / `old_text` / `new_text` / `expected_*` / `backup` / `append_if_missing` | 精确替换，`old_text` 必须唯一；默认先备份 |
 | `MultiEditTool` | `multi_edit_file` | `path` / `edits` / `expected_*` / `backup` / `dry_run` | 批量替换，一处失败整批回滚；`dry_run=True` 只预检不落盘 |
 | `RememberTool` | `remember_memory` | `content` / `kind` / `importance` | 写长期记忆 |
@@ -494,6 +497,11 @@ registry.get_tools_description()              # 渲染成给 prompt 用的文本
 result = registry.invoke_tool("name", {"k": "v"})     # → ToolResult
 result = registry.invoke_tool("name", '{"k":"v"}')    # 也接受 JSON 字符串
 result = registry.invoke_tool("name", **kwargs)
+
+# 并发 / 审批 / 超时（A8 / A9 / A10）
+results = registry.invoke_tools_concurrent([("t1", {...}), ("t2", {...})])  # 无依赖工具线程池并发
+registry.set_approval_callback(lambda name, args: (True, args, ""))        # 人工审批回调：(放行?, 参数, 原因)
+registry.default_timeout = 300                                              # 单工具超时熔断（秒）
 
 registry.to_openai_tools()                    # OpenAI function schema
 registry.to_anthropic_tools()                 # Anthropic 格式
@@ -640,6 +648,9 @@ store.clear()
 
 store.revise(memory_id, "新内容", source="user_stated")   # 修订（旧的转 superseded，历史保留）
 store.retract(memory_id)                                  # 软删（幂等）
+store.touch(memory_ids)                                   # B5：命中记账（不刷 updated_at）
+store.archive_stale(max_importance=0.3, stale_days=90)    # B5：衰减归档
+store.merge_similar(threshold=0.85)                       # B5：相似合并
 store.close()
 ```
 
@@ -1118,11 +1129,11 @@ python test\test_mcp.py
 
 | 测试文件 | 状态 | 说明 |
 |---------|------|------|
-| `test/test_react_agent.py` | ✅ 全过 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支 |
+| `test/test_react_agent.py` | ✅ 16/16 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
 | `test/test_tools.py` | ✅ 14/14 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表；`test_terminal` 在非 Windows 上自动跳过 |
-| `test/test_memory.py` | ✅ 全过 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具三件套、作用域隔离 |
+| `test/test_memory.py` | ✅ 23/23 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并 |
 | `test/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
-| `test/test_context.py` | ✅ 16/16 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端 |
+| `test/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
 | `test/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
 
 `test/demo.py` / `test/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
@@ -1140,7 +1151,7 @@ python test\test_mcp.py
 | LLM 接入 | 只做 OpenAI 格式 | 覆盖 90% 场景；换 provider 只改 `base_url` |
 | 工具参数 | pydantic `args_schema` | 校验 + schema 生成一体；`@tool` 场景才退回签名内省 |
 | 工具返回值 | 统一 `ToolResult` | 让模型能区分「成功 / 失败 / 被截断」，从而决定是否重试 |
-| 记忆检索 | 词法 + 重要性 + 时间衰减 | 先跑通闭环；`search()` 接口已留好，将来可换 embedding |
+| 记忆检索 | 词法 + 重要性 + 时间衰减，可选语义混合（B2） | 默认纯词法即闭环；`SemanticMemoryStore` 包装器按需开启，相关度 `0.7×语义 + 0.3×词法`，换后端不动上层 |
 | 记忆作用域 | `user_id` + `session_id` + `scope` | 显式隔离，架构上杜绝串记忆 |
 | 记忆写入 | 修订保留历史（supersede） | 审计友好，历史可追溯 |
 | 记忆注入位置 | 长期记忆随本轮 user 输入 | 防注入（不进 system）+ 缓存友好 |
@@ -1163,14 +1174,14 @@ python test\test_mcp.py
 | 模块 | 状态 | 下一步重点 |
 |------|------|-----------|
 | 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A20 计算器 AST 迁移） | **P0：A15 补 A8/A9/A10 测试护栏（并发 / 审批 / 超时 / `append` / `duration_ms` 当前零覆盖）**；**P1**：A16 并发与超时语义加固、A17 装饰器透出 `metadata`、A18 `return_direct` 落地、RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：异步 `arun`、跨平台 Shell、`ToolRegistry` 清理、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
-| 🧩 **skill** | ✅ 已实现 | 技能市场 / 技能依赖 / 技能版本管理、脚本沙箱、默认扫描路径统一 |
-| 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输、`resources` / `prompts`、图片透传、stderr 消费 |
-| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地 |
+| 🧩 **skill** | ✅ 已实现 | 脚本沙箱（C6）、默认扫描路径统一（C7）、技能依赖 / 版本管理（C8）、技能市场（C9）、`allowed_tools` 生效（C10） |
+| 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输（D6）、`resources` / `prompts`（D7）、图片透传（D8）、断线自动重连（D9）、stderr 消费（D10） |
+| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；下一阶段「**记忆 v2**」：B8 时间统一 UTC、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
 | 🪟 **context** | ✅ 已实现（v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、embedding 召回扩展位 |
 | 🛠 **infra** | ⏳ 规划中 | `TraceLogger`、评估工具、异步、打包发布 |
 
-**当前 P0 重点**：工具模块测试护栏（A15，回补 A8/A9/A10 的并发 / 审批 / 超时能力用例）。**当前 P1 重点**：并发 / 超时语义加固（A16）、RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）——除新回补的 A15 外，原 P0 已全部清零。
+**当前 P0 重点**：工具模块测试护栏（A15，回补 A8/A9/A10 的并发 / 审批 / 超时能力用例）。**当前 P1 重点**：并发 / 超时语义加固（A16）、RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）——除新回补的 A15 外，原 P0 已全部清零。记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8–B13）。
 
 ---
 

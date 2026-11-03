@@ -1,0 +1,89 @@
+"""数据库客户端抽象基类。
+
+统一约定所有后端（SQLite / MySQL / Postgres / ...）必须实现的最小接口集：
+- 连接管理：connect / close
+- DDL（建/删/检查表）：create_table / ensure_table / ensure_schema / table_exists / drop_table
+- DML（增删改查）：insert / select / select_one / update / delete
+- 事务：__enter__ / __exit__（with 语句）
+
+所有参数都用「原生 Python 类型 + schema.py 里的声明式模型」表达，
+上层（memory / logs / trace 等）只依赖这个抽象，不直接 import sqlite3。
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Any
+
+from .schema import Schema
+
+
+class DatabaseClientBase(ABC):
+    """数据库客户端抽象基类。子类必须实现下面所有方法。"""
+
+    # ---------- 连接 ----------
+    @abstractmethod
+    def connect(self) -> None: ...
+
+    @abstractmethod
+    def close(self) -> None: ...
+
+    # ---------- DDL：建表 / 删表 / 查表 ----------
+    @abstractmethod
+    def table_exists(self, table: str) -> bool:
+        """判断表是否已存在。"""
+
+    @abstractmethod
+    def create_table(
+        self,
+        table: str,
+        columns: dict[str, str] | list[Any] | Schema,
+        if_not_exists: bool = True,
+    ) -> None:
+        """建表。
+
+        Args:
+            table: 表名。
+            columns: 列定义，支持三种形式，按方便程度任选：
+                1. ``{列名: SQL类型字符串}`` —— 最简，例如 ``{"id": "INTEGER PRIMARY KEY", "name": "TEXT NOT NULL"}``；
+                2. ``list[Column]`` —— 使用 ``schema.Column`` 声明式定义，自动处理 NOT NULL / DEFAULT / UNIQUE；
+                3. ``Schema`` 对象 —— 一次性声明列 + 索引（推荐工程化使用）。
+            if_not_exists: 是否加上 ``IF NOT EXISTS``（默认 True，幂等）。
+        """
+
+    @abstractmethod
+    def ensure_table(self, table: str, columns: dict[str, str] | list[Any] | Schema) -> None:
+        """幂等建表（等价于 ``create_table(..., if_not_exists=True)``）。
+
+        语义：表存在就跳过、不存在就创建；**不会**修改已有表结构。
+        如果需要「缺列就补列」的迁移，请显式调用 ``ensure_schema``（支持 ALTER 迁移的后端）。
+        """
+
+    @abstractmethod
+    def ensure_schema(self, schema: Schema, migrate: bool = False) -> None:
+        """按 ``Schema`` 对象幂等建表 + 建索引。
+
+        Args:
+            schema: ``schema.Schema`` 声明式模型，含 table_name / columns / indexes。
+            migrate: 为 True 时尝试补列（仅 SQLite 支持 ADD COLUMN，已存在的列自动跳过）；
+                     默认 False，只建表 + 建索引，不改动已有表结构（最安全）。
+        """
+
+    @abstractmethod
+    def drop_table(self, table: str, if_exists: bool = True) -> None:
+        """删表。"""
+
+    # ---------- DML：CRUD ----------
+    @abstractmethod
+    def insert(self, table: str, data: dict) -> int: ...
+
+    @abstractmethod
+    def select(self, table: str, where: dict | None = None, limit: int | None = None) -> list[dict]: ...
+
+    @abstractmethod
+    def select_one(self, table: str, where: dict) -> dict | None: ...
+
+    @abstractmethod
+    def update(self, table: str, data: dict, where: dict) -> int: ...
+
+    @abstractmethod
+    def delete(self, table: str, where: dict) -> int: ...

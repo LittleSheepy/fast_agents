@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from fast_agents.memory import (
     BufferMemory,
+    ChromaMemoryStore,
     InMemoryProfileStore,
     InMemoryStore,
     MemoryManager,
@@ -642,6 +643,107 @@ def test_manager_compact_and_retrieve_touch():
     print("✅ test_manager_compact_and_retrieve_touch 通过（B5 维护入口）")
 
 
+# ===================== ChromaMemoryStore 阶段 1 测试 =====================
+# 阶段 1：不引 chromadb、不传真实客户端，验证 ①纯词法降级②代理记账③Manager 集成。
+
+class _FakeLLMNoEmbedding:
+    """假 LLM：embedding 永远失败，逼 ChromaMemoryStore 走纯词法降级"""
+    embedding_model = "fake-none"
+
+    def embed_query(self, q):           return None
+    def embed_documents(self, texts):   return None
+
+
+
+
+# ===================== ChromaMemoryStore 阶段 1 测试 =====================
+# 阶段 1：不引 chromadb、不传真实客户端，验证 ①纯词法降级②代理记账③Manager 集成。
+
+class _FakeLLMNoEmbedding:
+    """假 LLM：embedding 永远失败，逼 ChromaMemoryStore 走纯词法降级"""
+    embedding_model = "fake-none"
+
+    def embed_query(self, q):           return None
+    def embed_documents(self, texts):   return None
+
+
+def test_chroma_store_pure_lexical_degrade():
+    """chroma_client=None + 假 LLM（embedding 失败）→ 仍可正常 CRUD + 检索，不抛异常"""
+    with tempfile.TemporaryDirectory() as d:
+        inner = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1")
+        store = ChromaMemoryStore(inner, _FakeLLMNoEmbedding())  # chroma_client=None
+
+        r1 = store.add(MemoryRecord(content="Python 是解释型语言", kind="fact", importance=0.7))
+        r2 = store.add(MemoryRecord(content="Java 是编译型语言", kind="fact", importance=0.6))
+        assert store.get(r1.memory_id) is not None
+        assert store.get(r2.memory_id) is not None
+
+        # search 纯词法可召回（含 query 关键字的那条）
+        hits = store.search("Python", limit=2)
+        assert any(h.memory_id == r1.memory_id for h in hits), "纯词法降级应能召回含关键词的记忆"
+
+        # delete/clear 不抛异常
+        assert store.delete(r1.memory_id) is True
+        assert store.get(r1.memory_id) is None
+        store.clear()
+        assert store.all() == []
+        store.close()
+        inner.close()
+    print("✅ test_chroma_store_pure_lexical_degrade 通过（Chroma 纯词法降级 CRUD/search）")
+
+
+def test_chroma_store_b5_proxy_methods():
+    """B5 的 touch / revise / retract / archive_stale / merge_similar 都能正确代理 inner"""
+    with tempfile.TemporaryDirectory() as d:
+        inner = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1")
+        store = ChromaMemoryStore(inner, _FakeLLMNoEmbedding())
+        r = store.add(MemoryRecord(content="我喜欢吃苹果", kind="preference", importance=0.9))
+
+        # touch 能记账（不抛、不刷 updated_at）
+        assert store.touch([r.memory_id]) == 1
+        assert store.get(r.memory_id).access_count == 1
+
+        # revise 能修订（content 改了、向量重算降级不抛）
+        revised = store.revise(r.memory_id, "我喜欢吃香蕉", source="test")
+        assert revised is not None and revised.content == "我喜欢吃香蕉"
+
+        # archive_stale 正常代理（新写入的记忆不会被归档）
+        archived = store.archive_stale(stale_days=90, max_importance=0.3)
+        assert isinstance(archived, list) and len(archived) == 0
+
+        # merge_similar 正常代理（批量向量拿不到就降级纯词法，不抛）
+        merged = store.merge_similar(threshold=0.99)
+        assert isinstance(merged, list)
+
+        # retract 能撤回（同步不抛）——撤回后 active 列表里不应再出现该条
+        retracted = store.retract(r.memory_id)
+        assert retracted is not None
+        assert retracted.status in ("archived", "superseded", "retracted")
+        active_ids = {x.memory_id for x in store.all(include_inactive=False)}
+        assert r.memory_id not in active_ids
+        store.close()
+        inner.close()
+    print("✅ test_chroma_store_b5_proxy_methods 通过（B5 方法代理 + 降级不抛）")
+
+
+def test_chroma_store_with_manager_integration():
+    """ChromaMemoryStore 能直接插进 MemoryManager，retrieve/record/render_context 不抛"""
+    with tempfile.TemporaryDirectory() as d:
+        inner = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1")
+        store = ChromaMemoryStore(inner, _FakeLLMNoEmbedding())
+        mgr = MemoryManager(llm=_FakeLLMNoEmbedding(), long_term_store=store)
+        # record 时 auto_extract 会调 embed_documents → None 降级，不抛
+        mgr.record("我叫小明", "你好小明")
+        hits = mgr.retrieve("你叫什么")
+        assert isinstance(hits, list)
+        rendered = mgr.render_context("你叫什么")
+        assert isinstance(rendered, str)
+        mgr.close()
+        store.close()
+        inner.close()
+    print("✅ test_chroma_store_with_manager_integration 通过（Manager 接入零感知）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -666,4 +768,7 @@ if __name__ == "__main__":
     test_archive_stale()
     test_merge_similar_semantic()
     test_manager_compact_and_retrieve_touch()
+    test_chroma_store_pure_lexical_degrade()
+    test_chroma_store_b5_proxy_methods()
+    test_chroma_store_with_manager_integration()
     print("\n🎉 全部测试通过")
