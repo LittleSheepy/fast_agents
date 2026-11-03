@@ -11,6 +11,7 @@ from .scoring import (
     merge_similarity, rank_records, score_record, time_decay,
 )
 from .semantic_store import SemanticMemoryStore
+from .chroma_store import ChromaMemoryStore
 from .session_store import InMemorySessionStore, SessionStore, SQLiteSessionStore
 from .sqlite_store import SQLiteMemoryStore
 
@@ -18,7 +19,7 @@ __all__ = [
     "MemoryRecord", "MemoryKind", "MemoryStatus", "ContextPacket",
     "UserProfile", "ProfileStore", "SQLiteProfileStore", "InMemoryProfileStore",
     "MemoryStoreBase", "InMemoryStore", "SQLiteMemoryStore",
-    "SemanticMemoryStore",
+    "SemanticMemoryStore", "ChromaMemoryStore",
     "SessionStore", "SQLiteSessionStore", "InMemorySessionStore",
     "BufferMemory", "MemoryManager",
     "lexical_terms", "lexical_score", "time_decay", "combined_score",
