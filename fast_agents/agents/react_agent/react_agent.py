@@ -48,6 +48,7 @@ from ...tools.structured_tool import StructuredTool
 from ...tools.tool_base import ToolBase
 from ...tools.tool_registry import ToolRegistry
 from ...tools.tool_result import ToolStatus
+from ...trace import TraceLogger  # G1 tracer（可选依赖，默认 None 不引入任何开销）
 
 # 默认技能扫描目录：包根目录 fast_agents/.skills 与项目根目录 .skills
 # （react_agent.py 位于 fast_agents/agents/react_agent/，parents[2] 为包根，parents[3] 为项目根）
@@ -136,6 +137,7 @@ class ReActAgent(AgentBase):
         enable_context: bool = False,
         context_budget: Optional[int] = None,
         context_offload_threshold: int = 4_000,
+        tracer: Optional["TraceLogger"] = None,
     ):
         """
         初始化ReActAgent
@@ -167,6 +169,11 @@ class ReActAgent(AgentBase):
                 超长工具结果自动卸载到磁盘（默认 False，保持既有行为不变）
             context_budget: 上下文 token 预算（可选，覆盖 ctx 自带的预算）
             context_offload_threshold: 触发工具结果卸载的字符数阈值
+            tracer: G1 全链路记录器（可选）：
+                - 传 ``TraceLogger`` 实例时，自动把 tool_hook 挂到 tool_registry、
+                  并给 llm 打 llm.invoke 点（若 llm.tracer 尚未设置）；
+                  run() 会额外生成 ``agent.run`` / ``decision.step`` 两类 Span；
+                - 默认 None，行为与改动前逐字节一致、零开销。
         """
         super().__init__(name, llm, system_prompt)
         self.tool_registry = tool_registry or ToolRegistry()
@@ -208,6 +215,21 @@ class ReActAgent(AgentBase):
             self._init_context(ctx, context_budget, context_offload_threshold)
         else:
             self.ctx: Optional["ContextBuilder"] = ctx
+
+        # G1: tracer（可选，默认 None 无任何开销；显式传入时挂 LLM 打点 + 工具钩子）
+        self.tracer: Optional[TraceLogger] = tracer
+        if tracer is not None:
+            # 给 llm 打上 tracer（若用户没手动设 llm.tracer 才设，避免覆盖用户定制）
+            if getattr(self.llm, "tracer", None) is None:
+                try:
+                    self.llm.tracer = tracer
+                except Exception:
+                    pass
+            # 工具打点优先走 ToolRegistry.add_hook（不修改注册表逻辑）
+            try:
+                tracer.attach_to_tool_registry(self.tool_registry)
+            except Exception:
+                pass
 
         # 注册退出时自动 close（防子进程僵尸）
         atexit.register(self._safe_close)
@@ -582,7 +604,7 @@ class ReActAgent(AgentBase):
 
         Args:
             input_text: 用户问题
-            **kwargs: 其他参数
+            **kwargs: 其他参数（会透传给 llm.invoke）
 
         Returns:
             最终答案
@@ -591,85 +613,138 @@ class ReActAgent(AgentBase):
 
         print(f"\n🤖 {self.name} 开始处理问题: {input_text}")
 
-        if self.enable_memory and self.memory:
-            # 每次 run 重建工作区（system + buffer 历史），保证历史只注入一次
-            self._seed_workspace()
-        # else: 关闭记忆时保持原有行为：不清空 messages，允许跨 run 累积
+        # G1: tracer 存在时开启一条 agent trace，用 agent span 包裹整次 run
+        _tracer: Optional["TraceLogger"] = getattr(self, "tracer", None)
+        _agent_span = None
+        if _tracer is not None:
+            from ...trace import SpanKind
+            _tracer.start_trace(name=f"agent.{self.name}.run")
+            _agent_span = _tracer.start_span(
+                name=f"agent.run",
+                kind=SpanKind.AGENT,
+                input={"user_input": input_text[:500], "agent": self.name, "max_steps": self.max_steps},
+                metadata={"agent": self.name},
+            )
 
-        # 本轮只检索一次长期记忆，拼进本轮用户输入
-        memory_text = self._retrieve_long_term_memory(input_text)
-        if memory_text:
-            print(f"🧠 已注入长期记忆:\n{memory_text}")
-        user_input = self._merge_memory(input_text, memory_text)
-
-        # 开启 context 时，用「按 token 预算分层拼装」的方式重建工作区，
-        # 覆盖上面的简单 seed —— 此时长期记忆由 memory 层统一承载，不再重复拼进 user；
-        # 用户画像也走这条路径（system_tail → L1 system 末尾）
-        if self.enable_context and self.ctx is not None:
-            self._fit_context(input_text)
-            user_input = input_text
-        else:
-            # 关闭 context 的路径：把画像追加到工作区 system 消息末尾；
-            # 打开 context 时 _fit_context 已经处理过，这里不重复追加
-            self._inject_profile_to_workspace()
-
-        final_answer: Optional[str] = None
         try:
-            while current_step < self.max_steps:
-                current_step += 1
-                print(f"\n--- 第 {current_step} 步 ---")
+            if self.enable_memory and self.memory:
+                # 每次 run 重建工作区（system + buffer 历史），保证历史只注入一次
+                self._seed_workspace()
+            # else: 关闭记忆时保持原有行为：不清空 messages，允许跨 run 累积
 
-                tools = self.tool_registry.to_openai_tools()
+            # 本轮只检索一次长期记忆，拼进本轮用户输入
+            memory_text = self._retrieve_long_term_memory(input_text)
+            if memory_text:
+                print(f"🧠 已注入长期记忆:\n{memory_text}")
+            user_input = self._merge_memory(input_text, memory_text)
 
-                # 系统提示词已在构造/seed 时就位，这里只追加本轮用户输入（仅第 1 步追加）
-                # 开启 context 时，本轮用户输入已由 _fit_context 放进 user 层，无需重复追加
-                if current_step == 1 and not (self.enable_context and self.ctx is not None):
-                    self.messages.append_user(user_input)
-                messages = self.messages.to_openai_messages()
-                response: Message = self.llm.invoke(messages, tools=tools, **kwargs)
-                self.messages.append(response)
-
-                # 判断是否执行工具
-                if response.tool_calls:
-                    for tool_call in response.tool_calls:
-                        # 统一通过 invoke_tool 获取 ToolResult（含参数校验 / 错误捕获 / 截断）
-                        result = self.tool_registry.invoke_tool(
-                            tool_call.name, tool_call.arguments,
-                        )
-                        # 给不同 status 加上显式前缀，帮助模型理解结果性质
-                        observation = _render_observation(result)
-                        # 超长结果先卸载到磁盘：上下文里只留引用，模型可按需 read_offloaded 回读
-                        observation = self._offload_observation(tool_call.name, observation)
-                        # 通知技能中间件：捕获 load_skill 事件，记录已加载技能
-                        if self.skill_middleware is not None:
-                            observation = self.skill_middleware.after_tool_call(
-                                tool_call.name, tool_call.arguments or {}, observation,
-                            )
-                        tool_msg = Message("tool", observation)
-                        # OpenAI 要求 tool 消息带 tool_call_id；通过 metadata 挂载，
-                        # to_openai_message 里会用到
-                        tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
-                        self.messages.append(tool_msg)
-                    # 本轮可能有新加载的技能，同步到 system 提示词（Level 2 详情）
-                    if self.skill_middleware is not None:
-                        self.refresh_system_prompt()
-                    continue
-                else:
-                    final_answer = response.content
-                    break
-        finally:
-            # 每轮结束通知技能中间件（unload_after_turn 开启时会自动卸载已加载技能）
-            if self.skill_middleware is not None:
-                self.skill_middleware.after_agent_turn()
-            # 不管成功还是超步，都把这一轮沉淀回记忆
-            if final_answer is not None:
-                self._remember(input_text, final_answer)
+            # 开启 context 时，用「按 token 预算分层拼装」的方式重建工作区，
+            # 覆盖上面的简单 seed —— 此时长期记忆由 memory 层统一承载，不再重复拼进 user；
+            # 用户画像也走这条路径（system_tail → L1 system 末尾）
+            if self.enable_context and self.ctx is not None:
+                self._fit_context(input_text)
+                user_input = input_text
             else:
-                final_answer = "抱歉，我无法在限定步数内完成这个任务。"
-                self._remember(input_text, final_answer)
+                # 关闭 context 的路径：把画像追加到工作区 system 消息末尾；
+                # 打开 context 时 _fit_context 已经处理过，这里不重复追加
+                self._inject_profile_to_workspace()
 
-        print(f"🎉 最终答案: {final_answer}")
-        return final_answer
+            final_answer: Optional[str] = None
+            try:
+                while current_step < self.max_steps:
+                    current_step += 1
+                    print(f"\n--- 第 {current_step} 步 ---")
+
+                    # G1: 每步包一个 decision Span
+                    _dec_span = None
+                    if _tracer is not None:
+                        from ...trace import SpanKind
+                        _dec_span = _tracer.start_span(
+                            name=f"decision.step{current_step}",
+                            kind=SpanKind.DECISION,
+                            input={"step": current_step, "user_input_for_step": user_input if current_step == 1 else None},
+                            metadata={"step": current_step, "agent": self.name},
+                        )
+
+                    try:
+                        tools = self.tool_registry.to_openai_tools()
+
+                        # 系统提示词已在构造/seed 时就位，这里只追加本轮用户输入（仅第 1 步追加）
+                        # 开启 context 时，本轮用户输入已由 _fit_context 放进 user 层，无需重复追加
+                        if current_step == 1 and not (self.enable_context and self.ctx is not None):
+                            self.messages.append_user(user_input)
+                        messages = self.messages.to_openai_messages()
+                        response: Message = self.llm.invoke(messages, tools=tools, **kwargs)
+                        self.messages.append(response)
+
+                        # 判断是否执行工具
+                        if response.tool_calls:
+                            tool_names = [tc.name for tc in response.tool_calls]
+                            for tool_call in response.tool_calls:
+                                # 统一通过 invoke_tool 获取 ToolResult（含参数校验 / 错误捕获 / 截断）
+                                result = self.tool_registry.invoke_tool(
+                                    tool_call.name, tool_call.arguments,
+                                )
+                                # 给不同 status 加上显式前缀，帮助模型理解结果性质
+                                observation = _render_observation(result)
+                                # 超长结果先卸载到磁盘：上下文里只留引用，模型可按需 read_offloaded 回读
+                                observation = self._offload_observation(tool_call.name, observation)
+                                # 通知技能中间件：捕获 load_skill 事件，记录已加载技能
+                                if self.skill_middleware is not None:
+                                    observation = self.skill_middleware.after_tool_call(
+                                        tool_call.name, tool_call.arguments or {}, observation,
+                                    )
+                                tool_msg = Message("tool", observation)
+                                # OpenAI 要求 tool 消息带 tool_call_id；通过 metadata 挂载，
+                                # to_openai_message 里会用到
+                                tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
+                                self.messages.append(tool_msg)
+                            # 本轮可能有新加载的技能，同步到 system 提示词（Level 2 详情）
+                            if self.skill_middleware is not None:
+                                self.refresh_system_prompt()
+                            if _dec_span is not None:
+                                _tracer.end_span(
+                                    _dec_span,
+                                    output={"action": "tool_calls", "tool_names": tool_names},
+                                )
+                            continue
+                        else:
+                            final_answer = response.content
+                            if _dec_span is not None:
+                                _tracer.end_span(
+                                    _dec_span,
+                                    output={"action": "final", "length": len(final_answer) if final_answer else 0},
+                                )
+                            break
+                    except Exception as step_err:
+                        if _dec_span is not None:
+                            _tracer.end_span(_dec_span, output=None, error=f"{type(step_err).__name__}: {step_err}")
+                        raise
+            finally:
+                # 每轮结束通知技能中间件（unload_after_turn 开启时会自动卸载已加载技能）
+                if self.skill_middleware is not None:
+                    self.skill_middleware.after_agent_turn()
+                # 不管成功还是超步，都把这一轮沉淀回记忆
+                if final_answer is not None:
+                    self._remember(input_text, final_answer)
+                else:
+                    final_answer = "抱歉，我无法在限定步数内完成这个任务。"
+                    self._remember(input_text, final_answer)
+
+            print(f"🎉 最终答案: {final_answer}")
+            if _agent_span is not None and _tracer is not None:
+                _tracer.end_span(
+                    _agent_span,
+                    output={"final_answer_preview": (final_answer[:300] if final_answer else None), "steps": current_step},
+                )
+            return final_answer
+        except Exception as run_err:
+            if _agent_span is not None and _tracer is not None:
+                _tracer.end_span(_agent_span, output=None, error=f"{type(run_err).__name__}: {run_err}")
+            raise
+        finally:
+            if _tracer is not None:
+                _tracer.end_trace()
 
 
 def _render_observation(result) -> str:
