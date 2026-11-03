@@ -16,13 +16,12 @@
 """
 
 import json
-import sqlite3
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Optional
 
+from ..database import SQLiteClient
 from .schema import UserProfile
 
 # 允许直接写到 UserProfile 顶层的字段白名单
@@ -95,7 +94,7 @@ class ProfileStore(ABC):
 
 
 class SQLiteProfileStore(ProfileStore):
-    """SQLite 版画像存储：零依赖、单独一张表
+    """SQLite 版画像存储：零依赖、单独一张表，底层复用 `SQLiteClient`
 
     表结构：
         user_profiles(user_id TEXT PRIMARY KEY,
@@ -113,27 +112,15 @@ class SQLiteProfileStore(ProfileStore):
             raise ValueError("ProfileStore 要做持久化，请传文件路径；临时画像请用 InMemoryProfileStore")
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS user_profiles (
-                    user_id     TEXT PRIMARY KEY,
-                    profile     TEXT NOT NULL,
-                    source      TEXT NOT NULL,
-                    updated_at  TEXT NOT NULL
-                );
-                """
-            )
-
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(str(self.path))
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
+        # 复用 database 模块统一的 SQLiteClient：自动 WAL / 外键 / 参数化 / 标识符校验
+        self._db = SQLiteClient(str(self.path))
+        # 幂等建表，表结构与原手写 CREATE TABLE 完全一致，已有数据无缝兼容
+        self._db.ensure_table("user_profiles", {
+            "user_id":    "TEXT PRIMARY KEY",
+            "profile":    "TEXT NOT NULL",
+            "source":     "TEXT NOT NULL",
+            "updated_at": "TEXT NOT NULL",
+        })
 
     @staticmethod
     def _validate_user_id(user_id: str) -> None:
@@ -142,11 +129,7 @@ class SQLiteProfileStore(ProfileStore):
 
     def get(self, user_id: str) -> UserProfile:
         self._validate_user_id(user_id)
-        with self._connect() as db:
-            row = db.execute(
-                "SELECT profile FROM user_profiles WHERE user_id=?",
-                (user_id,),
-            ).fetchone()
+        row = self._db.select_one("user_profiles", {"user_id": user_id})
         if row is None:
             return UserProfile(user_id=user_id)
         try:
@@ -163,20 +146,21 @@ class SQLiteProfileStore(ProfileStore):
         profile = self.get(user_id)
         profile.merge_patch(patch or {})
         profile.updated_at = datetime.now()
-        with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO user_profiles(user_id, profile, source, updated_at)"
-                " VALUES(?,?,?,?)",
-                (
-                    user_id,
-                    json.dumps(profile.to_dict(), ensure_ascii=False),
-                    source,
-                    profile.updated_at.isoformat(),
-                ),
-            )
+        # 保留原 INSERT OR REPLACE 语义，行为和原实现完全一致
+        self._db.execute(
+            "INSERT OR REPLACE INTO user_profiles(user_id, profile, source, updated_at)"
+            " VALUES(?,?,?,?)",
+            (
+                user_id,
+                json.dumps(profile.to_dict(), ensure_ascii=False),
+                source,
+                profile.updated_at.isoformat(),
+            ),
+        )
         return profile
 
     def close(self) -> None:
+        self._db.close()
         return None
 
 
