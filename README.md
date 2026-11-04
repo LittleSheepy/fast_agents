@@ -67,11 +67,11 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 💬 **消息系统** | `Message` / `Messages` 双层结构，原生支持 function calling（`tool_calls` / `tool_call_id`），可一键转 OpenAI 格式 |
 | 🔧 **工具系统** | `ToolBase` 抽象基类 + `StructuredTool` / `@tool` 装饰器 + `ToolRegistry` 注册表，四种定义方式，schema 自动生成 |
 | 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关 |
-| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5），支持 Agent 主动读写 |
+| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5）+ **统一北京时间 CST（UTC+8）时间基准**（B8），支持 Agent 主动读写 |
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
-| 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，默认 JSONL 一行一条落盘，支持内存模式与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时（v1.0.1） |
+| 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，默认 JSONL 一行一条落盘，支持内存模式与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时（v1.0.1）；状态栈改为实例级 ContextVar，多 tracer 不串扰、async 协程天然隔离（v1.0.2）|
 | 📦 **零重型依赖** | 记忆模块只用标准库（`sqlite3` / `json` / `pathlib`）；MCP 模块不用官方 SDK，只用标准库 + 可选 `requests`；Trace 模块零新增依赖（标准库 + pydantic） |
 
 ---
@@ -230,6 +230,7 @@ fast_agents/
 │   │       └── mcp_tool.py           # list_mcp_servers / connect_mcp_server / disconnect_mcp_server
 │   ├── memory/                   # ④ 记忆系统
 │   │   ├── __init__.py
+│   │   │                          # （时间基准统一在 fast_agents/utils/time_utils.py，B8 起本模块不再自维护时钟）
 │   │   ├── schema.py             #    MemoryRecord / ContextPacket / MemoryKind / UserProfile
 │   │   ├── memory_store_base.py               #    MemoryStoreBase 抽象接口
 │   │   ├── scoring.py            #    词法打分 + 时间衰减
@@ -680,7 +681,7 @@ store.close()
 | `kind` | `preference` / `fact` / `episode` / `procedure` / `inference` |
 | `status` | `active` / `superseded` / `retracted` / **`archived`**（B5：低重要度+久未命中，自动归档） |
 | `importance` | 0~1 |
-| `created_at` / `updated_at` | 时间（`updated_at` 仅在内容变化时刷新，命中记账不刷它） |
+| `created_at` / `updated_at` | 时间（**B8 起为带时区的北京时间 CST（+08:00）**；`updated_at` 仅在内容变化时刷新，命中记账不刷它） |
 | `supersedes` | 被本条取代的旧记忆 id（修订链 / 合并目标） |
 | `access_count` | **B5 新增**：累计被 `retrieve()` 命中的次数（由 `touch()` 维护） |
 | `last_accessed_at` | **B5 新增**：最近一次被命中的时间（归档以"距该时间的天数"判断久未命中，None 时退用 `updated_at`） |
@@ -771,6 +772,12 @@ for t in build_memory_tools(memory, include_profile=True):   # 多一个 update_
 # 空闲时跑一次即可
 report = memory.compact()          # {"archived": 3, "merged": 2}
 ```
+
+**时间基准（B8）**：
+
+- 全项目时间戳统一为 **北京时间 CST（UTC+8，固定偏移、无夏令时）**：写入走 `time_utils.cstnow()`（aware CST），落库是带 `+08:00` 的 ISO 串，读取一律 `to_cst()` 归一化；
+- `time_decay` / `archive_stale` 的「久未命中」判定与各排序键都先归一化再比较，跨机器部署不再让时间衰减与归档判定漂移；
+- **naive 按 CST 兼容**：`to_cst()` 对 naive datetime 按 CST 解读（`replace(tzinfo=CST)`），用于兼容升级前按本地时间写入的历史数据，升级零偏移；新代码一律用 `cstnow()` 生成时间，不再产生新的模糊时间。详见 `docs/记忆模块编写说明.md` §7.11 / §10.10。
 
 ---
 
@@ -993,6 +1000,7 @@ agent = ReActAgent(
 | 回放 | `tracer.replay(trace_id)` | 返回按时间排序、字段稳定的可打印 dict 列表 |
 | token 元数据 | LLM span 的 `metadata` | **v1.0.1**：invoke/embed 记录 `model` + `usage`/`prompt_tokens`/`completion_tokens`/`total_tokens`（成本分析用） |
 | tool 耗时 | tool span 的 `duration_ms` | **v1.0.1**：取 `ToolResult.metadata["duration_ms"]` 实测值并回推 start_time |
+| 状态隔离 | `TraceLogger` 实例 | **v1.0.2**：改为每个实例自持一对 ContextVar，多 tracer 同时使用不串扰父链；天然支持 asyncio 多协程并发隔离（为 G2 异步铺路）|
 
 ```python
 from fast_agents import LLM, ReActAgent, ToolRegistry, TraceLogger
@@ -1221,12 +1229,12 @@ python test\test_mcp.py
 | 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A20 计算器 AST 迁移） | **P0：A15 补 A8/A9/A10 测试护栏（并发 / 审批 / 超时 / `append` / `duration_ms` 当前零覆盖）**；**P1**：A16 并发与超时语义加固、A17 装饰器透出 `metadata`、A18 `return_direct` 落地、RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：异步 `arun`、跨平台 Shell、`ToolRegistry` 清理、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
 | 🧩 **skill** | ✅ 已实现 | 脚本沙箱（C6）、默认扫描路径统一（C7）、技能依赖 / 版本管理（C8）、技能市场（C9）、`allowed_tools` 生效（C10） |
 | 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输（D6）、`resources` / `prompts`（D7）、图片透传（D8）、断线自动重连（D9）、stderr 消费（D10） |
-| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；下一阶段「**记忆 v2**」：B8 时间统一 UTC、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解 |
+| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；下一阶段「**记忆 v2**」：B8 时间统一为北京时间 CST 已落地、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
 | 🪟 **context** | ✅ 已实现（v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、embedding 召回扩展位 |
 | 🛠 **infra** | ⏳ 规划中 | `TraceLogger`、评估工具、异步、打包发布 |
 
-**当前 P0 重点**：工具模块测试护栏（A15，回补 A8/A9/A10 的并发 / 审批 / 超时能力用例）。**当前 P1 重点**：并发 / 超时语义加固（A16）、RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）——除新回补的 A15 外，原 P0 已全部清零。记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8–B13）。
+**当前 P0 重点**：工具模块测试护栏（A15，回补 A8/A9/A10 的并发 / 审批 / 超时能力用例）。**当前 P1 重点**：并发 / 超时语义加固（A16）、RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）——除新回补的 A15 外，原 P0 已全部清零。记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8 已落地，B9–B13 待推进）。
 
 ---
 

@@ -17,11 +17,11 @@
 
 import json
 from abc import ABC, abstractmethod
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..database import SQLiteClient
+from fast_agents.utils.time_utils import cstnow
 from .schema import UserProfile
 
 # 允许直接写到 UserProfile 顶层的字段白名单
@@ -145,7 +145,7 @@ class SQLiteProfileStore(ProfileStore):
         self._validate_user_id(user_id)
         profile = self.get(user_id)
         profile.merge_patch(patch or {})
-        profile.updated_at = datetime.now()
+        profile.updated_at = cstnow()
         # 保留原 INSERT OR REPLACE 语义，行为和原实现完全一致
         self._db.execute(
             "INSERT OR REPLACE INTO user_profiles(user_id, profile, source, updated_at)"
@@ -186,7 +186,7 @@ class InMemoryProfileStore(ProfileStore):
     ) -> UserProfile:
         profile = self.get(user_id)
         profile.merge_patch(patch or {})
-        profile.updated_at = datetime.now()
+        profile.updated_at = cstnow()
         self._profiles[user_id] = UserProfile(**profile.to_dict())
         self._sources[user_id] = source
         return self._profiles[user_id]

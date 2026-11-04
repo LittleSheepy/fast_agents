@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
 
+from fast_agents.utils.time_utils import to_cst, cstnow
 from .schema import MemoryRecord
 from .scoring import (
     cosine_similarity, lexical_terms, merge_similarity, rank_records,
@@ -95,7 +96,7 @@ class MemoryStoreBase(ABC):
             if record is None:
                 continue
             record.access_count += 1
-            record.last_accessed_at = datetime.now()
+            record.last_accessed_at = cstnow()
             self.update(record)
             count += 1
         return count
@@ -124,13 +125,13 @@ class MemoryStoreBase(ABC):
           all(include_inactive=True) 仍可审计；
         - 返回被归档的记录列表。
         """
-        moment = now or datetime.now()
+        moment = to_cst(now) or cstnow()
         deadline = moment - timedelta(days=max(0, int(stale_days)))
         archived: List[MemoryRecord] = []
         for record in self.all():
             if record.importance >= max_importance:
                 continue
-            last_used = record.last_accessed_at or record.updated_at
+            last_used = to_cst(record.last_accessed_at or record.updated_at)
             if last_used > deadline:
                 continue
             record.status = "archived"
@@ -160,8 +161,8 @@ class MemoryStoreBase(ABC):
         if len(all_records) < 2:
             return []
         if len(all_records) > max_records:
-            all_records = sorted(all_records, key=lambda r: r.updated_at, reverse=True)[:max_records]
-        records = sorted(all_records, key=lambda r: (-r.importance, r.created_at))
+            all_records = sorted(all_records, key=lambda r: to_cst(r.updated_at), reverse=True)[:max_records]
+        records = sorted(all_records, key=lambda r: (-r.importance, to_cst(r.created_at)))
 
         vecs = self.semantic_vectors([r.content for r in records])
         vec_by_id = {}
@@ -198,7 +199,7 @@ class MemoryStoreBase(ABC):
         if old.status != "active":
             raise ValueError("只能修订有效记忆，请先重新读取")
         old.status = "superseded"
-        old.updated_at = datetime.now()
+        old.updated_at = cstnow()
         self.update(old)
         new = MemoryRecord(
             user_id=old.user_id,
@@ -219,7 +220,7 @@ class MemoryStoreBase(ABC):
             raise KeyError(memory_id)
         if old.status == "active":
             old.status = "retracted"
-            old.updated_at = datetime.now()
+            old.updated_at = cstnow()
             self.update(old)
         return old
 

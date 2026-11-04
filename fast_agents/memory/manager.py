@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 import json
 
 from ..messages.message import Message
+from fast_agents.utils.time_utils import to_cst
 from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory, DEFAULT_SUMMARY_PROMPT
 from .in_memory_store import InMemoryStore
@@ -136,7 +137,7 @@ class MemoryManager:
                         "id": record.memory_id,
                         "source": record.source,
                         "kind": record.kind,
-                        "updated_at": record.updated_at.isoformat(),
+                        "updated_at": to_cst(record.updated_at).isoformat(),
                         "required": required,
                     },
                 )

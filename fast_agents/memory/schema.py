@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from fast_agents.utils.time_utils import cstnow
+
 # 记忆类型：与 HelloAgents 的 MemoryStore.KINDS 对齐
 # preference  偏好（用户喜好、习惯）
 # fact        事实（稳定的客观信息）
@@ -42,8 +44,8 @@ class MemoryRecord(BaseModel):
     kind: MemoryKind = "fact"
     status: MemoryStatus = "active"
     importance: float = 0.5
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=cstnow)
+    updated_at: datetime = Field(default_factory=cstnow)
     supersedes: Optional[str] = None
     access_count: int = 0
     last_accessed_at: Optional[datetime] = None
@@ -101,7 +103,7 @@ class UserProfile(BaseModel):
     language: str = "zh-CN"
     stable_preferences: Dict[str, str] = Field(default_factory=dict)
     stable_facts: Dict[str, str] = Field(default_factory=dict)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    updated_at: datetime = Field(default_factory=cstnow)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
     def is_empty(self) -> bool:
@@ -131,7 +133,7 @@ class UserProfile(BaseModel):
                 continue
             elif key in ("name", "role", "location", "language"):
                 setattr(self, key, value)
-        self.updated_at = datetime.now()
+        self.updated_at = cstnow()
         return self
 
     def to_text(self) -> str:

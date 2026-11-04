@@ -2,6 +2,7 @@
 
 from typing import Optional, Dict, Any, Literal, List
 from datetime import datetime
+from fast_agents.utils.time_utils import cstnow
 from pydantic import BaseModel
 
 MessageRole = Literal["user", "assistant", "system", "tool"]
@@ -32,7 +33,7 @@ class Message(BaseModel):
             role=role,
             content=content,
             tool_calls=kwargs.get('tool_calls', []),
-            timestamp=kwargs.get('timestamp', datetime.now()),
+            timestamp=kwargs.get('timestamp', cstnow()),
             metadata=kwargs.get('metadata', {})
         )
     

@@ -43,6 +43,7 @@ from ..database import (
     SQLiteClient,
     SortOrder,
 )
+from fast_agents.utils.time_utils import to_cst, to_cst_iso, cstnow
 from .memory_store_base import MemoryStoreBase
 from .schema import MemoryRecord
 
@@ -172,12 +173,12 @@ class SQLiteMemoryStore(MemoryStoreBase):
             kind=row["kind"],
             status=row["status"],
             importance=row["importance"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
+            created_at=to_cst(datetime.fromisoformat(row["created_at"])),
+            updated_at=to_cst(datetime.fromisoformat(row["updated_at"])),
             supersedes=row["supersedes"],
             access_count=row["access_count"] or 0,
             last_accessed_at=(
-                datetime.fromisoformat(row["last_accessed_at"])
+                to_cst(datetime.fromisoformat(row["last_accessed_at"]))
                 if row["last_accessed_at"] else None
             ),
             metadata=json.loads(row["metadata"] or "{}"),
@@ -195,11 +196,11 @@ class SQLiteMemoryStore(MemoryStoreBase):
             "kind":        r.kind,
             "status":      r.status,
             "importance":  r.importance,
-            "created_at":  r.created_at.isoformat(),
-            "updated_at":  r.updated_at.isoformat(),
+            "created_at":  to_cst_iso(r.created_at),
+            "updated_at":  to_cst_iso(r.updated_at),
             "supersedes":  r.supersedes,
             "access_count":     r.access_count,
-            "last_accessed_at": r.last_accessed_at.isoformat() if r.last_accessed_at else None,
+            "last_accessed_at": to_cst_iso(r.last_accessed_at),
             "metadata":    json.dumps(r.metadata, ensure_ascii=False),
         }
 
@@ -258,7 +259,7 @@ class SQLiteMemoryStore(MemoryStoreBase):
         ids = [mid for mid in memory_ids if mid]
         if not ids:
             return 0
-        now = datetime.now().isoformat()
+        now = cstnow().isoformat()
         return self._db.update_where(
             self._TABLE,
             {
@@ -276,7 +277,7 @@ class SQLiteMemoryStore(MemoryStoreBase):
     def update(self, record: MemoryRecord) -> MemoryRecord:
         if self.get(record.memory_id) is None:
             raise KeyError(record.memory_id)
-        record.updated_at = datetime.now()
+        record.updated_at = cstnow()
         self._db.update_where(
             self._TABLE,
             {
@@ -310,7 +311,7 @@ class SQLiteMemoryStore(MemoryStoreBase):
             raise KeyError(memory_id)
         if old.status != "active":
             raise ValueError("只能修订有效记忆，请先重新读取")
-        now_iso = datetime.now().isoformat()
+        now_iso = cstnow().isoformat()
         with self._db:
             self._db.update_where(
                 self._TABLE,
@@ -337,7 +338,7 @@ class SQLiteMemoryStore(MemoryStoreBase):
             raise KeyError(memory_id)
         if old.status == "active":
             old.status = "retracted"
-            old.updated_at = datetime.now()
+            old.updated_at = cstnow()
             self.update(old)
         return old
 

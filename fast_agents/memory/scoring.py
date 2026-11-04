@@ -14,6 +14,7 @@ import math
 from datetime import datetime
 from typing import Iterable, List, Optional
 
+from fast_agents.utils.time_utils import to_cst, cstnow
 from .schema import MemoryRecord
 
 # 中文按字也算词，所以用「英文词 + 单字」混合切分
@@ -48,7 +49,7 @@ def time_decay(updated_at: datetime, half_life_days: float = 30.0) -> float:
     """时间衰减因子：越旧的记忆权重越低，半衰期默认 30 天"""
     if half_life_days <= 0:
         return 1.0
-    delta_days = (datetime.now() - updated_at).total_seconds() / 86400.0
+    delta_days = (cstnow() - to_cst(updated_at)).total_seconds() / 86400.0
     if delta_days <= 0:
         return 1.0
     return math.pow(0.5, delta_days / half_life_days)
@@ -172,7 +173,7 @@ def rank_records(query, records, limit, *, include_preferences=True,
     if not query.strip():
         sorted_all = sorted(
             rec_list,
-            key=lambda r: (r.updated_at, r.importance),
+            key=lambda r: (to_cst(r.updated_at), r.importance),
             reverse=True,
         )
         return sorted_all[:limit]
@@ -191,5 +192,5 @@ def rank_records(query, records, limit, *, include_preferences=True,
         score = score_record(query, r, semantic=sem, hybrid_weight=hybrid_weight)
         scored.append((score, r))
 
-    scored.sort(key=lambda x: (-x[0], -x[1].importance, -x[1].updated_at.timestamp()))
+    scored.sort(key=lambda x: (-x[0], -x[1].importance, -to_cst(x[1].updated_at).timestamp()))
     return [r for _, r in scored[:limit]]

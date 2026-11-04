@@ -26,6 +26,7 @@ import struct
 import warnings
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+from fast_agents.utils.time_utils import cstnow
 from .memory_store_base import MemoryStoreBase
 from .schema import MemoryRecord
 from .scoring import cosine_similarity, rank_records
@@ -131,7 +132,6 @@ class SemanticMemoryStore(MemoryStoreBase):
         if self._vec_backend == "sqlite":
             from .sqlite_store import SQLiteMemoryStore as _SQLite
             inner: _SQLite = self.inner  # type: ignore[assignment]
-            import datetime as _dt
             with inner._connect() as db:
                 db.execute(
                     "INSERT OR REPLACE INTO memory_embeddings "
@@ -141,7 +141,7 @@ class SemanticMemoryStore(MemoryStoreBase):
                         record.memory_id, record.user_id, record.session_id,
                         self._pack_vec(vec), len(vec),
                         getattr(self.llm, "embedding_model", "unknown"),
-                        _dt.datetime.now().isoformat(),
+                        cstnow().isoformat(),
                     ),
                 )
         else:

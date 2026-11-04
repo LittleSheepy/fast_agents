@@ -36,6 +36,7 @@ from typing import Iterator, List, Optional
 
 from ..database import Column, ColumnType, Filter, FilterOp, Index, Query, Schema, SQLiteClient, SortOrder
 from ..messages import Message
+from fast_agents.utils.time_utils import to_cst, cstnow
 
 
 class SessionStore(ABC):
@@ -200,9 +201,9 @@ class SQLiteSessionStore(SessionStore):
             metadata = {}
         try:
             ts_raw = _get("timestamp")
-            ts = datetime.fromisoformat(ts_raw) if ts_raw else datetime.now()
+            ts = to_cst(datetime.fromisoformat(ts_raw)) if ts_raw else cstnow()
         except (ValueError, TypeError):
-            ts = datetime.now()
+            ts = cstnow()
 
         # 还原 MsgToolCall / MsgToolResult（Message.__init__ 的 kwargs 里直接传 dict 列表即可，
         # Pydantic 会自动转成对应的 BaseModel 实例）
@@ -238,7 +239,7 @@ class SQLiteSessionStore(SessionStore):
                 [tr.model_dump() if hasattr(tr, "model_dump") else tr for tr in (m.tool_results or [])],
                 ensure_ascii=False,
             ),
-            "timestamp": (m.timestamp or datetime.now()).isoformat(),
+            "timestamp": to_cst(m.timestamp or cstnow()).isoformat(),
             "metadata": json.dumps(m.metadata or {}, ensure_ascii=False, default=str),
         }
 
@@ -280,7 +281,7 @@ class SQLiteSessionStore(SessionStore):
                 "user_id": self.user_id,
                 "session_id": self.session_id,
                 "summary": summary or "",
-                "updated_at": datetime.now().isoformat(),
+                "updated_at": cstnow().isoformat(),
             },
             conflict_keys=["user_id", "session_id"],
             update_columns=["summary", "updated_at"],

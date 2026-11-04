@@ -15,7 +15,7 @@ import os
 import sys
 import tempfile
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -545,7 +545,7 @@ def test_archive_stale():
         # 低重要度 + 200 天没动过 → 应归档
         stale = store.add(MemoryRecord(
             content="随口提过的咖啡馆", kind="episode", source="t", importance=0.1,
-            updated_at=datetime.now() - timedelta(days=200),
+            updated_at=datetime.now(timezone.utc) - timedelta(days=200),
         ))
         # 低重要度但很新 → 不归档
         fresh = store.add(MemoryRecord(
@@ -554,7 +554,7 @@ def test_archive_stale():
         # 重要度高 + 很旧 → 不归档
         important = store.add(MemoryRecord(
             content="用户的职业是医生", kind="fact", source="t", importance=0.9,
-            updated_at=datetime.now() - timedelta(days=400),
+            updated_at=datetime.now(timezone.utc) - timedelta(days=400),
         ))
 
         archived = store.archive_stale(max_importance=0.3, stale_days=90)
@@ -624,7 +624,7 @@ def test_manager_compact_and_retrieve_touch():
         stale = mgr.long_term.add(MemoryRecord(
             user_id="u1", session_id="s1", content="随口提过的咖啡馆",
             kind="episode", source="t", importance=0.1,
-            updated_at=datetime.now() - timedelta(days=200),
+            updated_at=datetime.now(timezone.utc) - timedelta(days=200),
         ))
         report = mgr.compact(max_importance=0.3, stale_days=90)
         assert report["archived"] == 1, report
@@ -808,6 +808,53 @@ def test_session_store_persistence():
     print("✅ test_session_store_persistence 通过（SQLiteSessionStore 迁移后行为正常）")
 
 
+def test_b8_time_is_cst():
+    """B8：记忆时间统一为北京时间 CST (+08:00)——默认带时区、落库带 +08:00、naive 输入按 CST 解读以兼容历史数据"""
+    import sqlite3
+    from datetime import timedelta, timezone
+    from fast_agents.utils.time_utils import CST
+
+    # 1. 新建记录默认时间即 aware CST
+    r = MemoryRecord(content="时间基准")
+    assert r.created_at.tzinfo is not None, r.created_at
+    assert r.created_at.utcoffset() == timedelta(hours=8), r.created_at
+    assert r.updated_at.tzinfo is not None
+    assert r.updated_at.utcoffset() == timedelta(hours=8), r.updated_at
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "mem.db")
+        store = SQLiteMemoryStore(path, user_id="u1")
+        rec = store.add(MemoryRecord(content="落库时间", kind="fact"))
+        got = store.get(rec.memory_id)
+        # 2. 往返后仍是 aware CST（不随机器时区漂移）
+        assert got.created_at.utcoffset() == timedelta(hours=8), got.created_at
+        assert got.updated_at.utcoffset() == timedelta(hours=8), got.updated_at
+        # 3. 落库字符串带 +08:00（不再是裸本地串）
+        con = sqlite3.connect(path)
+        raw = con.execute(
+            "SELECT created_at, updated_at FROM memories WHERE memory_id = ?",
+            (rec.memory_id,),
+        ).fetchone()
+        con.close()
+        assert "+08:00" in raw[0] and "+08:00" in raw[1], raw
+
+        # 4. naive datetime 按 CST 解读（历史本地时间数据零偏移兼容），而不是抛错
+        from fast_agents.utils.time_utils import to_cst
+        naive = datetime(2026, 4, 18, 16, 0, 0)
+        normalized = to_cst(naive)
+        assert normalized.tzinfo is not None
+        assert normalized.utcoffset() == timedelta(hours=8)
+        assert normalized.year == 2026 and normalized.month == 4 and normalized.day == 18 and normalized.hour == 16
+
+        # 5. aware 跨时区转换不改变绝对时刻（UTC 输入 -> CST 输出，+8 小时）
+        utc_t = datetime(2026, 4, 18, 8, 0, 0, tzinfo=timezone.utc)
+        cst_t = to_cst(utc_t)
+        assert cst_t.utcoffset() == timedelta(hours=8)
+        assert cst_t.hour == 16 and cst_t.minute == 0
+        store.close()
+    print("✅ test_b8_time_is_cst 通过（B8 时间统一北京时间 CST：默认 / 往返 / +08:00 / naive 兼容）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -838,4 +885,5 @@ if __name__ == "__main__":
     test_sqlite_upsert_full_column_overwrite()
     test_touch_scope_isolation_in()
     test_session_store_persistence()
+    test_b8_time_is_cst()
     print("\n🎉 全部测试通过")

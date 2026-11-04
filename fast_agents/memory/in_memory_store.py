@@ -9,6 +9,7 @@ search 不在此处实现，由 MemoryStoreBase 通过 all() + scoring.rank_reco
 
 from typing import List, Optional
 
+from fast_agents.utils.time_utils import to_cst
 from .memory_store_base import MemoryStoreBase
 from .schema import MemoryRecord
 
@@ -30,7 +31,7 @@ class InMemoryStore(MemoryStoreBase):
         records = list(self._records.values())
         if not include_inactive:
             records = [r for r in records if r.status == "active"]
-        return sorted(records, key=lambda r: r.updated_at, reverse=True)
+        return sorted(records, key=lambda r: to_cst(r.updated_at), reverse=True)
 
     def update(self, record: MemoryRecord) -> MemoryRecord:
         if record.memory_id not in self._records:
