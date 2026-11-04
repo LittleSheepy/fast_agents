@@ -26,5 +26,3 @@ __all__ = [
     "JsonlStore",
     "MEMORY_PATH",
 ]
-
-__version__ = "1.0.1"
