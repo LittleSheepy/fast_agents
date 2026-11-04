@@ -93,6 +93,7 @@ class StructuredTool(ToolBase):
         max_output_chars: int = 100_000,
         handle_tool_error: bool = True,
         tags: Optional[list[str]] = None,
+        metadata: Optional[dict] = None,
         return_direct: bool = False,
     ) -> "StructuredTool":
         """从函数创建 StructuredTool。可作为装饰器使用。"""
@@ -103,7 +104,8 @@ class StructuredTool(ToolBase):
             schema = args_schema or _create_args_schema_from_function(f, tool_name)
             return cls(func=f, name=tool_name, description=tool_desc, args_schema=schema,
                        coroutine=coroutine, max_output_chars=max_output_chars,
-                       handle_tool_error=handle_tool_error, tags=tags, return_direct=return_direct)
+                       handle_tool_error=handle_tool_error, tags=tags, metadata=metadata,
+                       return_direct=return_direct)
         if func is not None:
             return _make(func)
         return _make
@@ -116,14 +118,17 @@ def tool(
     description: Optional[str] = None,
     args_schema: Optional[Type[BaseModel]] = None,
     max_output_chars: int = 100_000,
+    handle_tool_error: bool = True,
     tags: Optional[list[str]] = None,
+    metadata: Optional[dict] = None,
     return_direct: bool = False,
 ):
     """@tool 装饰器：把普通函数直接变成 StructuredTool。"""
     def _wrap(f: Callable) -> StructuredTool:
         return StructuredTool.from_function(
             f, name=name, description=description, args_schema=args_schema,
-            max_output_chars=max_output_chars, tags=tags, return_direct=return_direct,
+            max_output_chars=max_output_chars, handle_tool_error=handle_tool_error,
+            tags=tags, metadata=metadata, return_direct=return_direct,
         )
     if func is not None:
         return _wrap(func)
