@@ -1194,3 +1194,209 @@ def test_chroma_client_invalid_metric_rejected():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+
+
+# ===========================================================================
+# 向量后端：v1.1.1 优化项
+# ===========================================================================
+
+def test_vector_client_base_get_signature_has_include_switches():
+    """抽象基类 get 暴露 include_documents / include_metadatas 可选开关（默认 True）。"""
+    import inspect
+    from fast_agents.database import VectorClientBase
+    params = inspect.signature(VectorClientBase.get).parameters
+    assert params["include_documents"].default is True
+    assert params["include_metadatas"].default is True
+
+
+def test_chroma_create_collection_persists_dimension_and_rejects_duplicate():
+    """建集把 dimension 写进 collection metadata；重复建集抛「已存在」。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("opt1", dimension=4, metric="cosine")
+        # 维度写进了 metadata，可跨进程读回
+        assert db._client.get_collection("opt1").metadata.get("dimension") == 4
+        with pytest.raises(ValueError, match="已存在"):
+            db.create_collection("opt1")
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_get_or_create_is_idempotent_and_keeps_dimension():
+    """get_or_create 走原生幂等接口：二次调用不报错，维度仍记录。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.get_or_create_collection("opt2", dimension=3)
+        db.get_or_create_collection("opt2", dimension=3)  # 幂等
+        assert db._dimensions.get("opt2") == 3
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_add_rejects_duplicate_ids():
+    """同一批 ids 重复应提前报错（Chroma 内部会抛 DuplicateIDError）。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("opt3")
+        with pytest.raises(ValueError, match="重复"):
+            db.add("opt3", ids=["a", "a"], embeddings=[[1.0, 0.0], [0.0, 1.0]])
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_add_rejects_inconsistent_batch_dimension():
+    """同一批 embeddings 维度不一致应报错。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("opt4")
+        with pytest.raises(ValueError, match="维度不一致"):
+            db.add("opt4", ids=["a", "b"], embeddings=[[1.0, 0.0], [0.0, 1.0, 2.0]])
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_add_rejects_dimension_mismatch_with_declared():
+    """写入维度与建集声明的维度不一致应报错（Chroma 空集合不校验，靠客户端补位）。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("opt5", dimension=3)
+        with pytest.raises(ValueError, match="声明的维度"):
+            db.add("opt5", ids=["a"], embeddings=[[1.0, 0.0]])
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_search_rejects_dimension_mismatch():
+    """检索向量维度与声明维度不一致应报错。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("opt6", dimension=3)
+        with pytest.raises(ValueError, match="维度"):
+            db.search("opt6", [1.0, 0.0])
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_add_chunks_large_batch():
+    """add_chunk_size 生效：分块写入仍全部落库、返回总数。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp, add_chunk_size=2)
+        db.create_collection("opt7", dimension=2)
+        ids = [f"k{i}" for i in range(5)]
+        embs = [[float(i), float(i + 1)] for i in range(5)]
+        assert db.add("opt7", ids=ids, embeddings=embs) == 5
+        assert db.count("opt7") == 5
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_get_limit_validation_and_include_switches():
+    """get 校验 limit 为正整数；include_documents / include_metadatas 关闭后不收对应字段。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("opt8", dimension=2)
+        db.add("opt8", ids=["a"], embeddings=[[1.0, 0.0]], documents=["doc"], metadatas=[{"v": 1}])
+        with pytest.raises(ValueError):
+            db.get("opt8", limit=0)
+        with pytest.raises(ValueError):
+            db.get("opt8", limit=-3)
+        rows = db.get("opt8", include_documents=False, include_metadatas=False)
+        assert rows[0]["id"] == "a"
+        assert "document" not in rows[0] and "metadata" not in rows[0]
+        full = db.get("opt8")
+        assert full[0]["document"] == "doc" and full[0]["metadata"]["v"] == 1
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_delete_ids_take_precedence_and_exact_count():
+    """delete 返回精确条数；ids 与 where 同时传时以 ids 为准。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    from fast_agents.database import VectorFilter, VectorFilterOp
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("opt9", dimension=2)
+        db.add(
+            "opt9",
+            ids=["a", "b", "c"],
+            embeddings=[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            metadatas=[{"v": 1}, {"v": 2}, {"v": 3}],
+        )
+        # ids 含不存在的 id：返回精确删除条数
+        assert db.delete("opt9", ids=["a", "nope"]) == 1
+        # 同时传 ids 与 where：语义为按 ids 删（不受 where 影响）
+        removed = db.delete(
+            "opt9",
+            ids=["c"],
+            where=VectorFilter(field="v", op=VectorFilterOp.EQ, value=999),
+        )
+        assert removed == 1
+        assert db.count("opt9") == 1
+        assert db.get("opt9")[0]["id"] == "b"
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_get_or_create_tolerates_existing_collection_without_metadata():
+    """对已存在但 metadata 为空的集合调用 get_or_create 不应因 Chroma 0.6.x 的合并缺陷而崩。"""
+    pytest.importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        # 用裸 SDK 建一个没有 metadata 的集合
+        db.connect()
+        db._client.create_collection("raw1")
+        # 再走我们的 get_or_create（带 metadata + dimension），应能从容取回而不是 TypeError
+        db.get_or_create_collection("raw1", dimension=2)
+        assert db._dimensions.get("raw1") == 2
+        db.add("raw1", ids=["a"], embeddings=[[1.0, 0.0]])
+        assert db.count("raw1") == 1
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

@@ -111,6 +111,9 @@ class VectorClientBase(ABC):
 
         安全约定：``ids`` 和 ``where`` 至少要有一个非空；禁止传入空条件误删全量
         （与 SQLiteClient.delete_where 一致，更严格者可以允许空条件，但基类不允许）。
+
+        语义约定：同时传 ``ids`` 与 ``where`` 时，**以 ids 为准**（按 id 删除），
+        避免依赖各后端的未文档化混用行为。
         """
 
     # ---------- 精确取（非近邻） ----------
@@ -122,11 +125,15 @@ class VectorClientBase(ABC):
         where: VectorWhere = None,
         limit: int | None = None,
         include_embeddings: bool = False,
+        include_documents: bool = True,
+        include_metadatas: bool = True,
     ) -> list[dict[str, Any]]:
         """按 id 或 metadata 过滤取记录，返回 ``[{id, document?, metadata?, embedding?}]``。
 
         Args:
             include_embeddings: 默认 False 不返回向量（省流量 / 内存），需要时显式打开。
+            include_documents: 默认 True 返回文档原文；只要 id / metadata 时置 False 可减小载荷。
+            include_metadatas: 默认 True 返回元数据；只要 id / 文档时置 False 可减小载荷。
         """
 
     # ---------- 近邻检索 ----------
