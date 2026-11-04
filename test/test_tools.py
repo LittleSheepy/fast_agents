@@ -878,6 +878,217 @@ def test_write_append_preserves_existing_content():
 
 
 
+def test_terminal_platform_guard():
+    """N3：非 Windows 平台构造 TerminalTool 应明确报错，而非静默假成功。"""
+    import tempfile
+    from fast_agents.tools.tool_exception import ToolInitializationError
+
+    if os.name == "nt":
+        with tempfile.TemporaryDirectory() as tmp:
+            term = builtin.TerminalTool(workspace=tmp)
+            assert term is not None
+        print("✅ TerminalTool 平台守卫通过（Windows：正常构造）")
+        return
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            builtin.TerminalTool(workspace=tmp)
+        except ToolInitializationError as e:
+            assert "Windows" in str(e), f"错误信息未说明平台限制: {e}"
+            print("✅ TerminalTool 平台守卫通过（非 Windows：明确报错）")
+            return
+    raise AssertionError("非 Windows 平台构造 TerminalTool 应抛 ToolInitializationError，实际未报错")
+
+
+def test_terminal_truncation_delegated_to_base():
+    """N2：terminal 输出过长由基类统一截断为 TRUNCATED，不再手动二次截断。"""
+    import tempfile
+    import unittest.mock as mock
+    import fast_agents.tools.builtin.terminal_tool as tt
+
+    long_output = "line\n" * 2000
+    with mock.patch.object(tt, "_is_windows", return_value=True), \
+         mock.patch.object(tt, "route_and_run", return_value=(0, long_output, "", "cmd")):
+        with tempfile.TemporaryDirectory() as tmp:
+            term = tt.TerminalTool(workspace=tmp, max_output_chars=100)
+            r = term.invoke(command="dir")
+
+    assert r.succeeded, r.output
+    assert r.is_truncated, f"超长输出应被基类截断为 TRUNCATED，实际 status={r.status}"
+    assert "输出已截断" in r.output, "缺少基类截断标记"
+    assert "输出过长，已截断前" not in r.output, "仍存在旧的手动截断标记（二次截断未清除）"
+    print("✅ terminal 输出截断统一由基类处理通过")
+
+
+# ─────────────────────────────────────────────────────────
+# A17：@tool / from_function 透传 metadata / handle_tool_error
+# ─────────────────────────────────────────────────────────
+
+def test_decorator_metadata_requires_approval():
+    """A17：@tool(metadata=...) 应透传到 StructuredTool.metadata，审批可识别。"""
+    @tool(metadata={"requires_approval": True})
+    def risky_op(action: str) -> str:
+        """需要审批的操作"""
+        return f"executed {action}"
+
+    assert risky_op.metadata.get("requires_approval") is True, "metadata 未透传到工具"
+    reg = ToolRegistry()
+    reg.register_tool(risky_op)
+    # 无回调时 skip_approval 路径直接执行（与 A9 既有语义一致）
+    r = reg.invoke_tool("risky_op", {"action": "x"}, skip_approval=True)
+    assert r.succeeded, r.output
+    print("✅ @tool 装饰器 metadata 透传通过")
+
+
+def test_from_function_metadata_and_error_flag():
+    """A17：from_function 可声明 metadata；handle_tool_error=False 时异常向外抛出。"""
+    def lookup(key: str) -> str:
+        """按 key 查值"""
+        if key == "bad":
+            raise ValueError("查不到")
+        return f"v={key}"
+
+    t_no_catch = StructuredTool.from_function(
+        lookup, name="lookup_nocatch",
+        metadata={"category": "read"},
+        handle_tool_error=False,
+    )
+    assert t_no_catch.metadata.get("category") == "read"
+    # 正常路径
+    assert t_no_catch.invoke(key="ok").succeeded
+    # handle_tool_error=False 时异常向外抛出，不被兜底为 ToolResult.fail
+    raised = False
+    try:
+        t_no_catch.invoke(key="bad")
+    except ValueError as e:
+        raised = True
+        assert "查不到" in str(e)
+    assert raised, "handle_tool_error=False 时异常应向外抛出"
+
+    # handle_tool_error=True（默认）：异常被兜底为失败
+    t_catch = StructuredTool.from_function(lookup, name="lookup_catch")
+    r = t_catch.invoke(key="bad")
+    assert r.failed
+    assert "查不到" in r.output
+    print("✅ StructuredTool.from_function metadata + handle_tool_error 通过")
+
+
+def test_tool_return_direct_flag_set():
+    """A17/A18：@tool / from_function 传 return_direct=True 时工具实例 return_direct 为 True。"""
+    @tool(return_direct=True)
+    def direct_answer(q: str) -> str:
+        """直接给出最终答案"""
+        return f"答案是 {q}"
+
+    assert direct_answer.return_direct is True
+    t2 = StructuredTool.from_function(direct_answer.func, return_direct=True,
+                                      name="da2", description="d")
+    assert t2.return_direct is True
+    print("✅ @tool / from_function return_direct 参数透传通过")
+
+
+# ─────────────────────────────────────────────────────────
+# A33: 工具入参解析统一（invoke / ainvoke / invoke_tool 共用同一实现）
+# ─────────────────────────────────────────────────────────
+
+def _mk_echo_tool():
+    """构造一个用于入参解析测试的回显工具。"""
+    @tool
+    def echo(text: str = "") -> str:
+        """回显文本
+        Args:
+            text: 要回显的文本
+        """
+        return f"echo:{text}"
+    return echo
+
+
+def test_merge_invalid_json_same_message():
+    """A33：invoke 与 invoke_tool 对非法 JSON 的报错文案一致，且都带工具名。"""
+    echo = _mk_echo_tool()
+    reg = ToolRegistry()
+    reg.register_tool(echo)
+
+    r1 = echo.invoke("不是json")
+    r2 = reg.invoke_tool("echo", "不是json")
+    assert r1.failed and r2.failed
+    assert r1.output == r2.output, f"两条路径文案不一致：{r1.output!r} vs {r2.output!r}"
+    assert "工具 'echo'" in r1.output, f"错误信息应带工具名：{r1.output!r}"
+    assert "不是合法 JSON" in r1.output
+    print("✅ A33 非法 JSON 文案双路径一致通过")
+
+
+def test_merge_json_array_rejected():
+    """A33：JSON 数组不是合法入参，两条路径都提示“必须是 JSON 对象”。"""
+    echo = _mk_echo_tool()
+    reg = ToolRegistry()
+    reg.register_tool(echo)
+
+    r1 = echo.invoke("[1, 2]")
+    r2 = reg.invoke_tool("echo", "[1, 2]")
+    for r in (r1, r2):
+        assert r.failed
+        assert "必须是 JSON 对象" in r.output, r.output
+    assert r1.output == r2.output
+    print("✅ A33 JSON 数组被拒且文案一致通过")
+
+
+def test_merge_non_dict_type_rejected():
+    """A33：非 str/dict 的 tool_input 报类型错误，两条路径文案一致。"""
+    echo = _mk_echo_tool()
+    reg = ToolRegistry()
+    reg.register_tool(echo)
+
+    r1 = echo.invoke(123)
+    r2 = reg.invoke_tool("echo", 123)
+    for r in (r1, r2):
+        assert r.failed
+        assert "必须是 dict / JSON 字符串 / None" in r.output, r.output
+        assert "int" in r.output
+    assert r1.output == r2.output
+    print("✅ A33 非法类型报错且文案一致通过")
+
+
+def test_merge_empty_string_is_empty_dict():
+    """A33：空字符串等价于无入参（回归保护）。"""
+    echo = _mk_echo_tool()
+    reg = ToolRegistry()
+    reg.register_tool(echo)
+
+    assert echo.invoke("").output == echo.invoke().output
+    assert reg.invoke_tool("echo", "").output == reg.invoke_tool("echo").output
+    assert echo.invoke("").output == "echo:"
+    print("✅ A33 空字符串等价无入参通过")
+
+
+def test_merge_kwargs_override_tool_input():
+    """A33：kwargs 优先级高于 tool_input 中的同名键（回归保护）。"""
+    echo = _mk_echo_tool()
+    reg = ToolRegistry()
+    reg.register_tool(echo)
+
+    assert echo.invoke({"text": "a"}, text="b").output == "echo:b"
+    assert echo.invoke('{"text": "a"}', text="b").output == "echo:b"
+    assert reg.invoke_tool("echo", {"text": "a"}, text="b").output == "echo:b"
+    print("✅ A33 kwargs 覆盖 tool_input 通过")
+
+
+def test_merge_ainvoke_consistent():
+    """A33：ainvoke 与 invoke 的解析行为一致（三条路径共用同一实现）。"""
+    import asyncio
+    echo = _mk_echo_tool()
+
+    async def _run():
+        ok = await echo.ainvoke('{"text": "hi"}')
+        bad = await echo.ainvoke("不是json")
+        return ok, bad
+
+    ok, bad = asyncio.run(_run())
+    assert ok.output == echo.invoke('{"text": "hi"}').output
+    assert bad.output == echo.invoke("不是json").output
+    print("✅ A33 ainvoke 与 invoke 行为一致通过")
+
+
 if __name__ == "__main__":
     from pathlib import Path  # for test_terminal
     tests = [
@@ -920,6 +1131,17 @@ if __name__ == "__main__":
         test_timeout_not_triggered_when_fast,
         test_duration_ms_is_int,
         test_write_append_preserves_existing_content,
+        test_terminal_platform_guard,
+        test_terminal_truncation_delegated_to_base,
+        test_decorator_metadata_requires_approval,
+        test_from_function_metadata_and_error_flag,
+        test_tool_return_direct_flag_set,
+        test_merge_invalid_json_same_message,
+        test_merge_json_array_rejected,
+        test_merge_non_dict_type_rejected,
+        test_merge_empty_string_is_empty_dict,
+        test_merge_kwargs_override_tool_input,
+        test_merge_ainvoke_consistent,
     ]
     failed = 0
     for t in tests:

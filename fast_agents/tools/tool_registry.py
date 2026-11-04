@@ -7,13 +7,12 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import logging
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .structured_tool import StructuredTool
-from .tool_base import ToolBase
+from .tool_base import ToolBase, _merge_tool_input
 from .tool_result import ToolResult, ToolStatus
 
 logger = logging.getLogger(__name__)
@@ -102,22 +101,10 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult.fail(f"未找到名为 '{name}' 的工具。可用工具：{', '.join(self.list_names())}")
-        # 解析字符串 → dict
-        if isinstance(tool_input, str):
-            try:
-                parsed = json.loads(tool_input) if tool_input.strip() else {}
-            except json.JSONDecodeError as e:
-                return ToolResult.fail(f"工具 '{name}' 的参数不是合法 JSON：{e}")
-            if not isinstance(parsed, dict):
-                return ToolResult.fail(f"工具 '{name}' 的参数必须是 JSON 对象")
-            parsed.update(kwargs)
-            kwargs = parsed
-        elif isinstance(tool_input, dict):
-            merged = dict(tool_input)
-            merged.update(kwargs)
-            kwargs = merged
-        elif tool_input is not None:
-            return ToolResult.fail(f"tool_input 必须是 dict / JSON 字符串 / None，收到 {type(tool_input).__name__}")
+        # 解析入参（与 ToolBase.invoke / ainvoke 共用同一实现，避免三处重复）
+        kwargs, parse_error = _merge_tool_input(tool_input, kwargs, tool_name=name)
+        if parse_error is not None:
+            return ToolResult.fail(parse_error)
 
         # ── 审批流程 ──
         tool_meta = tool.metadata if isinstance(tool.metadata, dict) else {}

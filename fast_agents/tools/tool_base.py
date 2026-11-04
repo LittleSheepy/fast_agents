@@ -111,6 +111,49 @@ def _infer_param_schema_from_signature(func: Callable, skip: Sequence[str] = ("s
     return {"type": "object", "properties": properties, "required": required}
 
 
+def _merge_tool_input(
+    tool_input: Optional[Union[str, Dict[str, Any]]],
+    kwargs: Dict[str, Any],
+    *,
+    tool_name: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """把 tool_input（dict / JSON 字符串 / None）与 kwargs 合并成最终参数字典。
+
+    工具入参解析的唯一入口：``ToolBase.invoke`` / ``ToolBase.ainvoke`` /
+    ``ToolRegistry.invoke_tool`` 三条路径共用，避免同一段解析逻辑重复三处、
+    改一处漏一处。
+
+    Args:
+        tool_input: 三种形态之一——``None``（无入参）、``dict``、或 JSON 对象
+            字符串；传入其它类型视为错误。
+        kwargs: 关键字形式追加的参数，优先级高于 ``tool_input`` 中的同名键。
+        tool_name: 工具名；提供时错误信息会带上工具名，便于定位问题。
+
+    Returns:
+        ``(kwargs, error)`` 二元组：
+          - 解析成功时 ``error`` 为 ``None``，``kwargs`` 可直接用于参数校验；
+          - 解析失败时 ``error`` 为错误文案，调用方应直接
+            ``return ToolResult.fail(error)``。
+    """
+    prefix = f"工具 '{tool_name}' 的" if tool_name else ""
+    if tool_input is None:
+        return kwargs, None
+    if isinstance(tool_input, str):
+        try:
+            parsed = json.loads(tool_input) if tool_input.strip() else {}
+        except json.JSONDecodeError as e:
+            return kwargs, f"{prefix}参数不是合法 JSON：{e}"
+        if not isinstance(parsed, dict):
+            return kwargs, f"{prefix}参数必须是 JSON 对象"
+        parsed.update(kwargs)
+        return parsed, None
+    if isinstance(tool_input, dict):
+        merged = dict(tool_input)
+        merged.update(kwargs)
+        return merged, None
+    return kwargs, f"tool_input 必须是 dict / JSON 字符串 / None，收到 {type(tool_input).__name__}"
+
+
 class ToolBase(ABC):
     """工具抽象基类。
 
@@ -173,22 +216,9 @@ class ToolBase(ABC):
           2. 单一 dict：``tool.invoke({"a": 1, "b": "x"})``（对齐 LangChain Runnable 风格）。
         """
         start_time = _time.perf_counter()
-        if tool_input is not None:
-            if isinstance(tool_input, str):
-                try:
-                    parsed = json.loads(tool_input) if tool_input.strip() else {}
-                except json.JSONDecodeError as e:
-                    return ToolResult.fail(f"工具参数不是合法 JSON：{e}")
-                if not isinstance(parsed, dict):
-                    return ToolResult.fail("工具参数必须是 JSON 对象")
-                parsed.update(kwargs)
-                kwargs = parsed
-            elif isinstance(tool_input, dict):
-                merged = dict(tool_input)
-                merged.update(kwargs)
-                kwargs = merged
-            else:
-                return ToolResult.fail(f"tool_input 必须是 dict 或 JSON 字符串，收到 {type(tool_input).__name__}")
+        kwargs, parse_error = _merge_tool_input(tool_input, kwargs, tool_name=self.name)
+        if parse_error is not None:
+            return ToolResult.fail(parse_error)
 
         try:
             validated = self._validate_args(kwargs)
@@ -228,22 +258,9 @@ class ToolBase(ABC):
 
     async def ainvoke(self, tool_input: Optional[Union[str, Dict[str, Any]]] = None, **kwargs: Any) -> ToolResult:
         start_time = _time.perf_counter()
-        if tool_input is not None:
-            if isinstance(tool_input, str):
-                try:
-                    parsed = json.loads(tool_input) if tool_input.strip() else {}
-                except json.JSONDecodeError as e:
-                    return ToolResult.fail(f"工具参数不是合法 JSON：{e}")
-                if not isinstance(parsed, dict):
-                    return ToolResult.fail("工具参数必须是 JSON 对象")
-                parsed.update(kwargs)
-                kwargs = parsed
-            elif isinstance(tool_input, dict):
-                merged = dict(tool_input)
-                merged.update(kwargs)
-                kwargs = merged
-            else:
-                return ToolResult.fail(f"tool_input 必须是 dict 或 JSON 字符串，收到 {type(tool_input).__name__}")
+        kwargs, parse_error = _merge_tool_input(tool_input, kwargs, tool_name=self.name)
+        if parse_error is not None:
+            return ToolResult.fail(parse_error)
 
         try:
             validated = self._validate_args(kwargs)
