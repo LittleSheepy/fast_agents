@@ -2,11 +2,11 @@
 
 本文档面向 fast_agents **Database（持久化层）**系统，参考 **Python DB-API 2.0（PEP 249）**、**SQLAlchemy Core 的 Table/MetaData 抽象**、**SQLModel 的声明式模型**、**Peewee 的轻量 Schema** 等方案的共性设计，给出本模块的完整说明、源码解析与自定义教程。同时对齐 fast_agents 已交付的 tools / memory / mcp / skills / context 模块文档骨架，做到「翻开任何一份模块说明，都知道在哪一节能找到什么」。
 
-> **版本**：v1.0.0 · 2026-11-03 · 初版：三种声明式建表 + 幂等迁移 + CRUD/事务 + 谓词下推（读/写两侧）+ upsert + 统计/批量写入
+> **版本**：v1.0.0 · 2026-11-03 · 初版：**关系型**（三种声明式建表 + 幂等迁移 + CRUD/事务 + 谓词下推（读/写两侧）+ upsert + 统计/批量写入）+ **向量型**（`VectorClientBase` 抽象 + `ChromaClient` 落地）
 > **适用版本**：`fast_agents.database`
-> **配套代码**：`fast_agents/database/`（5 个源码文件）+ `test/test_database.py`（**82 项**用例，全绿）+ `examples/database/`（**4 个**可运行示例）
+> **配套代码**：`fast_agents/database/`（**8 个**源码文件）+ `test/test_database.py`（**105 项**用例，全绿）+ `examples/database/`（**5 个**可运行示例）
 > **运行环境**：Python 3.10+（仓库 `.python-version` = 3.10），Windows / macOS / Linux
-> **依赖**：零新增依赖，仅标准库 `sqlite3` + 全框架已有的 `pydantic>=2.14.1`；无 SQLAlchemy / Alembic / peewee 等 ORM
+> **依赖**：关系型**零新增核心依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic>=2.14.1`）；向量后端 `chromadb` 为**可选依赖**（`pip install fast-agents[chroma]`），不进核心依赖；无 SQLAlchemy / Alembic / peewee 等 ORM
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分放在第十二章，并与 `docs/演进路线图.md` 的 J 模块独立编号对齐。
 
 ---
@@ -34,7 +34,7 @@
 
 | **版本** | 日期 | 变更 | 作者 |
 |------|------|------|------|
-| **1.0.0** | 2026-11-03 | **初版**：`fast_agents/database/` 作为独立持久化层模块交付（`__init__.py` / `schema.py` / `query.py` / `database_client_base.py` / `sqlite_client.py` 共 5 个文件）。`SQLiteClient` 提供：连接与上下文事务；`execute / executemany / executescript / query` 基础 SQL 通道；三种声明式建表（dict / list[Column] / Schema）+ 幂等建索引 + `ensure_schema(migrate=True)` 自动 `ALTER TABLE ADD COLUMN` 补列；CRUD（`insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete`）；读侧谓词下推（9 种 `FilterOp` + 多条件 AND + 单/多列排序 + `limit/offset`，值一律参数化）；写侧条件写入（`upsert` 插入或更新、`update_where / delete_where` 带谓词批量改删，`SqlExpr` 支持自增等表达式且非空 filters 兜底防误改全表）；标识符走 `check_ident` 白名单防注入，异常统一包 `ValueError`，非内存库默认 `WAL + foreign_keys=ON`。查询命名对齐仓库既有 `select / select_one` 家族，定为 `select_where / select_one_where`。**零新增依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic`）；`test/test_database.py` **82/82** 全绿，配套 4 个可运行示例。 | — |
+| **1.0.0** | 2026-11-03 | **初版**：`fast_agents/database/` 作为独立持久化层模块交付（`__init__.py` / `schema.py` / `query.py` / `database_client_base.py` / `sqlite_client.py` 共 5 个文件）。`SQLiteClient` 提供：连接与上下文事务；`execute / executemany / executescript / query` 基础 SQL 通道；三种声明式建表（dict / list[Column] / Schema）+ 幂等建索引 + `ensure_schema(migrate=True)` 自动 `ALTER TABLE ADD COLUMN` 补列；CRUD（`insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete`）；读侧谓词下推（9 种 `FilterOp` + 多条件 AND + 单/多列排序 + `limit/offset`，值一律参数化）；写侧条件写入（`upsert` 插入或更新、`update_where / delete_where` 带谓词批量改删，`SqlExpr` 支持自增等表达式且非空 filters 兜底防误改全表）；标识符走 `check_ident` 白名单防注入，异常统一包 `ValueError`，非内存库默认 `WAL + foreign_keys=ON`。查询命名对齐仓库既有 `select / select_one` 家族，定为 `select_where / select_one_where`。**关系型零新增依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic`）。**同版并入向量型持久化能力**：新增 `vector_query.py` / `vector_client_base.py` / `chroma_client.py` 三个源码文件——`VectorClientBase` 与 `DatabaseClientBase` 平行定义向量后端契约（集合 / 写入 / 删除 / 取 / 近邻检索 / 计数共 12 个方法），`ChromaClient` 作为首个向量后端（本地目录 `PersistentClient` 与远端 `HttpClient` 双模式，`chromadb` 走可选依赖 extras），`VectorFilter` 提供 EQ/NE/GT/…/IN/AND/OR 的元数据过滤；`test/test_database.py` 增至 **105/105**（82 关系型 + 23 向量，其中 17 项需 chromadb），配套示例增至 5 个。 | — |
 
 > 后续版本迭代更新时在此表追加，保持「使用者可见的变更」倒序排列；内部重构不在此记录。
 
@@ -58,6 +58,9 @@ Agent 框架里要落盘的东西比想象中多：长期记忆、会话快照�
 | **查询模型层** | 运行期 | 过滤/排序/分页的轻量对象 + FilterOp 编译 | `query.py`（`Query/Filter/FilterOp/SortOrder`）+ `sqlite_client._compile_filter/_compile_query`（谓词下推） | 不依赖具体后端，编译逻辑集中在 SQLiteClient 内（纯字符串拼装+命名参数），未来其他后端可复用同样的 Filter 语义 |
 | **实现层（后端）** | 运行期 | 具体数据库驱动封装 | `sqlite_client.py`（`SQLiteClient`） | 依赖抽象层 + schema 解析函数 + 标准库 `sqlite3` |
 | **上层业务模块** | 运行期 | 记忆落盘 / Trace 落盘 / 画像落盘 | `memory/sqlite_store.py`、后续 G1 `TraceLogger` 等 | 只依赖抽象层 + 声明模型，不直接 `import sqlite3` |
+| **向量抽象层（契约）** | 编译期 | 向量后端必须实现的最小接口集 | `vector_client_base.py`（`VectorClientBase`） | 与 `DatabaseClientBase` **平行、互不继承**；上层只引用它 |
+| **向量声明模型层** | 编译期 | 向量元数据过滤模型（EQ/NE/GT/…/IN/AND/OR） | `vector_query.py`（`VectorFilterOp` / `VectorFilter`） | 纯数据模型，不依赖任何连接 |
+| **向量实现层（后端）** | 运行期 | 具体向量库驱动封装 | `chroma_client.py`（`ChromaClient`） | 依赖向量抽象层 + 标准库；`chromadb` 为可选依赖 |
 
 ### 2.3 关键设计原则（全篇代码都在落实它们）
 
@@ -103,11 +106,14 @@ Agent 框架里要落盘的东西比想象中多：长期记忆、会话快照�
 
 ```text
 fast_agents/database/                 ← 单数目录（对齐 tools/memory/skills/mcp 的命名约定）
-├── __init__.py                       # 模块出口：统一导出 SQLiteClient / DatabaseClientBase / Schema / Column / ColumnType / Index / Query / Filter / FilterOp / SortOrder
-├── database_client_base.py           # 抽象基类 DatabaseClientBase：connect/close + DDL（建/查/删表）+ DML（CRUD）契约
-├── schema.py                         # 声明模型 ColumnType/Column/Index/Schema + 标识符校验 + Column/Schema→SQL 片段纯函数
-├── query.py                          # 查询模型 SortOrder/FilterOp/Filter/Query（轻量过滤/排序/分页，由 SQLiteClient.select_where 编译为参数化 SQL）
-└── sqlite_client.py                  # SQLiteClient：唯一实现，封装 sqlite3 连接、事务、字典结果、幂等建表、便捷 CRUD、select_where 谓词下推、count/batch_insert 统计与批量写入
+├── __init__.py                       # 模块出口：统一导出关系型 + 向量型的全部公共符号（SQLiteClient / DatabaseClientBase / Schema / Column / ColumnType / Index / Query / Filter / FilterOp / SortOrder / ChromaClient / VectorClientBase / VectorFilter / VectorFilterOp）
+├── database_client_base.py           # 【关系型】抽象基类 DatabaseClientBase：connect/close + DDL（建/查/删表）+ DML（CRUD）契约
+├── schema.py                         # 【关系型】声明模型 ColumnType/Column/Index/Schema + 标识符校验 + Column/Schema→SQL 片段纯函数
+├── query.py                          # 【关系型】查询模型 SortOrder/FilterOp/Filter/Query（轻量过滤/排序/分页，由 SQLiteClient.select_where 编译为参数化 SQL）
+├── sqlite_client.py                  # 【关系型】SQLiteClient：唯一关系型实现，封装 sqlite3 连接、事务、字典结果、幂等建表、便捷 CRUD、select_where 谓词下推、count/batch_insert 统计与批量写入
+├── vector_query.py                   # 【向量型】向量元数据过滤模型 VectorFilterOp/VectorFilter（对齐 query.py，但支持 AND/OR 嵌套、不支持 LIKE/IS NULL）
+├── vector_client_base.py             # 【向量型】抽象基类 VectorClientBase：连接 + 集合管理 + 写入/删除/取/近邻检索/计数契约（12 个方法）
+└── chroma_client.py                  # 【向量型】ChromaClient：首个向量后端，本地 PersistentClient / 远端 HttpClient 双模式，chromadb 为可选依赖（延迟导入）
 ```
 
 配套但不放在 `fast_agents/database/` 下：
@@ -115,7 +121,9 @@ fast_agents/database/                 ← 单数目录（对齐 tools/memory/ski
 - `examples/database/basic_usage.py` —— CRUD + 事务最小闭环示例；
 - `examples/database/create_table_usage.py` —— 三种建表写法 + migrate + drop 完整示例；
 - `examples/database/query_filter_usage.py` —— 谓词下推：9 种 FilterOp + AND 组合 + 排序分页 + 注入安全完整示例；
-- `test/test_database.py` —— **82 项**单测（纯内存数据库，无外部依赖，全绿基线）。
+- `examples/database/conditional_write_usage.py` —— 写侧条件写入：upsert + update_where / delete_where 完整示例；
+- `examples/database/chroma_usage.py` —— 向量后端：建集 → add → get → search → count → delete → drop 完整示例（需 `pip install fast-agents[chroma]`）；
+- `test/test_database.py` —— **105 项**单测：82 项关系型用纯内存数据库、无外部依赖；23 项向量中 6 项纯抽象 / 编译校验无外部依赖，17 项走真实 Chroma 临时目录、未装 chromadb 时自动 skip。
 
 ### 4.2 分层
 
@@ -153,6 +161,34 @@ fast_agents/database/                 ← 单数目录（对齐 tools/memory/ski
                 ┌─────────▼─────────┐
                 │ 标准库 sqlite3     │
                 └───────────────────┘
+```
+
+向量型后端与上图的**关系型分层平行**，另有一组三层（互不继承、各走各的）：
+
+```text
+┌───────────────────────────────────────────────────────────────────┐
+│ 上层业务模块（未来的 memory/semantic_store 语义记忆）                 │
+│ 只 import VectorClientBase + VectorFilter，不直接 import chromadb     │
+└───────────────────────────┬───────────────────────────────────────┘
+                            │ 依赖抽象，不依赖具体后端
+┌───────────────────────────▼───────────────────────────────────────┐
+│ VectorClientBase（vector_client_base.py）—— 向量客户端契约            │
+│   连接：connect / close / ping                                       │
+│   集合：collection_exists / create_collection /                      │
+│        get_or_create_collection / drop_collection                    │
+│   DML：add / delete / get / search / count                           │
+└─────────┬─────────────────────────────────┬─────────────────────────┘
+          │实现（目前唯一）                    │ 过滤模型
+┌─────────▼─────────────────────┐   ┌────────▼──────────────────────┐
+│ ChromaClient（chroma_client.py）│   │ vector_query.py（纯数据模型）   │
+│  - 本地 PersistentClient /      │   │ VectorFilterOp / VectorFilter  │
+│    远端 HttpClient 双模式       │   │ （编译为 Chroma where，见 §6.7）│
+│  - 集合名白名单 + 维度校验       │   └───────────────────────────────┘
+│  - add 自动分块 / delete 精确计数│
+└───────────────────────────────┘
+          │
+          ▼
+   可选依赖 chromadb（pip install fast-agents[chroma]）
 ```
 
 ### 4.3 数据流 / 调用链路
@@ -418,6 +454,48 @@ class DatabaseClientBase(ABC):
 
 子类**必须实现全部 16 个方法**，上层（memory / trace / profile）只依赖这个抽象，不直接 import sqlite3/psycopg2。SQLiteClient 已经全部实现。
 
+### 6.7 向量过滤模型（`vector_query.py`，向量侧的谓词声明）
+
+```python
+class VectorFilterOp(str, Enum):
+    EQ="$eq"; NE="$ne"; GT="$gt"; GTE="$gte"; LT="$lt"; LTE="$lte"
+    IN="$in"; NIN="$nin"; AND="$and"; OR="$or"
+
+class VectorFilter(BaseModel):
+    field:   Optional[str] = None                    # 叶子条件必填
+    op:      VectorFilterOp
+    value:   Optional[Any] = None                    # 叶子条件用
+    filters: Optional[list["VectorFilter"]] = None    # op 为 AND/OR 时的子条件（≥2 个）
+
+VectorWhere = Union[dict[str, Any], VectorFilter, None]   # 便捷类型别名
+```
+
+> 枚举值直接写成 Chroma 的 `$` 前缀操作符，编译时零映射成本：叶子条件编译为 `{"field": {"$op": value}}`、AND/OR 编译为 `{"$and": [...]}` / `{"$or": [...]}`（编译逻辑在 `chroma_client._compile_vector_filter`）。**刻意不复用关系型 `query.Filter`**：向量过滤支持 AND/OR 嵌套、不支持 LIKE / IS NULL（Chroma metadata 过滤本身没有这两个能力），两边谓词集合不同，各自演进互不影响。
+
+### 6.8 `VectorClientBase`（向量抽象基类，与关系型平行）
+
+```python
+class VectorClientBase(ABC):
+    # 连接生命周期
+    @abstractmethod def connect(self) -> None: ...
+    @abstractmethod def close(self) -> None: ...
+    @abstractmethod def ping(self) -> bool: ...
+    # 集合（对应关系型的「表」）
+    @abstractmethod def collection_exists(self, name) -> bool: ...
+    @abstractmethod def create_collection(self, name, *, dimension=None, metric="cosine") -> None: ...
+    @abstractmethod def get_or_create_collection(self, name, *, dimension=None, metric="cosine") -> None: ...
+    @abstractmethod def drop_collection(self, name) -> None: ...
+    # 写入 / 删除 / 取 / 近邻检索 / 计数
+    @abstractmethod def add(self, collection, ids, embeddings=None, documents=None, metadatas=None) -> int: ...
+    @abstractmethod def delete(self, collection, ids=None, where=None) -> int: ...
+    @abstractmethod def get(self, collection, ids=None, where=None, limit=None,
+                            include_embeddings=False, include_documents=True, include_metadatas=True) -> list[dict]: ...
+    @abstractmethod def search(self, collection, query_embedding, *, n_results=10, where=None, include_embeddings=False) -> list[dict]: ...
+    @abstractmethod def count(self, collection, where=None) -> int: ...
+```
+
+子类**必须实现全部 12 个方法**，命名与关系型基类保持平行（`create_collection ↔ create_table`、`get_or_create_collection ↔ ensure_table`、`drop_collection ↔ drop_table`）。**允许一个后端同时继承 `DatabaseClientBase` 和 `VectorClientBase`**（如未来的 Postgres + pgvector），上层用 `isinstance` 判断能力即可。本轮只落地 Chroma 一个向量后端。
+
 ---
 
 ## 七、逐个文件讲解（源码导读）
@@ -529,6 +607,72 @@ class SQLiteClient(DatabaseClientBase):
   - **execute 包成 ValueError**：不让上层 import sqlite3 去 catch sqlite3.Error，贯彻"上层不依赖驱动"的分层原则；所有数据库错误都是 ValueError 的子类消息里能看到原始 SQL，便于排查。
 - **你要改的时候最该看的地方**：加新的便捷方法（如 `count / exists / upsert`）时，先想清楚是不是能通过组合 `query/execute` 实现，如果只是个别业务场景需要，加在业务层不要加到公共客户端里；加新后端时，直接对照 `DatabaseClientBase` 新增一个 `xxx_client.py`，不要在 SQLiteClient 里塞方言判断；改谓词编译时记住**读侧 `_compile_query` 与写侧 `_compile_filters` 都收敛到 `_compile_filter`**，改一处要同时回归 `select_where / update_where / delete_where`。
 
+### 7.6 `vector_query.py` —— 向量元数据过滤模型（向量侧的 `query.py`）
+
+```python
+class VectorFilter(BaseModel):
+    field:   Optional[str] = None
+    op:      VectorFilterOp
+    value:   Optional[Any] = None
+    filters: Optional[list["VectorFilter"]] = None
+```
+
+- **负责什么**：给向量侧提供"声明式元数据过滤"的数据模型，地位对应关系型的 `query.py`。一个 `VectorFilter` 兼做两种角色——单个叶子条件（`field + op + value`）或 AND/OR 逻辑组合（`op=AND/OR + filters`，子条件可继续嵌套）。
+- **关键实现**：`VectorFilterOp` 的枚举值就是 Chroma 的 `$` 操作符（`$eq / $ne / $gt / $gte / $lt / $lte / $in / $nin / $and / $or`）；`VectorWhere = Union[dict, VectorFilter, None]` 让调用方既能传模型、也能直接传 Chroma 原生 where dict。
+- **为什么这么写**：**不为复用而强行统一**。关系型 `Filter` 支持 LIKE / IS NULL、当前是平铺 AND；向量侧支持 AND/OR 嵌套、没有 LIKE / IS NULL。两者谓词集合不同，硬合并会让两边互相绑手绑脚，保持两个平行模型、命名风格一致即可。
+
+### 7.7 `vector_client_base.py` —— 向量抽象基类
+
+```python
+class VectorClientBase(ABC):
+    @abstractmethod
+    def create_collection(self, name, *, dimension=None, metric="cosine"): ...
+    @abstractmethod
+    def add(self, collection, ids, embeddings=None, documents=None, metadatas=None) -> int: ...
+    @abstractmethod
+    def search(self, collection, query_embedding, *, n_results=10, where=None, include_embeddings=False): ...
+```
+
+- **负责什么**：定义所有向量后端（Chroma / 未来 FAISS / Milvus / pgvector）必须实现的最小接口集——连接（3）+ 集合管理（4）+ 写入/删除/取/检索/计数（5）共 **12 个方法**。
+- **关键实现**：
+  - 命名与 `DatabaseClientBase` 平行（"动词 + 对象"，集合方法对齐表方法），降低记忆成本；
+  - **安全约定**：`delete` 的 `ids` 与 `where` 至少要有一个非空，空条件禁止删全量（与 `SQLiteClient.delete_where` 同一条安全线）；同时传 `ids` 与 `where` 时**以 ids 为准**，不依赖各后端未文档化的混用行为；
+  - `get` 暴露 `include_embeddings / include_documents / include_metadatas` 三个开关（默认不返回向量以省内存/流量）。
+- **为什么这么写**：不把事务 / DDL 迁移 / 外键这类关系型专有能力塞进向量基类（向量库普遍不支持）；两套基类平行之后，一个后端可以**同时继承两者**（Postgres + pgvector），上层 `isinstance` 即判断能力。**你要接新向量后端时，第一个要照着实现的就是这个类。**
+
+### 7.8 `chroma_client.py` —— Chroma 向量后端（首个向量实现）
+
+```python
+class ChromaClient(VectorClientBase):
+    def __init__(self, path=None, *, host=None, port=8000, ssl=False,
+                 headers=None, tenant=None, database=None,
+                 settings=None, add_chunk_size=1000):
+        try:
+            import chromadb                       # 延迟导入：核心依赖里不含 chromadb
+        except ImportError as e:
+            raise ImportError("使用 ChromaClient 需要先安装 chromadb 可选依赖：\n"
+                              "    pip install fast-agents[chroma]") from e
+        if (path is None) == (host is None):      # path / host 二选一
+            raise ValueError("ChromaClient 必须在 path（本地）与 host（远端）中二选一")
+```
+
+- **负责什么**：database 模块**第一个向量后端**，把 chromadb SDK 封装成与 `SQLiteClient` 同风格——集合名白名单校验、空条件删除拦截、对外返回统一摊平为 `list[dict]`（不向外泄露 SDK 的 dict-of-lists 原始结构）。两种连接模式：
+  - **本地持久化**：`ChromaClient(path="./chroma_data")` → `chromadb.PersistentClient`，向量落盘到该目录、重启可恢复，适合单机 / 开发；
+  - **远端服务**：`ChromaClient(host="127.0.0.1", port=8000)` → `chromadb.HttpClient`，连独立启动的 Chroma Server，适合生产 / 多进程共享；`ssl / headers / tenant / database` 均可透传。
+- **关键实现（也是相对"最小可用版"的优化点）**：
+  1. **少一次 RPC —— `get_or_create_collection` 走 SDK 原生幂等接口**：原实现「先 `collection_exists` 再 `create_collection`」要两次往返，现直接调 `client.get_or_create_collection(...)`，一次完成「有则取、无则建」；`collection_exists` 命中本地 collection 缓存时直接返回，不再每次发请求。
+  2. **`delete` 精确计数 + 少一次全量扫描**：改用 `col.get(ids=... / where=..., include=[])` 先拿到目标 id 数再删除，**直接返回精确条数**；不再「删前 `count` 一次、删后 `count` 一次」两次全量统计。并把 `ids` / `where` 语义固定为「传了 `ids` 就按 id 删、否则按 `where` 删」。
+  3. **`dimension` 真正生效**：Chroma 本身**不强制向量维度**（空集合写入任意维度都会成功）。本实现建集时把维度写进集合 metadata（键 `dimension`，可跨进程读回），`add` / `search` 时做**客户端侧维度校验**；对未声明维度的集合，按**首次写入**的维度推断并记住。维度不一致在写入/检索前就报中文错误，而不是等 SDK 抛晦涩异常。
+  4. **大批量写入自动分块**：`add` 超过 `add_chunk_size`（默认 1000）时自动分批 upsert，避免一次提交撞上 Chroma/SQLite 单批上限而**整体失败**；返回仍是总条数。
+  5. **默认关闭匿名遥测**：未显式传 `settings` 时用 `Settings(anonymized_telemetry=False)`，不向外部发送使用统计。
+  6. **健壮性补强**：`add` 校验 ids 批内去重（Chroma 内部会抛 `DuplicateIDError`，提前拦下给中文错误）与批内 embedding 维度一致；`get` 校验 `limit` 为正整数（Chroma 会忽略 `limit=0`）；`connect` 加双检锁避免多线程并发首次调用重复建 client；清理结果摊平函数里的死参数。
+  7. **兜底修掉一个真实缺陷**：对**已存在但 metadata 为空**的集合调用 `get_or_create_collection`，Chroma 0.6.x 合并 metadata 会抛 `TypeError: 'NoneType' object is not iterable`，实现里捕获后回退 `get_collection`，不再崩。
+- **为什么这么写**：
+  - **可选依赖放 extras**：`chromadb` 不进核心依赖（`pyproject.toml` 的 `[project.optional-dependencies] chroma = ["chromadb>=0.4,<1.0"]`），保持"零重型依赖"招牌；未装时构造 `ChromaClient` 抛清晰 `ImportError`，关系型能力完全不受影响。
+  - **集合名白名单对齐 Chroma SDK 真实规则**：`^[a-zA-Z0-9][a-zA-Z0-9_-]{1,61}[a-zA-Z0-9]$`——3–63 字符、首尾必须是字母或数字、中间允许字母/数字/下划线/连字符（实测 SDK 拒绝单字符名与以下划线/连字符结尾的名），把非法名挡在客户端而非直达 SDK。
+  - **过滤编译集中**：`_compile_vector_filter` 把 `VectorFilter` 编译成 Chroma 的 `where` 字典；同时接受**已是 dict** 的输入原样透传，给熟悉 Chroma 原生 where 格式的高级用户留口子。
+- **你要改的时候最该看的地方**：新增向量后端（FAISS / Milvus / pgvector）时对着 `VectorClientBase` 写一个新的 `xxx_client.py`，不要在 `ChromaClient` 里堆后端判断；改维度校验时注意三个入口（`create_collection` 写 metadata、`add` 校验、`search` 校验）要一致；`_flatten_get_result` / `_flatten_query_result` 是"对外输出统一 dict"的唯一出口，改返回结构只能改这里。
+
 ---
 
 ## 八、快速上手
@@ -538,17 +682,19 @@ class SQLiteClient(DatabaseClientBase):
 ```powershell
 cd D:\path\to\fast_agents
 
-# 依赖（database 模块本身零新增依赖，只要装好仓库 requirements 即可）
+# 依赖（关系型零新增依赖，装好仓库 requirements 即可；向量后端另需可选依赖）
 pip install -r requirements.txt
+# pip install fast-agents[chroma]     # 仅当要用 ChromaClient 时才装
 
-# 跑测试（82/82 全过才算装好）
+# 跑测试（105/105 全过才算装好；未装 chromadb 时 17 项向量端到端自动 skip，显示 88 passed, 17 skipped 也属正常）
 python test\test_database.py
 
-# 跑四个示例（全部用内存/临时库，跑完不留脏文件）
+# 跑五个示例（全部用内存/临时库，跑完不留脏文件）
 python examples\database\basic_usage.py
 python examples\database\create_table_usage.py
 python examples\database\query_filter_usage.py
 python examples\database\conditional_write_usage.py
+python examples\database\chroma_usage.py    # 需先 pip install fast-agents[chroma]
 ```
 
 > **命令必须按 Windows PowerShell 写**：项目里的 `test/` 目录和标准库 `test` 包同名，所以用 `python test\xxx.py` **直接执行**，不要用 `python -m test.xxx`（那会跑成标准库测试）。
@@ -672,7 +818,47 @@ db.ensure_schema(Schema(
 python test\test_database.py
 ```
 
-预期输出末尾为 `82 passed`（具体数字随版本更新）。任何一个 FAILED 都说明环境有问题（Python 版本过低 / 文件被占用 / 磁盘只读等），按报错定位即可。
+预期输出末尾为 `105 passed`（具体数字随版本更新）；若当前环境未装 chromadb，则显示 `88 passed, 17 skipped`——被跳过的 17 项是向量端到端用例（用 `pytest.importorskip("chromadb")` 标记），装好可选依赖后即为全绿。任何一个 FAILED 都说明环境有问题（Python 版本过低 / 文件被占用 / 磁盘只读等），按报错定位即可。
+
+### 8.6 向量后端快速上手（Chroma，可选依赖）
+
+向量能力是 database 模块的**第二套平行后端**，只在需要语义检索时才装可选依赖：
+
+```powershell
+pip install fast-agents[chroma]          # 等价于 pip install "chromadb>=0.4,<1.0"
+python examples\database\chroma_usage.py
+```
+
+最小可运行示例（本地持久化目录，跑完删目录；零 API Key）：
+
+```python
+import tempfile
+from fast_agents.database import ChromaClient, VectorFilter, VectorFilterOp
+
+with tempfile.TemporaryDirectory() as d:
+    db = ChromaClient(path=d)              # 本地持久化；远端用 ChromaClient(host="127.0.0.1", port=8000)
+    db.get_or_create_collection("faq", dimension=2, metric="cosine")   # 幂等建集，声明 2 维
+
+    db.add(
+        "faq",
+        ids=["q1", "q2"],
+        embeddings=[[1.0, 0.0], [0.0, 1.0]],
+        documents=["你好", "再见"],
+        metadatas=[{"lang": "zh"}, {"lang": "zh"}],
+    )
+
+    print(db.count("faq"))                                  # 2
+    print(db.get("faq", ids=["q1"])[0]["document"])          # 你好
+
+    hits = db.search("faq", [0.9, 0.1], n_results=1)         # 近邻检索
+    print(hits[0]["id"], hits[0]["distance"])                # q1 <distance>
+
+    db.delete("faq", where=VectorFilter(field="lang", op=VectorFilterOp.EQ, value="zh"))
+    db.drop_collection("faq")
+    db.close()
+```
+
+> 未装 chromadb 时构造 `ChromaClient` 会抛 `ImportError` 并提示安装命令；不装也**不影响关系型的任何用法**（`from fast_agents.database import SQLiteClient` 照常可用）。
 
 ---
 
@@ -776,6 +962,46 @@ with db:
 
 另外，`update_where` / `delete_where` 的 `query.filters` **必填**（空条件直接报错），这是安全约定而非能力缺失；要全表改删请显式写裸 SQL。
 
+### 9.4 `ChromaClient(path=None, *, host=None, port=8000, ssl=False, headers=None, tenant=None, database=None, settings=None, add_chunk_size=1000)`
+
+> 需先 `pip install fast-agents[chroma]`；`path`（本地）与 `host`（远端）**二选一**，都不给或都给都抛 `ValueError`。
+
+#### 连接 / 生命周期
+
+| 方法 | 说明 | 返回 |
+|---|---|---|
+| `connect()` | 建立 PersistentClient 或 HttpClient（幂等、加锁） | None |
+| `close()` | 清空缓存与 client 引用 | None |
+| `ping()` | `heartbeat()` 连通性检查 | bool |
+
+#### 集合管理（对应关系型的"表"）
+
+| 方法 | 参数 | 说明 |
+|---|---|---|
+| `collection_exists(name)` | name: str | 集合是否存在（命中缓存直接返回） |
+| `create_collection(name, *, dimension=None, metric="cosine")` | metric ∈ {cosine, ip, l2} | 建集并写 `hnsw:space`；`dimension` 写进 metadata；已存在抛 ValueError |
+| `get_or_create_collection(name, *, dimension=None, metric="cosine")` | — | **幂等建集**（走 SDK 原生接口，一次往返） |
+| `drop_collection(name)` | — | 删集合，不存在静默 |
+
+#### 写入 / 删除 / 取 / 检索 / 计数
+
+| 方法 | 参数 | 返回 | 说明 |
+|---|---|---|---|
+| `add(collection, ids, embeddings=None, documents=None, metadatas=None)` | 三个内容字段至少一个非空，长度须与 ids 一致 | int（写入条数） | 按 id upsert（同名覆盖）；ids 去重、批内维度一致、与声明维度一致校验；超 `add_chunk_size` 自动分块 |
+| `delete(collection, ids=None, where=None)` | ids / where 至少一个非空 | int（精确删除条数） | 传 ids 按 id 删、否则按 where 删；**空条件抛 ValueError** 防误删全量 |
+| `get(collection, ids=None, where=None, limit=None, include_embeddings=False, include_documents=True, include_metadatas=True)` | — | `list[dict]` | 精确取（非近邻）；`limit` 须为正整数 |
+| `search(collection, query_embedding, *, n_results=10, where=None, include_embeddings=False)` | query_embedding: list[float] | `list[dict]` | 近邻检索，按距离升序；结果含 `distance`（`include_embeddings=True` 时含 `embedding`） |
+| `count(collection, where=None)` | — | int | 无 where 走 `col.count()`；有 where 走 `get(include=[])` 计数 |
+
+### 9.5 向量数据模型速查
+
+| 类 | 构造常用字段 | 用途 |
+|---|---|---|
+| `VectorFilterOp` | 枚举：EQ/NE/GT/GTE/LT/LTE/IN/NIN/AND/OR（枚举值即 Chroma `$` 操作符） | 向量元数据过滤操作符 |
+| `VectorFilter(field=None, op=..., value=None, filters=None)` | — | 叶子条件（field+op+value）或 AND/OR 组合（op+filters，≥2 个）；由 `chroma_client._compile_vector_filter` 编译为 Chroma where |
+| `VectorWhere` | = `dict \| VectorFilter \| None` | 向量过滤入参类型别名；`None` 表示无条件 |
+| `VectorClientBase` | 抽象基类 | 向量后端契约（12 个抽象方法），与 `DatabaseClientBase` 平行 |
+
 ---
 
 ## 十、设计决策与常见坑
@@ -806,6 +1032,15 @@ with db:
 8. **为什么 `update_where / delete_where` 强制 filters 非空，而 `SqlExpr` 又要显式包裹？**
    两条都是「防手滑」：前者的痛点是「忘写条件 → 全表被改/被删」，与 `delete` 必须带 where 是同一条安全线；后者的痛点是「把外部输入拼进 SQL → 注入」，所以只有显式 `SqlExpr` 包装的内容才允许原样拼入，普通值一律参数化。宁可多写一点，也不给「图方便」留口子。
 
+9. **为什么向量能力另起一套平行抽象，而不塞进 `DatabaseClientBase`？**
+   关系型与向量型的能力模型差异太大——前者是表/列/事务/精确谓词/SQL，后者是集合/向量/元数据/近邻检索。硬塞进一个基类会强迫所有已有关系型后端实现一堆用不上的向量方法，破坏"零破坏性重构"。改成两套平行基类后，谁需要向量能力谁再继承 `VectorClientBase`（如未来的 Postgres + pgvector 同时继承两个），上层用 `isinstance` 判断即可，已有后端一行不改。
+
+10. **为什么 `chromadb` 走可选依赖（extras）而不是核心依赖？**
+   仓库招牌是"零重型依赖、基于 OpenAI 原生 API"；`chromadb` 带一堆传递依赖（hnswlib / onnxruntime 等），装进核心依赖会显著抬高所有使用者的安装成本。放到 `[project.optional-dependencies] chroma` 后，不用向量的人 `pip install fast-agents` 依旧轻量，用的人 `pip install fast-agents[chroma]` 即可；`ChromaClient` 内部延迟导入、未装时抛清晰 `ImportError`。
+
+11. **为什么向量过滤模型（`vector_query.py`）不复用关系型的 `Filter`？**
+   两者谓词集合不同：向量侧支持 AND/OR **嵌套**、不支持 `LIKE` / `IS NULL`（Chroma metadata 过滤本身没有这两个能力）；关系型 `Query` 目前是平铺 AND、有 LIKE/IS NULL。强行复用会让两边都被对方边界绑住。保持两个模型平行、命名风格一致（`Filter`↔`VectorFilter`、`FilterOp`↔`VectorFilterOp`），各自演进互不影响。
+
 ### 10.2 常见坑与排查
 
 | 现象 | 原因 / 解决 |
@@ -821,6 +1056,12 @@ with db:
 | `Column(index=True)` 没有看到建索引 | 主键列 / UNIQUE 列 SQLite 已自动建索引，模块会跳过避免冗余（`column_index_stmt` 里显式判断）。不是 bug |
 | BOOLEAN 列查出来是 0/1，不是 True/False | 是设计如此（SQLite 无原生 BOOLEAN）。业务层 `bool(row["flag"])` 转一下；或用 `detect_types=sqlite3.PARSE_DECLTYPES` + 注册适配器（当前没注册，保持简单） |
 | TIMESTAMP 列存什么格式 | 存 ISO 8601 字符串（对齐 memory 模块的 `updated_at/created_at` 习惯），不要存 datetime 对象——SQLite 没有原生时间类型，字符串排序等价于时间排序（只要是 ISO 格式） |
+| `ImportError: 使用 ChromaClient 需要先安装 chromadb 可选依赖` | 没装可选依赖。执行 `pip install fast-agents[chroma]`（或 `pip install "chromadb>=0.4,<1.0"`）。不装不影响关系型能力 |
+| `ValueError: 非法集合名: 'ab'；需 3-63 字符...` | Chroma 集合名约束：3–63 字符、**首尾必须是字母或数字**、中间允许字母/数字/`_`/`-`。单字符名（`'a'` / `'t'`）与以下划线/连字符结尾的名都会被拒 |
+| `ValueError: embedding 维度(x) 与集合 'y' 声明的维度(z) 不一致` | 建集时声明了 `dimension`，写入/检索向量必须与之一致（Chroma 空集合本身不校验，是客户端补的位）。要么对齐维度，要么建集时不声明 |
+| `ValueError: delete 的 ids 和 where 不能同时为空（防止误删全量）` | 向量版 `delete` 与关系型 `delete` 同一条安全线：不带条件不允许删全量。要清空集合请用 `drop_collection` |
+| `ValueError: 同一批 embeddings 维度不一致：[...]` | 一次 `add` 的 embeddings 必须同维度；分批前先对齐 |
+| `TypeError: 'NoneType' object is not iterable`（`get_or_create_collection` 时） | Chroma 0.6.x 对「已存在但 metadata 为空」的集合合并 metadata 的缺陷；本实现已捕获回退，若绕过 client 直接用 SDK 需自行注意 |
 
 ### 10.3 跨平台注意事项（Windows 专项）
 
@@ -841,7 +1082,7 @@ with db:
 
 | 测试文件 | 项数 | 覆盖点 | 运行命令 |
 |---|---|---|---|
-| `test/test_database.py` | **82 / 82**（初版基线，2026-11-03） | 连接与基本 CRUD / 字典返回 / 事务提交 / 事务回滚 / 异常后可继续使用 / select order_by 与 limit / 列名注入防护 / 非法 order_by 拦截 / delete 必须传 where / 内存库 / 文件库持久化 / close 后自动重连 / **dict 方式建表** / **list[Column] 方式建表** / **Schema 方式建表** / table_exists 幂等 / 列级索引自动建 / 复合索引 / 唯一约束 / default 值类型映射（布尔/数字/字符串/None） / BOOLEAN→0/1 / VARCHAR→TEXT / TIMESTAMP→TEXT / ensure_table 幂等重复调用 / ensure_schema 重复调用幂等 / **migrate=True 补列** / migrate=False 不补列 / drop_table / 手写 CREATE TABLE 仍可用（向后兼容） / 上下文管理器嵌套报错语义 / 批量 executemany / executescript 多语句 / 标识符非法名报错 / **谓词下推**：EQ/NEQ/GT/GTE/LT/LTE 六类比较 / LIKE 模糊 / IN 集合匹配（含空列表/非列表值拦截） / IS NULL / IS NOT NULL / 二元操作符漏 value 报错 / 多 Filter AND 组合 / 同字段多 Filter 参数名不冲突 / sort_by + ASC/DESC + limit + offset 组合 / 仅 offset 无 limit 自动补 LIMIT -1 / limit/offset 负数拦截 / 字段名非法注入拦截 / value 参数化（SQL 片段不会被执行） / select_one_where 单行返回与 None / select_one_where 不污染原 Query 对象 / 无 filters 全量返回 / select_where 入参类型检查 / 原 select(where=dict) 等值写法继续可用 / **count**：总行数 / 带条件计数（含 IS NULL）/ 非法表名拦截 / **batch_insert**：基础批量插入 / 空列表返回 0 / 字段不一致拦截 / 非法表名拦截 / **upsert**：插入新行 / 冲突更新且不新增行 / update_columns 限定列 / conflict_keys 缺失拦截 / 非法表名拦截 / **update_where**：比较谓词 GTE / IN 谓词 / SqlExpr 自增表达式 / 空 filters 拦截 / 值参数化防注入 / **delete_where**：比较谓词 LT / IN 谓词 / 空 filters 拦截且不误删 / **多列排序**：sort_by list 升序与降序 / 单字段 str 排序兼容 / 空 sort_by 列表拦截 / busy_timeout 与 timeout 同口径 / SqlExpr 空表达式拦截 | `python test\test_database.py` |
+| `test/test_database.py` | **105 / 105**（初版基线，2026-11-03；其中 17 项向量端到端需 chromadb，未装时自动 skip） | 连接与基本 CRUD / 字典返回 / 事务提交 / 事务回滚 / 异常后可继续使用 / select order_by 与 limit / 列名注入防护 / 非法 order_by 拦截 / delete 必须传 where / 内存库 / 文件库持久化 / close 后自动重连 / **dict 方式建表** / **list[Column] 方式建表** / **Schema 方式建表** / table_exists 幂等 / 列级索引自动建 / 复合索引 / 唯一约束 / default 值类型映射（布尔/数字/字符串/None） / BOOLEAN→0/1 / VARCHAR→TEXT / TIMESTAMP→TEXT / ensure_table 幂等重复调用 / ensure_schema 重复调用幂等 / **migrate=True 补列** / migrate=False 不补列 / drop_table / 手写 CREATE TABLE 仍可用（向后兼容） / 上下文管理器嵌套报错语义 / 批量 executemany / executescript 多语句 / 标识符非法名报错 / **谓词下推**：EQ/NEQ/GT/GTE/LT/LTE 六类比较 / LIKE 模糊 / IN 集合匹配（含空列表/非列表值拦截） / IS NULL / IS NOT NULL / 二元操作符漏 value 报错 / 多 Filter AND 组合 / 同字段多 Filter 参数名不冲突 / sort_by + ASC/DESC + limit + offset 组合 / 仅 offset 无 limit 自动补 LIMIT -1 / limit/offset 负数拦截 / 字段名非法注入拦截 / value 参数化（SQL 片段不会被执行） / select_one_where 单行返回与 None / select_one_where 不污染原 Query 对象 / 无 filters 全量返回 / select_where 入参类型检查 / 原 select(where=dict) 等值写法继续可用 / **count**：总行数 / 带条件计数（含 IS NULL）/ 非法表名拦截 / **batch_insert**：基础批量插入 / 空列表返回 0 / 字段不一致拦截 / 非法表名拦截 / **upsert**：插入新行 / 冲突更新且不新增行 / update_columns 限定列 / conflict_keys 缺失拦截 / 非法表名拦截 / **update_where**：比较谓词 GTE / IN 谓词 / SqlExpr 自增表达式 / 空 filters 拦截 / 值参数化防注入 / **delete_where**：比较谓词 LT / IN 谓词 / 空 filters 拦截且不误删 / **多列排序**：sort_by list 升序与降序 / 单字段 str 排序兼容 / 空 sort_by 列表拦截 / busy_timeout 与 timeout 同口径 / SqlExpr 空表达式拦截 / **向量抽象层**：VectorClientBase 12 个抽象方法齐全 / VectorFilter 叶子与 AND 组合编译为 Chroma where / dict 透传 / AND 组合至少 2 子条件拦截 / **ChromaClient**：path 与 host 二选一拦截 / 非法集合名拦截 / 本地持久化全链路（建集→写→按 id 取→近邻 search→where 过滤→按条件删→幂等建集→drop 幂等）/ add 长度一致性与空 ids 拦截 / search 空向量与 n_results=0 拦截 / 带 where 的 count / 非法 metric 拦截 / 建集把 dimension 写入 metadata 并拒绝重复建集 / get_or_create 幂等且保留维度 / add ids 去重拦截 / 批内维度不一致拦截 / 与声明维度不符拦截 / search 维度不符拦截 / add_chunk_size 分块写入 / get limit 校验与 include 开关 / delete ids 优先且精确计数 / 无 metadata 集合的 get_or_create 兜底 | `python test\test_database.py` |
 
 **关键回归断言**（这几条锁住了核心设计承诺，改代码时必须保留）：
 
@@ -856,15 +1097,16 @@ with db:
 - `test_select_one_where` + 末尾 `q.limit is None` 断言 —— 锁死 select_one_where 的 limit=1 是内部行为，不污染调用方传入的 Query 对象（避免共享 Query 复用时被意外改 limit）；
 - `test_select_where_still_works` —— 锁死原 dict 等值 API 在引入 select_where 后**不被破坏、不被替换**。
 
-**全绿基线**：在 Windows PowerShell + Python 3.10+（仓库 `.python-version` = 3.10）+ 干净 venv（只装 requirements.txt）环境下，`python test\test_database.py` 必须输出末尾显示 `82 passed`；任何一条红都视为环境或代码问题，不应合并。
+**全绿基线**：在 Windows PowerShell + Python 3.10+（仓库 `.python-version` = 3.10）+ 干净 venv（只装 requirements.txt）环境下，`python test\test_database.py` 必须输出末尾显示 `105 passed`（装好 `fast-agents[chroma]` 后）；未装 chromadb 时显示 `88 passed, 17 skipped` 也属正常基线。任何一条 FAILED 都视为环境或代码问题，不应合并。
 
-**跨模块回归**：database 改动后，除了本模块 82 项，还要跑一遍 `test_memory.py` 里涉及 SQLiteMemoryStore 的用例（虽然 memory 目前没直接用 ensure_schema 或 select_where，但共用 sqlite3 驱动，方言/默认 PRAGMA 变动可能影响），以及 `test_context.py` / `test_react_agent.py` 全套，确认没有隐式依赖被破坏。
+**跨模块回归**：database 改动后，除了本模块 105 项，还要跑一遍 `test_memory.py` 里涉及 SQLiteMemoryStore 的用例（虽然 memory 目前没直接用 ensure_schema 或 select_where，但共用 sqlite3 驱动，方言/默认 PRAGMA 变动可能影响），以及 `test_context.py` / `test_react_agent.py` 全套，确认没有隐式依赖被破坏。
 
 **当前测试与实现的已知差异**（如实写明，不粉饰）：
 
 - `connect()` 作为基类接口目前只在 `__init__` 和 `close()` 后被调用，没有独立单测；由于 `__init__` 已经调用 `_connect`，功能等价，风险低；
 - `select_where` 的 `sort_by` 已支持单字段与多字段；「按表达式排序」（如 `ORDER BY random()`）**没有实现**，这是刻意为之的能力边界（见 §5.4 / §9.3）；
-- OR / NOT / 括号分组 / JOIN / 聚合 / GROUP BY / 子查询**没有测试也不打算做**，保持零重型依赖。
+- OR / NOT / 括号分组 / JOIN / 聚合 / GROUP BY / 子查询**没有测试也不打算做**，保持零重型依赖；
+- 向量侧的 17 项 Chroma 端到端用例依赖可选依赖 `chromadb`，在未安装的环境里会被 `pytest.importorskip` 跳过（不是失败）；纯抽象/编译校验的 6 项向量用例不需要 chromadb，任何环境都会真跑。
 
 ---
 
@@ -874,7 +1116,10 @@ with db:
 
 ### 12.1 初版已交付
 
-- **初版**（v1.0.0，2026-11-03）：`fast_agents/database/` 5 个源码文件；SQLiteClient 支持连接与上下文事务、基础 SQL 通道（execute / executemany / executescript / query）、三种声明式建表 + 幂等建索引 + `migrate=True` 补列、CRUD（insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete）、读侧谓词下推（9 种 FilterOp + AND + 单/多列排序 + limit/offset）、写侧条件写入（`upsert` + `update_where` / `delete_where` + `SqlExpr`）、标识符白名单防注入；非内存库默认开启 WAL + foreign_keys，并显式设 `PRAGMA busy_timeout`；`test/test_database.py` **82/82** 全绿；配套 4 个示例。
+- **初版**（v1.0.0，2026-11-03）：`fast_agents/database/` **8 个源码文件**，同一版本内包含**关系型 + 向量型**两套平行后端。
+  - **关系型**：`SQLiteClient` 支持连接与上下文事务、基础 SQL 通道（execute / executemany / executescript / query）、三种声明式建表 + 幂等建索引 + `migrate=True` 补列、CRUD（insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete）、读侧谓词下推（9 种 FilterOp + AND + 单/多列排序 + limit/offset）、写侧条件写入（`upsert` + `update_where` / `delete_where` + `SqlExpr`）、标识符白名单防注入；非内存库默认开启 WAL + foreign_keys，并显式设 `PRAGMA busy_timeout`。
+  - **向量型**：`VectorClientBase`（12 个抽象方法，与 `DatabaseClientBase` 平行）+ `VectorFilter` 元数据过滤模型（EQ/NE/GT/…/IN/AND/OR）+ `ChromaClient` 首个向量后端（本地 `PersistentClient` / 远端 `HttpClient` 双模式，`chromadb` 走可选依赖 extras；含"少一次往返 / delete 精确计数 / dimension 真正生效 / add 自动分块 / 关匿名遥测 / 健壮性补强"等优化）。
+  - `test/test_database.py` **105/105** 全绿（82 关系型 + 23 向量，其中 17 项需 chromadb）；配套 **5 个**示例。
 
 ### 12.2 待办（按优先级）
 
@@ -883,6 +1128,8 @@ with db:
 3. **J4 · MySQL / Postgres 后端**（P2，依赖 G4 打包发布）—— 现状：`DatabaseClientBase` 抽象基类已经定义契约（含 `select_where / select_one_where`），但只有 SQLite 实现。目标：新增 `fast_agents/database/mysql_client.py` / `postgres_client.py`，通过同一套 Schema/Column/Query 模型，让上层 0 改动切换后端（走 `pip install fast-agents[mysql]` / `[postgres]` 装可选驱动）。**为什么现在不做**：现阶段 fast_agents 的目标场景是个人 / 小团队本地 Agent，SQLite 单文件零运维更合适；等 G4 PyPI 发布、有服务端部署需求时再做。
 4. **J5 · 统一异常体系**（P2）—— 现状：所有异常包成 ValueError。目标：定义 `DatabaseError` 基类，派生 `IntegrityError / NotFoundError / MigrationError / ConnectionError / IdentifierError / QueryCompileError`，上层能按错误类型 catch。**为什么现在不做**：目前上层只有 database 自身 + 未来 J3 迁移过来的 memory，一律 `except ValueError` 够用；等 G1 trace / A12 审计等更多模块接入时再细分异常类型收益更大。
 5. **J6 · upsert**（P3）—— **单条已落地**：`upsert(table, data, conflict_keys, update_columns=None)` 已提供 `ON CONFLICT DO UPDATE`；`batch_insert` 提供参数化批量插入。**剩余目标**：批量 upsert（一次多条冲突更新），等 memory 迁移后出现真实批量冲突写场景再做。
+6. **J7 · 语义记忆（`memory/semantic_store.py`）接入 `VectorClientBase`**（P2，依赖 J3 节奏；本轮新增编号，`演进路线图.md` 的 J 模块同步随后）—— 现状：database 模块已提供 `VectorClientBase` + `ChromaClient`，但 `memory/` 层尚未接入；本轮刻意**不动** `semantic_store.py`，先把 database 层的向量抽象站稳。目标：让语义记忆通过 `VectorClientBase`（默认 `ChromaClient`）落盘，不在 memory 层直接 `import chromadb`，与关系型一样"只依赖抽象"。**为什么现在不做**：先把 database 层的向量抽象与首个后端交付、验收，再动上层，避免一次改动跨两层、破坏面过大。
+7. **J8 · 远端 Chroma Server / 其他向量后端**（P3）—— 现状：`ChromaClient` 已支持远端 `HttpClient` 模式（`host/port/ssl/headers/tenant/database`），但尚未在真实服务端验证；FAISS / Milvus / pgvector 后端未实现。目标：补齐更多向量后端，均实现同一套 `VectorClientBase`。**为什么现在不做**：等出现真实的多机 / 大库检索需求再做，避免为不存在的问题提前造轮子。
 
 当前初版最明显的空缺：**跨模块迁移（memory/trace/profile 仍各自手写建表，J3）**——database 模块的建表 / CRUD / 读侧谓词下推 / 写侧条件写入（upsert + update_where/delete_where）已足以覆盖 memory 三个 SQLite 后端的全部现有用法，下一个阻塞点就是把上层真正接进来。
 
@@ -906,7 +1153,7 @@ with db:
 写完/改完本模块文档后，逐项对照勾选：
 
 - [x] 文档名为 `database模块编写说明.md`，落位 `docs/`（与既有文档同级）；
-- [x] 开篇写清了定位、配套代码路径、版本（v1.0.0）、平台（Win/macOS/Linux）、依赖（零新增、仅 sqlite3+pydantic），且有可跳转目录；
+- [x] 开篇写清了定位、配套代码路径、版本（v1.0.0）、平台（Win/macOS/Linux）、依赖（关系型零新增、仅 sqlite3+pydantic；向量 chromadb 为可选依赖），且有可跳转目录；
 - [x] 有更新历史（以初版 v1.0.0 为起点）；后续版本破坏性变更都必须给迁移办法；
 - [x] 第二章讲清了分层（门面/抽象/声明模型/查询模型/实现/业务）和 5 条设计原则，后续源码导读的每一处设计都能回指某条原则；
 - [x] 第三章包含对比总表（裸 sqlite3/SQLAlchemy/SQLModel/LangChain/CrewAI/fast_agents 六家）+ 异同表（**明确列出了"缺少什么"：多后端、连接池、迁移不完整、OR/JOIN/聚合等**）；
@@ -918,8 +1165,10 @@ with db:
 - [x] API 速查按类分小节（SQLiteClient 连/DDL/CRUD/事务 + 数据模型速查），无已废弃旧 API 需迁移；
 - [x] 第十章三块齐全：设计决策 6 条（每条都是"为什么不是另一种做法"）、常见坑 11 条（每条都是"现象 + 可执行解法"）、跨平台注意事项 6 条（无平台差异的内容不留"无"占位）；
 - [x] 跨平台注意事项已并入 10.3（按 v2.0 模板要求不再独立成章）；
-- [x] 测试章节列出 82 项覆盖点 + 关键回归断言（每条锁死一个设计承诺）+ 全绿基线；未单测 / 刻意不做的能力边界如实写明；
+- [x] 测试章节列出 105 项覆盖点（82 关系型 + 23 向量）+ 关键回归断言（每条锁死一个设计承诺）+ 全绿基线；未单测 / 刻意不做的能力边界如实写明；
 - [x] 演进路线 J2–J6 每条都说明"现状是什么、为什么现在不做"，与《演进路线图.md》的 G / J / B 系列编号一致；
 - [x] 章节数量、顺序、编号（开篇 → 一～十三 → 附录）与工具/记忆/Skill/MCP/context 五份成品文档完全一致；
 - [x] 全文无"待补充 / TBD"残留，无大段与 README 重复的安装/特性介绍（README 讲怎么用，本文讲怎么实现/怎么扩展，分工明确）；
+- [x] 向量后端如实写清了定位：`VectorClientBase` 与 `DatabaseClientBase` 平行、`ChromaClient` 为首个向量后端、`chromadb` 走可选依赖（未装时抛清晰 ImportError），并列出相对最小可用版的优化点；
+- [x] 向量型与关系型的边界写清楚（两套平行抽象、允许同时继承、向量过滤不支持 LIKE/IS NULL、delete 空条件禁止）；
 - [x] 换行符：`.md` 文件在仓库 `.gitattributes` 中声明为 `text eol=crlf`（LF 入库、Windows 检出 CRLF），符合交付要求。

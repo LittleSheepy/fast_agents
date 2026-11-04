@@ -8,7 +8,7 @@
 - 与 SQLiteClient 风格对齐：集合名白名单校验、空条件删除拦截、所有对外返回统一
   为 ``list[dict]``（不向外泄露 Chroma SDK 的 dict-of-lists 原始结构）。
 
-v1.1.1 相对 v1.1.0 的优化点（详见 docs/database模块编写说明.md 的更新历史 v1.1.1 与 §7.8）：
+本实现在最小可用版之上的优化点（详见 docs/database模块编写说明.md 的 §7.8 与更新历史 v1.0.0）：
 
 1. **少一次往返**：``get_or_create_collection`` 直接走 SDK 原生
    ``client.get_or_create_collection``（原来「先 collection_exists 再 create」两次 RPC）；
