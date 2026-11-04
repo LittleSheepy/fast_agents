@@ -680,11 +680,16 @@ class ReActAgent(AgentBase):
                         # 判断是否执行工具
                         if response.tool_calls:
                             tool_names = [tc.name for tc in response.tool_calls]
+                            return_direct_answer: Optional[str] = None
                             for tool_call in response.tool_calls:
                                 # 统一通过 invoke_tool 获取 ToolResult（含参数校验 / 错误捕获 / 截断）
                                 result = self.tool_registry.invoke_tool(
                                     tool_call.name, tool_call.arguments,
                                 )
+                                # return_direct：工具标记「结果直接作为最终答案返回」，不再进下一轮推理
+                                tool_obj = self.tool_registry.get_tool(tool_call.name)
+                                if tool_obj is not None and getattr(tool_obj, "return_direct", False) and result.succeeded:
+                                    return_direct_answer = result.output
                                 # 给不同 status 加上显式前缀，帮助模型理解结果性质
                                 observation = _render_observation(result)
                                 # 超长结果先卸载到磁盘：上下文里只留引用，模型可按需 read_offloaded 回读
@@ -699,6 +704,17 @@ class ReActAgent(AgentBase):
                                 # to_openai_message 里会用到
                                 tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
                                 self.messages.append(tool_msg)
+                            # return_direct 命中：本轮不再把 tool 结果喂给模型，直接作为最终答案返回
+                            if return_direct_answer is not None:
+                                final_answer = return_direct_answer
+                                if _dec_span is not None:
+                                    _tracer.end_span(
+                                        _dec_span,
+                                        output={"action": "return_direct", "tool_names": tool_names},
+                                    )
+                                # 跳出 while 推理循环（走 finally 做记忆沉淀）
+                                current_step = self.max_steps + 1
+                                break
                             # 本轮可能有新加载的技能，同步到 system 提示词（Level 2 详情）
                             if self.skill_middleware is not None:
                                 self.refresh_system_prompt()
