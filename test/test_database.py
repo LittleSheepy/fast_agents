@@ -970,3 +970,227 @@ def test_sql_expr_empty_rejected():
         SqlExpr("")
     with pytest.raises(ValueError):
         SqlExpr("   ")
+
+
+# ===========================================================================
+# 向量后端：VectorClientBase 抽象层 + 编译层
+# ===========================================================================
+
+def test_vector_client_base_abstract_methods():
+    """VectorClientBase 应覆盖连接/集合/写入/删除/取/检索/计数 7 类能力。"""
+    from fast_agents.database import VectorClientBase
+    expected = {"connect", "close", "ping",
+                "collection_exists", "create_collection", "get_or_create_collection", "drop_collection",
+                "add", "delete", "get", "search", "count"}
+    assert expected == VectorClientBase.__abstractmethods__
+
+
+def test_vector_filter_leaf_and_compile():
+    """叶子条件应编译成 Chroma where 格式。"""
+    from fast_agents.database import VectorFilter, VectorFilterOp
+    from fast_agents.database.chroma_client import _compile_vector_filter
+    f = VectorFilter(field="kind", op=VectorFilterOp.EQ, value="fact")
+    assert _compile_vector_filter(f) == {"kind": {"$eq": "fact"}}
+
+
+def test_vector_filter_and_compile():
+    """AND 组合条件应编译成 $and 嵌套。"""
+    from fast_agents.database import VectorFilter, VectorFilterOp
+    from fast_agents.database.chroma_client import _compile_vector_filter
+    f = VectorFilter(op=VectorFilterOp.AND, filters=[
+        VectorFilter(field="user_id", op=VectorFilterOp.EQ, value="u1"),
+        VectorFilter(field="score", op=VectorFilterOp.GTE, value=0.7),
+    ])
+    assert _compile_vector_filter(f) == {
+        "$and": [
+            {"user_id": {"$eq": "u1"}},
+            {"score": {"$gte": 0.7}},
+        ]
+    }
+
+
+def test_vector_filter_passthrough_dict():
+    """dict 原样透传，给熟悉 Chroma where 格式的高级用户留口子。"""
+    from fast_agents.database.chroma_client import _compile_vector_filter
+    assert _compile_vector_filter({"x": {"$gt": 1}}) == {"x": {"$gt": 1}}
+
+
+def test_vector_filter_and_needs_two_subfilters():
+    """AND/OR 组合至少 2 个子条件。"""
+    from fast_agents.database import VectorFilter, VectorFilterOp
+    from fast_agents.database.chroma_client import _compile_vector_filter
+    with pytest.raises(ValueError):
+        _compile_vector_filter(VectorFilter(op=VectorFilterOp.AND, filters=[
+            VectorFilter(field="a", op=VectorFilterOp.EQ, value=1),
+        ]))
+
+
+def test_chroma_client_requires_path_or_host():
+    """path 和 host 二选一，都不给/都给都报错。"""
+    pytest.importorskip("chromadb")
+    from fast_agents.database import ChromaClient
+    with pytest.raises(ValueError):
+        ChromaClient()
+    with pytest.raises(ValueError):
+        ChromaClient(path="/tmp/x", host="127.0.0.1")
+
+
+def test_chroma_client_invalid_collection_name():
+    """非法集合名（太短 / 首尾非字母数字 / 含特殊字符 / 过长）直接报错。"""
+    pytest.importorskip("chromadb")
+    from fast_agents.database import ChromaClient
+    import tempfile, os
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    db = ChromaClient(path=tmp)
+    for bad in ["ab", "_abc", "a" * 64, "abc!", "a b", "abc_"]:
+        with pytest.raises(ValueError):
+            db.create_collection(bad)
+    db.close()
+
+
+def test_chroma_client_lifecycle_local_persistent():
+    """本地持久化模式：建集→写→按id取→近邻搜索→按条件删→幂等建集→drop。"""
+    chromadb = pytest.importorskip("chromadb")
+    from fast_agents.database import ChromaClient
+    from fast_agents.database import VectorFilter, VectorFilterOp
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        assert db.ping() is True
+        # 幂等建集
+        db.get_or_create_collection("mem_v1", dimension=4, metric="cosine")
+        db.get_or_create_collection("mem_v1", dimension=4, metric="cosine")  # 重复调用幂等
+        assert db.collection_exists("mem_v1")
+        assert not db.collection_exists("mem_v2")
+        # 写 3 条：2 条 kind=fact、1 条 kind=preference
+        db.add(
+            "mem_v1",
+            ids=["m1", "m2", "m3"],
+            embeddings=[[1.0, 0.0, 0.0, 0.0],
+                        [0.9, 0.1, 0.0, 0.0],
+                        [0.0, 1.0, 0.0, 0.0]],
+            documents=["猫喜欢吃小鱼干", "猫爱睡觉", "我喜欢蓝颜色"],
+            metadatas=[{"kind": "fact", "score": 0.9},
+                       {"kind": "fact", "score": 0.8},
+                       {"kind": "preference", "score": 1.0}],
+        )
+        assert db.count("mem_v1") == 3
+        # 按 id 精确取
+        rows = db.get("mem_v1", ids=["m1"])
+        assert len(rows) == 1 and rows[0]["id"] == "m1" and rows[0]["document"] == "猫喜欢吃小鱼干"
+        assert "embedding" not in rows[0]  # 默认不带 embedding
+        rows_with_emb = db.get("mem_v1", ids=["m1"], include_embeddings=True)
+        assert "embedding" in rows_with_emb[0] and len(rows_with_emb[0]["embedding"]) == 4
+        # upsert 覆盖：m2 的 document/score 覆盖，m1/m3 保留
+        db.add("mem_v2_dummy" if False else "mem_v1",
+               ids=["m2"],
+               documents=["猫爱打盹"],
+               metadatas=[{"kind": "fact", "score": 0.85}],
+               embeddings=[[0.9, 0.15, 0.0, 0.0]])
+        assert db.count("mem_v1") == 3
+        m2 = db.get("mem_v1", ids=["m2"])[0]
+        assert m2["document"] == "猫爱打盹" and m2["metadata"]["score"] == 0.85
+        # 近邻检索：query ≈ [1,0,0,0] 应该先返回 m1、再 m2，m3 最远
+        hits = db.search("mem_v1", [1.0, 0.0, 0.0, 0.0], n_results=2)
+        assert len(hits) == 2
+        assert hits[0]["id"] == "m1"
+        assert hits[1]["id"] == "m2"
+        assert "distance" in hits[0]
+        # where 前置过滤：只在 preference 类里搜，应只返回 m3
+        hits_filtered = db.search("mem_v1", [1.0, 0.0, 0.0, 0.0], n_results=5,
+                                  where=VectorFilter(field="kind", op=VectorFilterOp.EQ, value="preference"))
+        assert [h["id"] for h in hits_filtered] == ["m3"]
+        # delete 空条件拒绝
+        with pytest.raises(ValueError):
+            db.delete("mem_v1")
+        # 按 metadata 条件删除：删 score >= 0.9 的 → m1(0.9) 会被保留？不，m1=0.9 >=0.9 删，m3=1.0 删，剩 m2
+        removed = db.delete("mem_v1", where=VectorFilter(field="score", op=VectorFilterOp.GTE, value=0.9))
+        assert removed == 2
+        assert db.count("mem_v1") == 1
+        assert db.get("mem_v1", ids=["m2"])[0]["document"] == "猫爱打盹"
+        # 按 id 删除
+        db.delete("mem_v1", ids=["m2"])
+        assert db.count("mem_v1") == 0
+        # drop 幂等
+        db.drop_collection("mem_v1")
+        db.drop_collection("mem_v1")  # 不存在静默
+        assert not db.collection_exists("mem_v1")
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_client_add_requires_consistent_lengths():
+    """embeddings/documents/metadatas 长度必须与 ids 一致。"""
+    pytest.importorskip("chromadb")
+    from fast_agents.database import ChromaClient
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("tt1")
+        with pytest.raises(ValueError):
+            db.add("tt1", ids=["a"], embeddings=[[1.0, 0.0], [0.0, 1.0]])
+        with pytest.raises(ValueError):
+            db.add("tt1", ids=["a"])  # 内容字段全空
+        with pytest.raises(ValueError):
+            db.add("tt1", ids=[])   # ids 空
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_client_search_rejects_bad_query_vector():
+    """query_embedding 必须是非空向量。"""
+    pytest.importorskip("chromadb")
+    from fast_agents.database import ChromaClient
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("tt1")
+        db.add("tt1", ids=["a"], embeddings=[[1.0, 0.0]])
+        with pytest.raises(ValueError):
+            db.search("tt1", [])
+        with pytest.raises(ValueError):
+            db.search("tt1", [1.0, 0.0], n_results=0)
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_client_count_with_where():
+    """带 where 的 count 走 get include=[] 计数。"""
+    pytest.importorskip("chromadb")
+    from fast_agents.database import ChromaClient
+    from fast_agents.database import VectorFilter, VectorFilterOp
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("tt1")
+        db.add("tt1", ids=["a", "b", "c"],
+               embeddings=[[1,0],[0,1],[1,1]],
+               metadatas=[{"v":1},{"v":2},{"v":3}])
+        assert db.count("tt1") == 3
+        assert db.count("tt1", where=VectorFilter(field="v", op=VectorFilterOp.GTE, value=2)) == 2
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_client_invalid_metric_rejected():
+    """metric 只能是 cosine / ip / l2。"""
+    pytest.importorskip("chromadb")
+    from fast_agents.database import ChromaClient
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        with pytest.raises(ValueError):
+            db.create_collection("tt1", metric="euclidean")
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+

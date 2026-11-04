@@ -17,6 +17,10 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
+[project.optional-dependencies]
+# 向量后端可选依赖：pip install fast-agents[chroma]
+chroma = ["chromadb>=0.4,<1.0"]
+
 [tool.uv.build-backend]
 module-root = ""
 
