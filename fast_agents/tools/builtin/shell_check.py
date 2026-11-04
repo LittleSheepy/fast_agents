@@ -1,17 +1,17 @@
 """shell_check.py
 判断命令是否需要 shell=True 执行
 仅支持 Windows，修复原实现中不考虑引号的问题
-"""
-
-from typing import List
-
-
 # Windows CMD / PowerShell 通用 shell 元字符（引号外出现才真正需要 shell）
 WIN_SHELL_METACHARS = frozenset((
     "|", ">", ">>", "<",      # 管道 / 重定向
     "&&", "||", "&",          # 命令连接控制符
     "^", "%", "(", ")",       # cmd 特有：转义 / 变量 / 分组
 ))
+"""
+
+from typing import List
+
+
 
 
 def need_shell(command: str) -> bool:
