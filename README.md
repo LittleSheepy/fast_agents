@@ -10,7 +10,7 @@
 
 FastAgents 是一个从零手写的轻量 Agent 框架，**不依赖 LangChain 等重型编排库**，直接基于 OpenAI 原生 API 实现。
 
-当前包含七大能力：**LLM 客户端、消息系统、工具系统、ReAct Agent、记忆系统、技能系统、上下文工程（context）**，另有一套**零依赖的 MCP 扩展模块**（让 Agent 接入外部工具服务器）。
+当前包含八大能力：**LLM 客户端、消息系统、工具系统、ReAct Agent、记忆系统、技能系统、上下文工程（context）、Trace 全链路追踪**，另有一套**零依赖的 MCP 扩展模块**（让 Agent 接入外部工具服务器）。
 
 代码全部可读、有测试覆盖，适合作为「理解 Agent 原理」的学习范本，也能直接用于中小型项目。
 
@@ -71,7 +71,8 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
-| 📦 **零重型依赖** | 记忆模块只用标准库（`sqlite3` / `json` / `pathlib`）；MCP 模块不用官方 SDK，只用标准库 + 可选 `requests` |
+| 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，默认 JSONL 一行一条落盘，支持内存模式与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时（v1.0.1） |
+| 📦 **零重型依赖** | 记忆模块只用标准库（`sqlite3` / `json` / `pathlib`）；MCP 模块不用官方 SDK，只用标准库 + 可选 `requests`；Trace 模块零新增依赖（标准库 + pydantic） |
 
 ---
 
