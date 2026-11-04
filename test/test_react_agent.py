@@ -418,6 +418,40 @@ def test_profile_injected_via_system_tail_in_context_path():
     print("✅ test_profile_injected_via_system_tail_in_context_path passed（B4 context 路径）")
 
 
+def test_return_direct_short_circuits_to_final_answer():
+    """A18：return_direct 工具执行后直接作为最终答案，不再回喂模型二次推理。"""
+    from fast_agents.tools.structured_tool import StructuredTool
+
+    def get_time() -> str:
+        """返回当前时间"""
+        return "现在是 2026-11-08 15:30"
+
+    # 用 StructuredTool.from_function 声明 return_direct=True
+    time_tool = StructuredTool.from_function(get_time, return_direct=True)
+    assert time_tool.return_direct is True
+
+    reg = ToolRegistry()
+    reg.register_tool(time_tool)
+
+    # 脚本：先让模型调一次 get_time，若短路则不应再调第二次 LLM
+    llm = MockLLM([
+        Message(
+            "assistant",
+            "",
+            tool_calls=[MsgToolCall(name="get_time", arguments="{}", id="call_t")],
+        ),
+        # 如果短路生效，这个 "unreachable" 不会被消费
+        Message("assistant", "unreachable-should-not-be-called"),
+    ])
+    agent = ReActAgent("测试助手", llm, tool_registry=reg,
+                       memory=MemoryManager(llm=llm), enable_skills=False)
+    answer = agent.run("现在几点")
+    assert answer == "现在是 2026-11-08 15:30", f"return_direct 未直接返回工具结果: {answer!r}"
+    # 关键断言：LLM 只被调用 1 次（不再走第二轮推理）
+    assert llm.i == 1, f"return_direct 未短路，LLM 被调用 {llm.i} 次"
+    print("✅ test_return_direct_short_circuits_to_final_answer passed（A18）")
+
+
 if __name__ == "__main__":
     test_no_tool_path()
     test_tool_path_and_no_duplicate_system()
@@ -435,4 +469,5 @@ if __name__ == "__main__":
     test_profile_noop_when_empty_or_unconfigured()
     test_profile_injected_into_system_tail_non_context_path()
     test_profile_injected_via_system_tail_in_context_path()
+    test_return_direct_short_circuits_to_final_answer()
     print("\n🎉 全部测试通过")
