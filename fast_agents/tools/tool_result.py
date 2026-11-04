@@ -36,12 +36,13 @@ class ToolResult:
         return cls(output=output, status=ToolStatus.SUCCESS, artifact=artifact, metadata=metadata or {})
 
     @classmethod
-    def fail(cls, error: str) -> "ToolResult":
+    def fail(cls, error: str, metadata: Optional[dict[str, Any]] = None) -> "ToolResult":
         return cls(
             output=f"错误：{error}",
             status=ToolStatus.ERROR,
             error=error,
             is_error=True,
+            metadata=metadata or {},
         )
 
     @classmethod
