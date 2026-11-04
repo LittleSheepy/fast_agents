@@ -7,11 +7,18 @@
    历史永不丢失（审计友好）；
 3. 显式删除：retract 只改状态保留历史，delete 才真删。
 
-B5 新增两个记账字段 access_count / last_accessed_at：旧库在 __init__ 里自动
-ALTER TABLE 补齐（幂等），无需手动迁移；命中记账走 touch()，**不刷新 updated_at**，
-以免破坏时间衰减打分。
+B5 新增两个记账字段 access_count / last_accessed_at：旧库在 __init__ 里通过
+``ensure_schema(migrate=True)`` 自动 ALTER TABLE 补齐（幂等），无需手动迁移；
+命中记账走 touch()，**不刷新 updated_at**，以免破坏时间衰减打分。
 
-只用标准库 sqlite3，不引入 SQLAlchemy，保持和你现有 requirements 一致的轻量风格。
+底层复用 ``fast_agents.database.SQLiteClient``：
+- 自动开启 WAL + busy_timeout，并发读写更友好（B9 落地）；
+- 建表 / 索引 / 常规 CRUD 全部走声明式 API，不再手写 ``CREATE TABLE`` /
+  ``PRAGMA table_info`` / ``ALTER TABLE`` 样板；
+- 标识符白名单 + 参数化查询，杜绝 SQL 注入；
+- 只有少数 SQLite 特有写法（比如 ``INSERT OR REPLACE``、``revise`` 的两步事务）
+  通过 ``db.execute()`` 逃生舱保留；``touch()`` 利用 ``update_where`` + ``SqlExpr``
+  实现批量自增，不需要手写 ``IN (?,?,….)``。
 
 search 不在此处实现，由 MemoryStoreBase 通过 all() + scoring.rank_records
 提供默认实现，保证与 InMemoryStore 打分口径一致（B7）。后续若要做 SQL 侧
@@ -19,25 +26,67 @@ search 不在此处实现，由 MemoryStoreBase 通过 all() + scoring.rank_reco
 """
 
 import json
-import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional
+from typing import Iterable, List, Optional
 from contextlib import contextmanager
 
+from ..database import (
+    Column,
+    ColumnType,
+    Filter,
+    FilterOp,
+    Index,
+    Query,
+    Schema,
+    SqlExpr,
+    SQLiteClient,
+    SortOrder,
+)
 from .memory_store_base import MemoryStoreBase
 from .schema import MemoryRecord
 
 
 class SQLiteMemoryStore(MemoryStoreBase):
-    """按 user_id + session_id 隔离的持久化记忆"""
+    """按 user_id + session_id 隔离的持久化记忆（底层复用 SQLiteClient）"""
+
+    _TABLE = "memories"
+    _IDX_SCOPE = "idx_scope"
+
+    # 声明式表结构，供 ensure_schema(..., migrate=True) 使用；
+    # 缺列由 SQLiteClient 自动补 ADD COLUMN，新库一次建齐。
+    _SCHEMA = Schema(
+        table_name=_TABLE,
+        columns=[
+            Column(name="memory_id",        type=ColumnType.TEXT, primary_key=True),
+            Column(name="user_id",          type=ColumnType.TEXT, nullable=False),
+            Column(name="session_id",       type=ColumnType.TEXT, nullable=False),
+            Column(name="content",          type=ColumnType.TEXT, nullable=False),
+            Column(name="source",           type=ColumnType.TEXT, nullable=False),
+            Column(name="kind",             type=ColumnType.TEXT, nullable=False),
+            Column(name="status",           type=ColumnType.TEXT, nullable=False),
+            Column(name="importance",       type=ColumnType.REAL, nullable=False),
+            Column(name="created_at",       type=ColumnType.TIMESTAMP, nullable=False),
+            Column(name="updated_at",       type=ColumnType.TIMESTAMP, nullable=False),
+            Column(name="supersedes",       type=ColumnType.TEXT),
+            # B5 新增列：新库直接建，老库 ensure_schema(migrate=True) 自动补
+            Column(name="access_count",     type=ColumnType.INTEGER, nullable=False, default=0),
+            Column(name="last_accessed_at", type=ColumnType.TIMESTAMP),
+            Column(name="metadata",         type=ColumnType.TEXT, nullable=False),
+        ],
+        indexes=[
+            Index(name=_IDX_SCOPE, columns=["user_id", "session_id", "status"]),
+        ],
+    )
 
     def __init__(
         self,
         path: str,
-        user_id: str = "default",
-        session_id: str = "default",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
         scope: str = "user",
+        *,
+        timeout: float = 10.0,
     ):
         """
         Args:
@@ -46,6 +95,7 @@ class SQLiteMemoryStore(MemoryStoreBase):
                   同一用户的不同会话共享记忆（所以换个 session_id 还能想起你）；
                 - "session"：按 user_id + session_id 双重隔离，
                   记忆只在单次会话内可见（适合「本窗口内的临时结论」）。
+            timeout: SQLite 写锁等待超时秒数（透传给 SQLiteClient；同时映射到 busy_timeout）。
         """
         if str(path) == ":memory:":
             raise ValueError("请提供持久化文件路径；临时记忆请用 InMemoryStore")
@@ -58,70 +108,61 @@ class SQLiteMemoryStore(MemoryStoreBase):
         self.session_id = session_id
         self.scope = scope
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS memories (
-                    memory_id   TEXT PRIMARY KEY,
-                    user_id     TEXT NOT NULL,
-                    session_id  TEXT NOT NULL,
-                    content     TEXT NOT NULL,
-                    source      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    status      TEXT NOT NULL,
-                    importance  REAL NOT NULL,
-                    created_at  TEXT NOT NULL,
-                    updated_at  TEXT NOT NULL,
-                    supersedes  TEXT,
-                    access_count    INTEGER NOT NULL DEFAULT 0,
-                    last_accessed_at TEXT,
-                    metadata    TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_scope
-                    ON memories(user_id, session_id, status);
-                """
-            )
-            self._migrate_schema()
+
+        # 复用 database 模块统一的 SQLiteClient：自动 WAL / busy_timeout / 外键 / 参数化
+        self._db = SQLiteClient(str(self.path), timeout=timeout)
+        # 幂等建表 + 幂等建索引 + 老库自动补列（B5 的 access_count / last_accessed_at）
+        self._db.ensure_schema(self._SCHEMA, migrate=True)
+
+    # ---------- 兼容桥（供 SemanticMemoryStore 等同类内部使用）----------
+    # semantic_store 的向量表建在本类的 SQLite 连接里（同库一张独立表），
+    # 它通过 inner._connect() 拿到底层 sqlite3.Connection、通过 inner._scope_clause()
+    # 拿到 (WHERE 片段, 参数) 做作用域过滤。为避免破坏这个既有耦合，保留这两个
+    # 私有方法：它们是实现细节，不是公开 API，不要在第三方代码里调用。
+
+    @contextmanager
+    def _connect(self):
+        """返回底层 sqlite3.Connection 的上下文管理器（供 semantic_store 等内部复用）。
+
+        保持与旧实现一致的事务语义：进入块时 BEGIN，正常退出 COMMIT，异常 ROLLBACK——
+        这是依赖 SQLiteClient 的 ``with self._db`` 显式事务语义实现的；块内 yield
+        的就是底层连接对象，第三方代码可直接在上面 execute()。
+        """
+        with self._db:
+            yield self._db.conn
 
     def _scope_clause(self) -> tuple:
-        """返回 (WHERE 片段, 参数列表)，所有读写都必须带上它做隔离"""
+        """返回 (WHERE 片段, 参数列表)，与旧版语义一致，供 semantic_store 复用。"""
         if self.scope == "user":
             return "user_id=?", [self.user_id]
         return "user_id=? AND session_id=?", [self.user_id, self.session_id]
 
-    # B5 新增列（老库缺列时补上）
-    _ADDED_COLUMNS = (
-        ("access_count", "INTEGER NOT NULL DEFAULT 0"),
-        ("last_accessed_at", "TEXT"),
-    )
+    # ---------- 作用域过滤（所有读写都走这一组 Filter）----------
 
-    def _migrate_schema(self) -> None:
-        """给 B5 之前建的旧库补上 access_count / last_accessed_at
+    def _scope_filters(self) -> List[Filter]:
+        """返回作用域对应的 Filter 列表，所有 CRUD 都带上做隔离。"""
+        if self.scope == "user":
+            return [Filter(field="user_id", op=FilterOp.EQ, value=self.user_id)]
+        return [
+            Filter(field="user_id", op=FilterOp.EQ, value=self.user_id),
+            Filter(field="session_id", op=FilterOp.EQ, value=self.session_id),
+        ]
 
-        SQLite 没有「ADD COLUMN IF NOT EXISTS」语法，所以先 PRAGMA 查一遍
-        缺哪些列，再逐个 ALTER。幂等、可重复执行，也不会动到已有数据；
-        新库因为建表语句里已经带上这两列，这里会直接跳过。
-        """
-        with self._connect() as db:
-            existing = {row["name"] for row in db.execute("PRAGMA table_info(memories)")}
-            for column, ddl in self._ADDED_COLUMNS:
-                if column not in existing:
-                    db.execute(f"ALTER TABLE memories ADD COLUMN {column} {ddl}")
+    def _scope_where(self, extra: Optional[List[Filter]] = None) -> List[Filter]:
+        """scope + 额外条件拼在一起，构造 query.filters 用。"""
+        return self._scope_filters() + list(extra or [])
 
-    @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(str(self.path), timeout=10)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+    def _scope_eq(self, *, scope_only: bool = False) -> dict:
+        """等值 where 字典（供 select/update/delete 的等值 API 使用）。"""
+        w: dict = {"user_id": self.user_id}
+        if self.scope == "session":
+            w["session_id"] = self.session_id
+        return w
 
     # ---------- 序列化 ----------
 
     @staticmethod
-    def _row_to_record(row: sqlite3.Row) -> MemoryRecord:
+    def _row_to_record(row: dict) -> MemoryRecord:
         return MemoryRecord(
             memory_id=row["memory_id"],
             user_id=row["user_id"],
@@ -143,48 +184,54 @@ class SQLiteMemoryStore(MemoryStoreBase):
         )
 
     @staticmethod
-    def _to_params(r: MemoryRecord) -> tuple:
-        return (
-            r.memory_id, r.user_id, r.session_id, r.content, r.source, r.kind,
-            r.status, r.importance, r.created_at.isoformat(), r.updated_at.isoformat(),
-            r.supersedes, r.access_count,
-            r.last_accessed_at.isoformat() if r.last_accessed_at else None,
-            json.dumps(r.metadata, ensure_ascii=False),
-        )
+    def _record_to_row(r: MemoryRecord) -> dict:
+        """把 MemoryRecord 转成数据库行字典（字段名与表列一一对应）。"""
+        return {
+            "memory_id":   r.memory_id,
+            "user_id":     r.user_id,
+            "session_id":  r.session_id,
+            "content":     r.content,
+            "source":      r.source,
+            "kind":        r.kind,
+            "status":      r.status,
+            "importance":  r.importance,
+            "created_at":  r.created_at.isoformat(),
+            "updated_at":  r.updated_at.isoformat(),
+            "supersedes":  r.supersedes,
+            "access_count":     r.access_count,
+            "last_accessed_at": r.last_accessed_at.isoformat() if r.last_accessed_at else None,
+            "metadata":    json.dumps(r.metadata, ensure_ascii=False),
+        }
 
     # ---------- 接口实现 ----------
 
     def add(self, record: MemoryRecord) -> MemoryRecord:
         record.user_id = record.user_id or self.user_id
         record.session_id = record.session_id or self.session_id
-        with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO memories"
-                " (memory_id, user_id, session_id, content, source, kind, status,"
-                "  importance, created_at, updated_at, supersedes, access_count,"
-                "  last_accessed_at, metadata)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                self._to_params(record),
-            )
+        # INSERT OR REPLACE：同 memory_id 覆盖，行为与原实现一致；
+        # upsert 的 conflict_keys 取主键 memory_id，冲突时更新除主键外的所有列。
+        self._db.upsert(self._TABLE, self._record_to_row(record), conflict_keys=["memory_id"])
         return record
 
     def get(self, memory_id: str) -> Optional[MemoryRecord]:
-        clause, params = self._scope_clause()
-        with self._connect() as db:
-            row = db.execute(
-                f"SELECT * FROM memories WHERE memory_id=? AND {clause}",
-                [memory_id, *params],
-            ).fetchone()
+        row = self._db.select_one_where(Query(
+            table_name=self._TABLE,
+            filters=self._scope_where([
+                Filter(field="memory_id", op=FilterOp.EQ, value=memory_id),
+            ]),
+        ))
         return self._row_to_record(row) if row else None
 
     def all(self, include_inactive: bool = False) -> List[MemoryRecord]:
-        clause, params = self._scope_clause()
-        sql = f"SELECT * FROM memories WHERE {clause}"
+        filters = self._scope_filters()
         if not include_inactive:
-            sql += " AND status='active'"
-        sql += " ORDER BY updated_at DESC, memory_id"
-        with self._connect() as db:
-            rows = db.execute(sql, params).fetchall()
+            filters.append(Filter(field="status", op=FilterOp.EQ, value="active"))
+        rows = self._db.select_where(Query(
+            table_name=self._TABLE,
+            filters=filters,
+            sort_by=["updated_at", "memory_id"],
+            sort_order=SortOrder.DESC,
+        ))
         return [self._row_to_record(r) for r in rows]
 
     def search(
@@ -201,69 +248,87 @@ class SQLiteMemoryStore(MemoryStoreBase):
         """命中记账：直接 UPDATE 自增，**不触碰 updated_at**
 
         覆盖基类默认实现的两个理由：
-        1. 省掉一次读（基类要走 get + update 两条 SQL）；
+        1. 省掉一次读（基类要走 get + update 两条路径）；
         2. 基类的 update() 会把 updated_at 刷成当前时间，而 updated_at 参与时间衰减
            打分——命中一次就刷新，会让「越旧越轻」失效，这里必须绕开。
 
-        同一次命中的多个 id 用单条 ``UPDATE ... WHERE memory_id IN (...)`` 批量写回：
+        同一次命中的多个 id 通过 ``update_where + FilterOp.IN`` 批量写回：
         逐条执行会发 N 条 SQL、吃 N 份事务开销，而 touch 恰好在「每轮检索」的热路径上。
         """
         ids = [mid for mid in memory_ids if mid]
         if not ids:
             return 0
-        clause, params = self._scope_clause()
         now = datetime.now().isoformat()
-        placeholders = ",".join("?" for _ in ids)
-        with self._connect() as db:
-            count = db.execute(
-                f"UPDATE memories SET access_count = access_count + 1,"
-                f" last_accessed_at = ?"
-                f" WHERE memory_id IN ({placeholders}) AND {clause}",
-                (now, *ids, *params),
-            ).rowcount
-        return count
+        return self._db.update_where(
+            self._TABLE,
+            {
+                "access_count":     SqlExpr("access_count + 1"),
+                "last_accessed_at": now,
+            },
+            Query(
+                table_name=self._TABLE,
+                filters=self._scope_where([
+                    Filter(field="memory_id", op=FilterOp.IN, value=ids),
+                ]),
+            ),
+        )
 
     def update(self, record: MemoryRecord) -> MemoryRecord:
         if self.get(record.memory_id) is None:
             raise KeyError(record.memory_id)
         record.updated_at = datetime.now()
-        clause, params = self._scope_clause()
-        with self._connect() as db:
-            db.execute(
-                f"UPDATE memories SET content=?, source=?, kind=?, status=?, importance=?,"
-                f" updated_at=?, access_count=?, last_accessed_at=?, metadata=?"
-                f" WHERE memory_id=? AND {clause}",
-                (
-                    record.content, record.source, record.kind, record.status,
-                    record.importance, record.updated_at.isoformat(),
-                    record.access_count,
-                    record.last_accessed_at.isoformat() if record.last_accessed_at else None,
-                    json.dumps(record.metadata, ensure_ascii=False),
-                    record.memory_id, *params,
-                ),
-            )
+        self._db.update_where(
+            self._TABLE,
+            {
+                "content":          record.content,
+                "source":           record.source,
+                "kind":             record.kind,
+                "status":           record.status,
+                "importance":       record.importance,
+                "updated_at":       record.updated_at.isoformat(),
+                "access_count":     record.access_count,
+                "last_accessed_at": record.last_accessed_at.isoformat() if record.last_accessed_at else None,
+                "metadata":         json.dumps(record.metadata, ensure_ascii=False),
+            },
+            Query(
+                table_name=self._TABLE,
+                filters=self._scope_where([
+                    Filter(field="memory_id", op=FilterOp.EQ, value=record.memory_id),
+                ]),
+            ),
+        )
         return record
 
     def revise(self, memory_id: str, content: str, source: str) -> MemoryRecord:
-        """修订一条记忆：旧版标记 superseded，追加新版并指向旧版"""
+        """修订一条记忆：旧版标记 superseded，追加新版并指向旧版
+
+        两步必须在同一个事务里：要么都成功，要么都回滚；用 SQLiteClient 的
+        ``with db:`` 显式事务上下文（BEGIN ... 正常 commit / 异常 rollback）。
+        """
         old = self.get(memory_id)
         if old is None:
             raise KeyError(memory_id)
         if old.status != "active":
             raise ValueError("只能修订有效记忆，请先重新读取")
-        clause, params = self._scope_clause()
-        with self._connect() as db:
-            db.execute(
-                f"UPDATE memories SET status='superseded', updated_at=? "
-                f"WHERE memory_id=? AND {clause}",
-                (datetime.now().isoformat(), memory_id, *params),
+        now_iso = datetime.now().isoformat()
+        with self._db:
+            self._db.update_where(
+                self._TABLE,
+                {"status": "superseded", "updated_at": now_iso},
+                Query(
+                    table_name=self._TABLE,
+                    filters=self._scope_where([
+                        Filter(field="memory_id", op=FilterOp.EQ, value=memory_id),
+                    ]),
+                ),
             )
-        new = MemoryRecord(
-            user_id=old.user_id, session_id=old.session_id, content=content,
-            source=source, kind=old.kind, importance=old.importance,
-            supersedes=memory_id, metadata=dict(old.metadata),
-        )
-        return self.add(new)
+            new = MemoryRecord(
+                user_id=old.user_id, session_id=old.session_id, content=content,
+                source=source, kind=old.kind, importance=old.importance,
+                supersedes=memory_id, metadata=dict(old.metadata),
+            )
+            self._db.upsert(self._TABLE, self._record_to_row(new), conflict_keys=["memory_id"])
+        return new
 
     def retract(self, memory_id: str) -> MemoryRecord:
         """撤回一条记忆（保留历史，幂等）"""
@@ -277,18 +342,23 @@ class SQLiteMemoryStore(MemoryStoreBase):
         return old
 
     def delete(self, memory_id: str) -> bool:
-        clause, params = self._scope_clause()
-        with self._connect() as db:
-            cur = db.execute(
-                f"DELETE FROM memories WHERE memory_id=? AND {clause}",
-                [memory_id, *params],
-            )
-        return cur.rowcount > 0
+        return self._db.delete_where(
+            self._TABLE,
+            Query(
+                table_name=self._TABLE,
+                filters=self._scope_where([
+                    Filter(field="memory_id", op=FilterOp.EQ, value=memory_id),
+                ]),
+            ),
+        ) > 0
 
     def clear(self) -> None:
-        clause, params = self._scope_clause()
-        with self._connect() as db:
-            db.execute(f"DELETE FROM memories WHERE {clause}", params)
+        # delete_where 要求 filters 非空；用 scope_filters 保证只清当前作用域，不会误删他用户数据。
+        self._db.delete_where(
+            self._TABLE,
+            Query(table_name=self._TABLE, filters=self._scope_filters()),
+        )
 
     def close(self) -> None:
+        self._db.close()
         return None

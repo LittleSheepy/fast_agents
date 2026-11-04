@@ -55,9 +55,7 @@ def main():
         print("=" * 60)
 
         m1 = MemoryManager(
-            long_term_store=SQLiteMemoryStore(
-                db_path, user_id="xiaoming", session_id="s1", scope="user"
-            ),
+            long_term_store=SQLiteMemoryStore(db_path),
             llm=llm,
             user_id="xiaoming",
             session_id="s1",

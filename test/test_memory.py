@@ -29,6 +29,7 @@ from fast_agents.memory import (
     SemanticMemoryStore,
     SQLiteMemoryStore,
     SQLiteProfileStore,
+    SQLiteSessionStore,
     UserProfile,
     lexical_score,
     merge_similarity,
@@ -654,19 +655,6 @@ class _FakeLLMNoEmbedding:
     def embed_documents(self, texts):   return None
 
 
-
-
-# ===================== ChromaMemoryStore 阶段 1 测试 =====================
-# 阶段 1：不引 chromadb、不传真实客户端，验证 ①纯词法降级②代理记账③Manager 集成。
-
-class _FakeLLMNoEmbedding:
-    """假 LLM：embedding 永远失败，逼 ChromaMemoryStore 走纯词法降级"""
-    embedding_model = "fake-none"
-
-    def embed_query(self, q):           return None
-    def embed_documents(self, texts):   return None
-
-
 def test_chroma_store_pure_lexical_degrade():
     """chroma_client=None + 假 LLM（embedding 失败）→ 仍可正常 CRUD + 检索，不抛异常"""
     with tempfile.TemporaryDirectory() as d:
@@ -744,6 +732,82 @@ def test_chroma_store_with_manager_integration():
     print("✅ test_chroma_store_with_manager_integration 通过（Manager 接入零感知）")
 
 
+def test_sqlite_upsert_full_column_overwrite():
+    """J3 陷阱1：add 走全列 upsert，语义与原 INSERT OR REPLACE 一致
+
+    要点：同 memory_id 再次 add 时是「整行覆盖」——业务列全部按传入记录刷新，
+    不会残留旧行里没提供的字段（这正是 OR REPLACE「先删后插」的行为）。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        store = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1", session_id="s1")
+        r = store.add(MemoryRecord(content="原始内容", kind="fact", source="t"))
+        mid = r.memory_id
+        store.touch([mid])                              # access_count -> 1
+        assert store.get(mid).access_count == 1
+
+        # 同 id 再 add：整行覆盖（access_count 回到传入记录的 0）
+        r2 = MemoryRecord(memory_id=mid, user_id="u1", session_id="s1",
+                          content="覆盖后内容", kind="fact", source="t")
+        store.add(r2)
+        got = store.get(mid)
+        assert got.content == "覆盖后内容"
+        assert got.access_count == 0
+        assert got.created_at == r2.created_at
+        # 只保留一行，而不是又插了一条
+        assert len(store.all(include_inactive=True)) == 1
+        store.close()
+    print("✅ test_sqlite_upsert_full_column_overwrite 通过（陷阱1：全列覆盖等价 OR REPLACE）")
+
+
+def test_touch_scope_isolation_in():
+    """J3 陷阱2：touch 的 IN 条件必须叠加作用域谓词，杜绝跨用户记账"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "mem.db")
+        a = SQLiteMemoryStore(path, user_id="uA", session_id="s1")
+        b = SQLiteMemoryStore(path, user_id="uB", session_id="s1")
+        ra = a.add(MemoryRecord(content="A的记忆", kind="fact", source="t"))
+        rb = b.add(MemoryRecord(content="B的记忆", kind="fact", source="t"))
+
+        # 故意把 B 的 id 混进 A 的 touch 列表：只应命中 A 自己那条
+        n = a.touch([ra.memory_id, rb.memory_id])
+        assert n == 1, f"应命中 1 条，实际 {n}"
+        assert a.get(ra.memory_id).access_count == 1
+        assert b.get(rb.memory_id).access_count == 0, "跨用户记账泄漏"
+        # 空 id 列表直接返回 0，不发 SQL
+        assert a.touch([]) == 0
+        a.close()
+        b.close()
+    print("✅ test_touch_scope_isolation_in 通过（陷阱2：IN + scope 隔离）")
+
+
+def test_session_store_persistence():
+    """J3：SQLiteSessionStore 迁移到 SQLiteClient 后的持久化 / 隔离 / 摘要 upsert"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "session.db")
+        ss = SQLiteSessionStore(path, user_id="u1", session_id="s1")
+        ss.append(Message(role="user", content="你好"))
+        ss.append(Message(role="assistant", content="你好呀"))
+        assert [m.content for m in ss.load()] == ["你好", "你好呀"]
+
+        ss.save_summary("第一版摘要")
+        assert ss.load_summary() == "第一版摘要"
+        # 第二次保存走 upsert 覆盖（若是普通 INSERT 会因复合主键冲突报错）
+        ss.save_summary("第二版摘要")
+        assert ss.load_summary() == "第二版摘要"
+        meta_rows = ss._db.select("session_meta", {"user_id": "u1", "session_id": "s1"})
+        assert len(meta_rows) == 1, f"摘要表应只有一行，实际 {len(meta_rows)}"
+
+        # 作用域隔离：同库不同 session 互不可见
+        other = SQLiteSessionStore(path, user_id="u1", session_id="s2")
+        assert other.load() == [] and other.load_summary() == ""
+
+        ss.clear()
+        assert ss.load() == [] and ss.load_summary() == ""
+        ss.close()
+        other.close()
+    print("✅ test_session_store_persistence 通过（SQLiteSessionStore 迁移后行为正常）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -771,4 +835,7 @@ if __name__ == "__main__":
     test_chroma_store_pure_lexical_degrade()
     test_chroma_store_b5_proxy_methods()
     test_chroma_store_with_manager_integration()
+    test_sqlite_upsert_full_column_overwrite()
+    test_touch_scope_isolation_in()
+    test_session_store_persistence()
     print("\n🎉 全部测试通过")

@@ -91,7 +91,9 @@ class ChromaMemoryStore(MemoryStoreBase):
         self.chroma_client = chroma_client
         self.payload_support = bool(payload_support)
 
-        # 集合名按作用域生成：不同 user/session 互不干扰
+        # 集合名按作用域生成：不同 user/session 互不干扰。
+        # 注意：Chroma collection 名禁止冒号/斜杠，只允许字母数字与 _ - . ；
+        # 若 user_id / session_id 含非法字符，阶段 2 接真实 Chroma 前需先归一化替换。
         self._collection_name = (
             collection_name
             or f"{self._DEFAULT_COLLECTION_PREFIX}_{inner.user_id}_{inner.session_id}"
@@ -124,7 +126,13 @@ class ChromaMemoryStore(MemoryStoreBase):
         # 注意：不在这里抛异常，调用方会 try/except 兜底
 
     def _query_chroma(self, q_vec: List[float], top_k: int) -> List[str]:
-        """从 Chroma 按向量召回 top_k 个 memory_id；阶段 1 返回空列表"""
+        """从 Chroma 按向量召回 top_k 个 memory_id；阶段 1 返回空列表。
+
+        阶段 2 实现时若想省掉对候选逐条重算 embedding，可把返回扩成
+        ``List[Tuple[str, float]]``（memory_id + 向量库自带相似度/距离分），
+        search() 直接复用该分数；当前保持只回 id，与 inner 全量合流后
+        仍由 rank_records 统一算分，换后端时排序口径最稳定。
+        """
         coll = self._collection_or_none()
         if coll is None:
             return []
@@ -266,13 +274,16 @@ class ChromaMemoryStore(MemoryStoreBase):
         if q_vec is None:
             return self.inner.search(query, limit, include_preferences=include_preferences)
 
+        # 阶段 1：_collection 恒为 None，向量通道整体关闭；此状态下不下发
+        # semantic_getter，直接让 rank_records 走纯词法，省掉逐条回调开销。
+        use_semantic = self._collection_or_none() is not None
+
         # 阶段 1：chroma_ids 为空，records 就等于 inner 全量；
         # 阶段 2：chroma_ids 非空，这里做一次 id 集合合流去重
         chroma_ids = self._query_chroma(q_vec, top_k=limit * self._CHROMA_TOP_K_MULTIPLIER)
         records = self.inner.all(include_inactive=False)
         if chroma_ids:
             # 让 chroma 召回的 id 与 inner 全量合并（inner 兜底避免漏掉偏好/最近条目）
-            chroma_id_set = set(chroma_ids)
             id_order = list(chroma_ids)
             seen = set(chroma_ids)
             for r in records:
@@ -280,17 +291,10 @@ class ChromaMemoryStore(MemoryStoreBase):
                     id_order.append(r.memory_id)
                     seen.add(r.memory_id)
             by_id = {r.memory_id: r for r in records}
-            merged = [by_id[mid] for mid in id_order if mid in by_id]
-            records = merged
+            records = [by_id[mid] for mid in id_order if mid in by_id]
 
         def semantic_getter(r: MemoryRecord) -> Optional[float]:
-            # 阶段 1：_collection 为 None → 永远拿不到向量 → 语义分 None → 纯词法
-            # 阶段 2：这里可以从 Chroma payload 直接拿向量/距离，或调 _load_vec_chroma(r)
-            # 阶段 1 先通过 _safe_embed_document 懒补算——但因为 save 是 no-op，
-            # 每条会重复算 embedding；这是可接受的阶段 1 行为（chroma_client=None 时
-            # _collection_or_none() 返回 None，下面直接返回 None，省掉无意义的 embedding 调用）
-            if self._collection_or_none() is None:
-                return None
+            # 阶段 2：可从 Chroma payload 直接取向量/距离分；这里懒补算兜底
             vec = self._safe_embed_document(r.content)
             if vec is None:
                 return None
@@ -303,7 +307,7 @@ class ChromaMemoryStore(MemoryStoreBase):
         return rank_records(
             query, records, limit,
             include_preferences=include_preferences,
-            semantic_getter=semantic_getter,
+            semantic_getter=semantic_getter if use_semantic else None,
             hybrid_weight=self.hybrid_weight,
             semantic_floor=self._SEMANTIC_FLOOR,
         )
