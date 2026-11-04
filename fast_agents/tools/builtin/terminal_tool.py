@@ -1,6 +1,7 @@
 """安全的Windows命令行工具
 fast_agents/tools/builtin/terminal_tool.py
 
+- 仅支持 Windows 平台：非 Windows 构造时直接报错（避免落到同名命令造成「假成功」）
 - 拼接的多条命令拆分后每条独立做安全校验
 - 自动探测cmd/powershell，智能判断shell=True需求
 - cd 在任意位置都做沙箱路径校验（修复 cd 位于链中时绕过沙箱的问题）
@@ -9,6 +10,7 @@ fast_agents/tools/builtin/terminal_tool.py
 from __future__ import annotations
 
 import os
+import sys
 import locale
 import subprocess
 from pathlib import Path
@@ -17,6 +19,7 @@ from typing import List, Optional, Set, Tuple, Union
 from pydantic import BaseModel, Field
 
 from ..tool_base import ToolBase
+from ..tool_exception import ToolInitializationError
 from ..tool_result import ToolResult
 # 按功能拆分的模块导入
 from .shell_check import need_shell
@@ -74,6 +77,15 @@ def _build_allowed_commands(
     return allowed
 
 
+def _is_windows() -> bool:
+    """当前是否为 Windows 平台。
+
+    TerminalTool 依赖 cmd.exe / PowerShell，仅 Windows 可用；抽取为函数便于
+    在非 Windows 环境下做单元测试（避免直接 patch ``os.name`` 影响 pathlib）。
+    """
+    return os.name == "nt"
+
+
 class TerminalInput(BaseModel):
     command: str = Field(description="要执行的 shell 命令，如 'dir'、'type README.md'、'findstr \"xxx\" file'")
 
@@ -90,6 +102,14 @@ class TerminalTool(ToolBase):
 
     def __init__(self, workspace: str = ".", timeout: int = 30, max_output_chars: int = 20_000,
                  allow_exec: bool = False, allow_cd: bool = True, allowed_commands: Optional[Set[str]] = None):
+        # 平台守卫：本工具依赖 cmd.exe / PowerShell，仅 Windows 可用。
+        # 非 Windows 上必须明确报错——否则会落到同名命令（如 Linux 的 dir），
+        # 造成「命令执行成功，无输出」的假成功，命令语义与 Windows 完全不符。
+        if not _is_windows():
+            raise ToolInitializationError(
+                "TerminalTool 仅支持 Windows 平台（依赖 cmd.exe / PowerShell），"
+                f"当前运行平台为 {sys.platform}，该工具不可用"
+            )
         super().__init__(max_output_chars=max_output_chars)
         self.metadata["requires_approval"] = allow_exec  # 开启执行权限时才要求审批
         self.workspace = Path(workspace).resolve()
@@ -206,7 +226,10 @@ class TerminalTool(ToolBase):
             return ToolResult.ok(f"✅ 当前目录: {new_dir}")
 
     def _exec(self, raw_command: str) -> ToolResult:
-        """执行命令，微调：使用新的need_shell智能判断，自动路由shell，每条命令已提前校验"""
+        """执行命令：need_shell 智能判断 shell 需求，自动路由 cmd / powershell。
+
+        输出截断统一交由基类 invoke() / ainvoke() 处理，此处只负责组装完整输出。
+        """
         # ========== 智能判断是否需要shell=True ==========
         needs_shell_flag = need_shell(raw_command)
 
@@ -235,10 +258,8 @@ class TerminalTool(ToolBase):
         if rc != 0:
             full_output = f"[返回码 {rc}]\n{full_output}"
 
-        # 截断过长输出
-        if len(full_output) > self.max_output_chars:
-            full_output = full_output[:self.max_output_chars] + f"\n... (输出过长，已截断前{self.max_output_chars}字符)"
-
+        # 输出截断统一由基类 invoke()/ainvoke() 处理（超长会转成 TRUNCATED 状态），
+        # 这里不再手动截断，避免「手截 + 基类」二次截断、状态与其它工具不一致。
         return ToolResult.ok(full_output or "（命令执行成功，无输出）")
 
     def reset(self) -> None:
@@ -247,6 +268,9 @@ class TerminalTool(ToolBase):
 
 if __name__ == "__main__":
     # 简单测试
+    if not _is_windows():
+        print("TerminalTool 仅支持 Windows 平台，当前非 Windows，跳过演示。")
+        raise SystemExit(0)
     tool = TerminalTool(workspace="./test_workspace", allow_exec=True)
     print(f"检测到Shell: {tool.detected_shell} -> {tool.shell_path}")
 
