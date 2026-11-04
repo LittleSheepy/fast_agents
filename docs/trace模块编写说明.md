@@ -2,11 +2,11 @@
 
 本文档面向 fast_agents **Trace（全链路可观测性）**系统，参考 **OpenTelemetry Trace/Span 模型**、**LangChain Callbacks/Tracer**、**OpenAI Agents SDK Tracing** 的核心概念（trace / span / 父子关系 / 钩子），给出本模块的完整说明、源码解析与自定义教程。同时对齐 fast_agents 已交付的 tools / memory / mcp / skills / context / database 模块文档骨架，做到「翻开任何一份模块说明，都知道在哪一节能找到什么」。
 
-> **版本**：v1.0.1 · 2026-11-04 · 初版（路线图 G1 最小闭环）：Trace/Span 数据模型 + TraceLogger 记录器 + 默认 JsonlStore 落盘 + ToolRegistry 钩子打点 + LLM/Agent 可选接入 + 查询/回放，LLM 打点补 token/model 元数据、tool span 取真实耗时
+> **版本**：v1.0.0 · 2026-11-04 · 初版（路线图 G1 最小闭环）：Trace/Span 数据模型 + TraceLogger 记录器 + 默认 JsonlStore 落盘 + ToolRegistry 钩子打点 + LLM/Agent 可选接入 + LLM token/model 元数据 + tool 真实耗时 + 查询/回放
 > **适用版本**：`fast_agents.trace`
-> **配套代码**：`fast_agents/trace/`（5 个源码文件）+ `test/test_trace.py`（**41 项**用例，全绿）+ `examples/trace/`（**2 个**可运行示例）
+> **配套代码**：`fast_agents/trace/`（**5 个**源码文件）+ `test/test_trace.py`（**43 项**用例，全绿）+ `examples/trace/`（**2 个**可运行示例）
 > **运行环境**：Python 3.10+（仓库 `.python-version` = 3.10），Windows / macOS / Linux
-> **依赖**：**零新增依赖**，仅标准库（`json / threading / uuid / contextvars / time`）+ 全框架已有的 `pydantic>=2.14.1`；不引入 OpenTelemetry / LangChain / loguru 任何外部库
+> **依赖**：**零新增依赖**，仅标准库（`json / os / threading / uuid / time / contextvars / pathlib / contextlib / enum / abc`）+ 全框架已有的 `pydantic>=2.14.1`；不引入 OpenTelemetry / LangChain / loguru 任何外部库
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分放在第十二章，并与 `docs/演进路线图.md` 的 G 模块编号对齐。
 
 ---
@@ -34,9 +34,9 @@
 
 | **版本** | 日期 | 变更 | 作者 |
 |------|------|------|------|
-| **1.0.1** | 2026-11-04 | **初版（路线图 G1 最小闭环）**：`fast_agents/trace/` 作为独立模块交付（`__init__.py` / `models.py` / `store_base.py` / `jsonl_store.py` / `trace_logger.py` 共 5 个文件）。`TraceLogger` 提供 Trace/Span 生命周期、`tool_hook` 工具钩子、`read_spans/replay` 查询回放；默认 `JsonlStore` 一行一条 JSON 落盘，支持 `:memory:` 内存模式；`TraceStoreBase` 抽象预留 SQLite 后端切换位。LLM（`LLM.invoke/stream_invoke/embed_query/embed_documents`）与 `ReActAgent` 均仅新增 `tracer=None` 可选参数，默认行为与改动前完全一致；通过 `ToolRegistry.add_hook` 自动打点工具调用，tool span 耗时取自 `ToolResult.metadata["duration_ms"]`（`tool_base` 上报），LLM span 的 `metadata` 写入 `model / usage / prompt_tokens / completion_tokens / total_tokens` 等 token 用量元数据。**零新增依赖**；`test/test_trace.py` **41/41** 全绿，配套 2 个可离线运行示例（无需 API Key）。 | — |
+| **1.0.0** | 2026-11-04 | **初版（路线图 G1 最小闭环）**：`fast_agents/trace/` 作为独立子包交付（`__init__.py` / `models.py` / `store_base.py` / `jsonl_store.py` / `trace_logger.py` 共 5 个文件）。交付：**SpanRecord** 数据模型（trace_id/span_id/parent_id/session_id/name/kind/start_time/end_time/duration_ms/input/output/status/error/metadata）+ **SpanKind** 枚举（llm/tool/decision/agent/custom）+ **SpanStatus** 枚举（success/error）+ **TraceLogger** 门面（手动 span / with 上下文 / trace() 开新根 / 失败安全 / `read_spans` 多条件过滤 / `replay` 缩进回放）+ **TraceStoreBase** 抽象基类 + **JsonlStore**（唯一实现，支持 `":memory:"` 内存模式与 jsonl 逐行 append 落盘，坏行跳过）。**接入**：LLM 门面 `invoke / stream_invoke / embed_query / embed_documents` 仅新增可选 `tracer=None` 打点（stream 走包装生成器），LLM span 写入 `model` + `usage / prompt_tokens / completion_tokens / total_tokens` 元数据；`ReActAgent.__init__` 仅新增可选 `tracer=None`，非 None 时自动 `attach_to_tool_registry` 挂工具钩子、`run` 内自动包 agent/decision 两类 span；工具打点完全走既有 `ToolRegistry.add_hook`，tool span 读 `ToolResult.metadata["duration_ms"]` 记真实耗时并回推 `start_time`，**不修改注册表源码**；根 `fast_agents/__init__.py` 同步重导出 trace 全部公开符号。**零新增依赖**、**零破坏性改动**：`test/test_trace.py` **43/43** 全绿；`examples/trace/basic_usage.py` 与 `examples/trace/jsonl_replay.py` 两个离线可跑示例（不需要 API Key）；`pyproject.toml` / `requirements.txt` 零变更。 | — |
 
-> 后续版本迭代更新时在此表追加，保持「使用者可见的变更」倒序排列；内部重构不在此记录。
+> 本模块当前为初版，上表仅记录首发；后续每次改动在表尾追加一行，破坏性变更须写明迁移办法。
 
 ---
 
@@ -54,8 +54,8 @@
 |---|---|---|---|---|
 | **Trace** | 一次分布式请求的完整调用链 | 一次 Agent run（或用户手动开启的一条链路）| 从 `start_trace` 到 `end_trace`；`with tracer.trace():` 自动成对 | 整次对话/任务的所有 Span 共享同一个 `trace_id` |
 | **Span** | 链路上的单个操作单元 | 一次 LLM 调用 / 一次工具调用 / 一次 decision 决策 / 一次 agent run / 一次自定义打点 | 从 `start_span` 到 `end_span`；`with tracer.span():` 自动成对；`tool_hook` 自动成对 | 输入、输出、起止时间、耗时、状态、错误、扩展元数据 |
-| **SpanContext** | 跨进程传递的 trace/span id | 同进程内用 `threading.local` + `contextvars.ContextVar` 维护当前 trace/span 栈 | 随调用栈入栈出栈 | 初版仅支持同步单线程内父子传播，async 场景留 G2 |
-| **Exporter / SpanProcessor** | Span 结束后的导出/批处理 | 直接写 `TraceStoreBase.write(span)`，无批处理、无异步队列 | v1.0.x 同步写；异步/批处理留 G2 | 当前实现 `JsonlStore` 同步 append |
+| **SpanContext** | 跨进程传递的 trace/span id | 同进程内用**实例级 `contextvars.ContextVar`** 维护当前 trace/span 栈（每个 `TraceLogger` 实例自持一对） | 随调用栈入栈出栈 | 实例间互不串扰；同线程 / 同协程内自动父子；`asyncio.Task` 会拷贝上下文，故协程内自动继承父链 |
+| **Exporter / SpanProcessor** | Span 结束后的导出/批处理 | 直接写 `TraceStoreBase.write(span)`，无批处理、无异步队列 | 当前为同步写；异步/批处理留后续版本 | 当前实现 `JsonlStore` 同步 append |
 
 ### 2.3 关键设计原则（全篇代码都在落实它们）
 
@@ -78,16 +78,16 @@
 | **LangChain Callbacks / Tracer** | LangChain 专属可观测性 | langchain-core（内置）| CallbackManager + handler 基类（on_llm_start/on_tool_end 等）| 内置 Console/File/ LangSmith Tracer | 与 LLM/Tool/Agent 生命周期绑定最深，开箱即用 | 强绑定 LangChain 抽象体系，拿出来单独用几乎不可能；回调方法众多（start/end/error 三件套），接入面大 |
 | **OpenAI Agents SDK Tracing** | OpenAI Agents SDK 专属 | agents-sdk（内置）| `trace()` / `span()` 上下文管理器 + 自动 Agent/LLM/Tool 打点 | 默认本地 trace 文件 + 可选上传 OpenAI 平台 | API 设计简洁（with 语法）、自动打点覆盖好、内置 trace viewer | 强绑定 OpenAI Agents SDK；默认会上报云端（隐私/离线场景需关闭）；本地存储格式不公开稳定 |
 | **loguru + 装饰器手写** | 通用日志打点 | loguru | 自己写装饰器/上下文管理器 | 日志文件 | 轻、灵活 | 没有 Trace/Span 父子链概念、没有标准化字段、没有存储抽象、回放/分析全靠自己 grep |
-| **fast_agents（本模块）** | **框架内置的最小可跑闭环** | **零新依赖**（标准库 + pydantic）| `tracer=` 可选参数注入 + `ToolRegistry.add_hook` 工具钩子 + `with tracer.span(...)` 手动打点 | **默认 JsonlStore**（一行一条 JSON 落盘，可切 `:memory:`）；存储抽象预留 SQLite 位 | 零依赖、零侵入、旁路不阻塞；API 克制（一个 TraceLogger 搞定）；字段对齐路线图最小集 | 初版不做异步并发、不做批处理、不做 Web UI、不做远端上报；Context 只在线程内传播；不支持 SpanEvent / Link；无采样 |
+| **fast_agents（本模块）** | **框架内置的最小可跑闭环** | **零新依赖**（标准库 + pydantic）| `tracer=` 可选参数注入 + `ToolRegistry.add_hook` 工具钩子 + `with tracer.span(...)` 手动打点 | **默认 JsonlStore**（一行一条 JSON 落盘，可切 `:memory:`）；存储抽象预留 SQLite 位 | 零依赖、零侵入、旁路不阻塞；API 克制（一个 TraceLogger 搞定）；字段对齐路线图最小集；状态栈实例级隔离且可随协程传播 | 初版不做异步并发写入/批处理、不做 Web UI、不做远端上报；不支持 SpanEvent / Link；无采样 |
 
 ### 3.2 关键差异：相同 / 增加 / 缺少
 
 | 维度 | 与三者相同 | 相对最简方案（loguru）增加 | 目前缺少（诚实列缺项） |
 |---|---|---|---|
 | 核心模型 | Trace/Span 父子关系、SpanKind/Status 分类、metadata 扩展 | trace_id/span_id/parent_id 链路字段、自动计时、自动状态（异常→error）| SpanEvent（时间点事件）、SpanLink（跨 trace 关联）、Resource（进程/主机属性） |
-| 接入方式 | with 上下文管理器自动成对、手动 start/end 兜底 | LLM/Agent 可选 `tracer=` 参数自动打点；ToolRegistry 钩子一行接入工具 | 装饰器式打点（`@traced`）、async 协程内父子链自动传播 |
+| 接入方式 | with 上下文管理器自动成对、手动 start/end 兜底 | LLM/Agent 可选 `tracer=` 参数自动打点；ToolRegistry 钩子一行接入工具 | 装饰器式打点（`@traced`）、async 场景的写入侧接入（同协程父子链已自动） |
 | 存储 | 同步写、落盘可查 | `TraceStoreBase` 抽象、JsonlStore 零依赖、`:memory:` 测试友好 | 异步批量写、SQLite 索引后端、远端 OTLP/Langfuse exporter |
-| 上下文传播 | 当前线程/上下文自动父子 | threading.local + ContextVar 双保险 | 跨线程/跨进程/跨协程传播；Baggage（透传 KV）|
+| 上下文传播 | 当前线程/上下文自动父子 | 实例级 ContextVar 栈：多 tracer 实例互不串扰，且随 `asyncio.Task` 拷贝上下文传播 | 跨线程/跨进程传播、Baggage（透传 KV）|
 | 性能 | — | 打点通道异常全吞、不阻塞主业务 | 采样（Sampler）、背压、限速 |
 | 消费 | 读取回放 | `read_spans` 按条件过滤 + `replay` 按时间排序平铺 | 瀑布图 UI、Token 成本聚合、工具选择准确率评估（G3/G4）|
 
@@ -101,7 +101,7 @@
 
 ```text
 fast_agents/trace/                    ← 单数目录（对齐 tools/memory/skills/mcp/database 命名约定）
-├── __init__.py                       # 模块出口：统一导出 TraceLogger/SpanKind/SpanStatus/SpanRecord/TraceStoreBase/JsonlStore/MEMORY_PATH + __version__
+├── __init__.py                       # 模块出口：统一导出 TraceLogger/SpanKind/SpanStatus/SpanRecord/TraceStoreBase/JsonlStore/MEMORY_PATH
 ├── models.py                         # 数据模型：SpanKind/SpanStatus 枚举 + SpanRecord pydantic 模型 + _new_id/_now_ts 辅助
 ├── store_base.py                     # 存储抽象基类 TraceStoreBase（write/read/iter_records/close/flush）
 ├── jsonl_store.py                    # 默认存储实现 JsonlStore：JSONL 一行一条落盘；支持 :memory: 内存模式；带线程锁；行缓冲 fsync
@@ -111,14 +111,14 @@ fast_agents/trace/                    ← 单数目录（对齐 tools/memory/ski
 **配套但不在 trace/ 下的改动**（接入点，都只加可选参数 `tracer=None`，不改既有行为）：
 
 - `fast_agents/llm/llm.py`：`LLM.__init__`、`invoke/stream_invoke/embed_query/embed_documents` 加 `tracer: Optional[TraceLogger] = None`，传入时自动开 `llm.*` Span，把模型名、token 用量写进 metadata；
-- `fast_agents/agents/react_agent/react_agent.py`：`ReActAgent.__init__` 加 `tracer=None`，传入时自动开 `agent.*` trace 与 `agent.run`/`agent.decision` Span，并自动把 tracer 挂到 LLM 和 ToolRegistry；
-- `fast_agents/__init__.py`：顶层 `__init__` 不重导出 trace 内容（按需显式 `from fast_agents.trace import ...`）；
-- `test/test_trace.py`：**41 项** pytest 用例（纯内存/临时目录，无外部依赖，全绿）；
+- `fast_agents/agents/react_agent/react_agent.py`：`ReActAgent.__init__` 加 `tracer=None`，传入时自动开 `agent.*` trace 与 `agent.run`/`decision.stepN` Span，并自动把 tracer 挂到 LLM 和 ToolRegistry；
+- `fast_agents/__init__.py`：顶层 `__init__` **重导出** trace 全部公开符号（`TraceLogger / SpanKind / SpanStatus / SpanRecord / TraceStoreBase / JsonlStore / MEMORY_PATH`），可直接 `from fast_agents import TraceLogger`；
+- `test/test_trace.py`：**43 项** pytest 用例（纯内存/临时目录，无外部依赖，全绿）；
 - `examples/trace/basic_usage.py`：最小示例，演示手动打点 + 内存回放；
 - `examples/trace/jsonl_replay.py`：落盘 + 跨 TraceLogger 实例读回回放示例；
 - `docs/trace模块编写说明.md`：本文档；
-- `README.md`：项目结构 trace/ 行、能力表 trace 行、版本历史 v2.20.0；
-- `docs/演进路线图.md`：§十 G 模块 G1 标记已落地、I5 Token 统计标记落地。
+- `README.md`：项目结构 `trace/` 行、核心模块小节 trace 条目；
+- `docs/演进路线图.md`：§十 G 模块 G1 状态与 I5 Token 统计标记。
 
 ### 4.2 分层
 
@@ -139,7 +139,7 @@ fast_agents/trace/                    ← 单数目录（对齐 tools/memory/ski
 │  - attach_to_tool_registry（一行接入工具打点）                       │
 │  - read_spans / replay（查询与回放）                                │
 │  - flush / close / 上下文管理器 __enter__/__exit__                  │
-│  - 线程本地栈 threading.local + ContextVar 双保险                    │
+│  - 实例级 ContextVar 栈（_trace_stack_var / _span_stack_var）        │
 └──────────────────────────────┬────────────────────────────────────┘
                                │写入 SpanRecord（pydantic 模型）
 ┌──────────────────────────────▼────────────────────────────────────┐
@@ -156,7 +156,7 @@ fast_agents/trace/                    ← 单数目录（对齐 tools/memory/ski
 └─────────┬─────────────────────────────────┬───────────────────────┘
           │当前唯一实现                       │未来扩展
 ┌─────────▼─────────────────────┐   ┌───────▼───────────────────────┐
-│ JsonlStore（jsonl_store.py）   │   │ SQLiteStore（v1.1.0 计划）   │
+│ JsonlStore（jsonl_store.py）   │   │ SQLiteStore（计划中）         │
 │ - JSONL 一行一条（utf-8）      │   │ 基于 database.SQLiteClient   │
 │ - :memory: 内存模式            │   │ 对 trace_id/kind/start_time  │
 │ - 线程锁 + 行缓冲 + fsync      │   │ 建索引、支持谓词下推          │
@@ -181,24 +181,24 @@ with tracer.trace("demo") as tid:                 # start_trace → push trace_i
 **链路 2：LLM 自动打点（tracer= 传入 LLM 后）**
 
 ```text
-LLM.invoke(messages, ..., tracer=?)              # llm.py:71
+LLM.invoke(messages, ..., tracer=?)              # llm.py
   → effective_tracer = tracer or self.tracer    # 方法参数优先、实例属性兜底
   → if effective_tracer is None: 直接走原逻辑    # 零开销
   → with effective_tracer.span("llm.invoke", kind=LLM, input=_summarize_input(messages),
                                 metadata={"model": model, ...}) as s:
         msg = openai_client.invoke(..., usage_sink=usage_sink)  # 底层回填 token 用量
-        s.metadata.update(usage_sink)            # 把 usage/prompt_tokens/... 写进 metadata
-        return msg                               # __exit__ 自动 end_span
+        _merge_usage_metadata(s.metadata, usage_sink)          # 把 usage/prompt_tokens/... 写进 metadata
+        return msg                                             # __exit__ 自动 end_span
 ```
 
-`embed_query` / `embed_documents` 同模式（span 名 `llm.embed_query` / `llm.embed_documents`，metadata 记录 embedding 模型与总 token）；`stream_invoke` 手动 start_span，生成器耗尽/异常时 end_span（stream 模式下不统计 token，因为底层未开 `stream_options`）。
+`embed_query` / `embed_documents` 同模式（span 名 `llm.embed_query` / `llm.embed_documents`，metadata 记录 embedding 模型与 token 总和）；`stream_invoke` 手动 start_span，生成器耗尽/异常时 end_span（stream 模式下不统计 token，因为底层未开 `stream_options`）。
 
 **链路 3：工具自动打点（attach_to_tool_registry 后）**
 
 ```text
 ToolRegistry.invoke_tool(name, args)             # tools/tool_registry.py
   → tool.invoke(args) → ToolResult(output=..., status=..., metadata={"duration_ms": 25, ...})
-  → for hook in self._hooks: hook(name, args, result)
+  → for hook in self._hooks: hook(name, kwargs, result)
         └─ tracer.tool_hook(name, args, result)  # trace_logger.py
               → 读 result.metadata["duration_ms"]  ← tool_base 用 perf_counter 实测写入
               → start_time = now - duration_ms/1000  # 回推开始时刻（后钩子语义）
@@ -214,15 +214,15 @@ ToolRegistry.invoke_tool(name, args)             # tools/tool_registry.py
 ReActAgent.run(...)                              # react_agent.py
   → if self.tracer:
         self.tracer.start_trace(name=f"agent.{self.name}.run")
-        _agent_span = start_span(f"agent.{self.name}.run", kind=AGENT, input=query)
+        _agent_span = start_span("agent.run", kind=AGENT, input={"user_input": ..., "agent": ..., "max_steps": ...})
   → 每一步 ReAct 循环：
-        _dec_span = start_span("agent.decision", kind=DECISION, input=messages, metadata={...})
+        _dec_span = start_span("decision.stepN", kind=DECISION, input=messages, metadata={...})
         llm.invoke(messages, tools=...)          # 自动产生 llm.invoke span（父是 _dec_span）
         if 要调工具:
             tool_registry.invoke_tool(name, args) # 自动产生 tool.* span（父是 _dec_span）
         end_span(_dec_span, output=parsed, ...)
-  → 循环结束：end_span(_agent_span, output=answer, status=SUCCESS)
-  → 异常：end_span(_agent_span, output=None, status=ERROR, error=...)
+  → 循环结束：end_span(_agent_span, output={"final_answer_preview": ..., "steps": ...}, status=SUCCESS)
+  → 异常：end_span(_agent_span, output=None, error=...)
   → end_trace()
 ```
 
@@ -232,14 +232,14 @@ ReActAgent.run(...)                              # react_agent.py
    - `LLM.__init__(self, ..., tracer=None)` 新增可选参数存为 `self.tracer`；
    - `invoke / stream_invoke / embed_query / embed_documents` 各自新增可选 `tracer=None` 参数；**方法级 tracer 优先、实例级 tracer 兜底**，两者都 None 时走原逻辑零开销；
    - span 名：`llm.invoke` / `llm.stream_invoke` / `llm.embed_query` / `llm.embed_documents`；
-   - token 元数据：底层 `OpenAIClient` 新增可选关键字 `usage_sink: dict`，LLM 层把 `usage/prompt_tokens/completion_tokens/total_tokens` 合并进 span.metadata；stream 模式无 token 数据。
+   - token 元数据：底层 `OpenAIClient` 新增可选关键字 `usage_sink: dict`，LLM 层把 `usage / prompt_tokens / completion_tokens / total_tokens` 合并进 span.metadata；stream 模式无 token 数据。
 
 2. **Agent 侧（`fast_agents/agents/react_agent/react_agent.py`）**：
    - `ReActAgent.__init__(self, ..., tracer=None)` 新增可选参数；
    - 若 tracer 非 None：
      - 若 `self.llm.tracer` 还没被用户手动设置，则自动把 tracer 挂给 LLM（不覆盖用户定制）；
      - 调用 `tracer.attach_to_tool_registry(self.tool_registry)` 一行挂工具钩子；
-   - `run()` 内部：开始时开 `agent.<name>.run` trace + agent Span，每步循环开 `agent.decision` Span（父是 agent Span），结束时统一 end；异常时 agent span 自动记 ERROR。
+   - `run()` 内部：开始时开 `agent.<name>.run` trace + `agent.run` Span，每步循环开 `decision.stepN` Span（父是 agent Span），结束时统一 end；异常时 agent span 自动记 ERROR。
 
 3. **工具侧（`fast_agents/tools/tool_registry.py`）**：
    - **不修改 ToolRegistry 源码**，工具打点只走现有 `add_hook(hook)` 扩展点；
@@ -266,15 +266,15 @@ ReActAgent.run(...)                              # react_agent.py
 | 自动启动 | 首个 start_span 时若没有活跃 trace，会懒启动一条名为 "default" 的 trace | 无 |
 | 结束 | `end_trace()` / with 块退出 | `end_span(s, output=, status=, error=, metadata=)` / with 块退出（异常自动 ERROR）|
 | 数据载体 | 不持久化自己，只作为 trace_id 共享给 Span | `SpanRecord` pydantic 模型，结束时写 store |
-| 栈 | `_local.trace_stack`（list[trace_id]） | `_local.span_stack`（list[span_id]） |
+| 栈 | `_trace_stack_var`（`ContextVar[tuple]`，元素为 trace_id） | `_span_stack_var`（`ContextVar[tuple]`，元素为 span_id） |
 
 ### 5.2 父子链怎么维护
 
 父子关系的核心是**当前活跃 span_id**：
 
-1. 双保险：`threading.local` 作为线程内主存储（每个线程独立栈），`contextvars.ContextVar` 作为跨同线程上下文（如同线程内的回调、contextlib 嵌套）的透传兜底；
-2. `start_span` 时，parent_id = `span_stack[-1]`（栈顶即当前活跃 span），空栈时再回退到 `_active_span_id.get()`；push 当前 span_id 进栈；
-3. `end_span` 时，若栈顶是该 span 则 pop 出去，并把 ContextVar 重置为新栈顶；
+1. **状态唯一载体**：每个 `TraceLogger` 实例在 `__init__` 里自持一对**实例级 `contextvars.ContextVar`**——`_trace_stack_var` / `_span_stack_var`，栈用不可变 `tuple` 表示（ContextVar 推荐不可变值，空栈为 `()`）。实例隔离（多 tracer 互不串扰）+ 上下文隔离（`asyncio.Task` 自动拷贝上下文，协程内天然继承）一次拿全；
+2. `start_span` 时，parent_id = `_span_stack_var.get()[-1]`（栈顶即当前活跃 span），空栈时 parent_id 为 None；随后 `_push_span` 把新 span_id 压栈；
+3. `end_span` 时，`_pop_span_if_top(span_id)` 仅在栈顶与传入 span 一致时弹出（若调用方手动动过栈，则不做调整）；
 4. tool_hook 因为是后钩子触发，**调用时上层 decision Span 已经是当前活跃 Span**，所以直接 start_span 出来的 tool Span 会自然成为 decision Span 的子 Span——不需要 tool_hook 自己管父子链。
 
 ### 5.3 三种打点方式怎么选
@@ -292,7 +292,7 @@ ReActAgent.run(...)                              # react_agent.py
 ToolRegistry 的钩子是**后钩子**——工具执行完了才调用 hook，这时已经不知道工具是几点开始的。两种处理方式：
 
 - **方式 A（朴素）**：hook 里 start_span 时取当前时刻当 start_time，finish 时 duration 就是钩子自身的耗时（几乎为 0），完全失真；
-- **方式 B（本模块做法，v1.0.1 修正）**：
+- **方式 B（本模块做法）**：
   1. `tool_base.py` 在工具执行前后用 `time.perf_counter()` 实测耗时，写入 `result.metadata["duration_ms"]`（int 毫秒）；
   2. trace 侧在 hook 里读取该值；
   3. 取「当前时刻（≈ 工具执行结束时刻）− duration_ms」回推 start_time；
@@ -351,7 +351,7 @@ class SpanRecord(BaseModel):
     parent_id: Optional[str]       # 父 Span id；根 Span 为 None
     session_id: Optional[str]      # 会话 id（跨 run 聚合用，默认 sess_ + 12 位 hex）
     # 基本信息
-    name: str                      # Span 名称，如 "llm.invoke" / "tool.calculator" / "agent.run"
+    name: str                      # Span 名称，如 "llm.invoke" / "tool.compute" / "agent.run"
     kind: SpanKind                 # Span 类型
     # 时间
     start_time: float              # 开始时间戳（秒，time.time() 墙钟）
@@ -397,7 +397,7 @@ class TraceStoreBase(ABC):
 | 函数 | 作用 |
 |---|---|
 | `_new_id()` | 生成 `uuid4().hex`（32 位 hex，不带横线），用作 span_id；trace_id 前缀加 `"trace_"`；session_id 前缀加 `"sess_"` |
-| `_now_ts()` | 返回 `time.time()` 秒级墙钟时间戳；用于 start_time/end_time（注：v1.0.x 墙钟用于字段；duration_ms 由 end-start 差值算出，短时间跨度内 NTP 跳变影响可接受，perf_counter 版本见 v1.0.2 规划） |
+| `_now_ts()` | 返回 `time.time()` 秒级墙钟时间戳，用于 start_time/end_time；`duration_ms` 由 `(end_time - start_time) * 1000` 算出，短时间跨度内墙钟跳变影响可接受 |
 
 ---
 
@@ -413,10 +413,9 @@ from .trace_logger import TraceLogger
 
 __all__ = ["TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
            "TraceStoreBase", "JsonlStore", "MEMORY_PATH"]
-__version__ = "1.0.1"
 ```
 
-**为什么这么写**：统一导出入口让调用方只需 `from fast_agents.trace import TraceLogger, SpanKind`；`__version__` 单独暴露便于诊断；顶层 `fast_agents/__init__.py` 不重导出 trace，避免不使用 trace 的用户被额外 import 到 pydantic 之外的东西（实际上 trace 模块全量 import 很轻，但保持显式依赖更清晰）。
+**为什么这么写**：统一导出入口让调用方只需 `from fast_agents.trace import TraceLogger, SpanKind`；顶层 `fast_agents/__init__.py` **同步重导出** trace 全部公开符号，所以 `from fast_agents import TraceLogger` 也能直接拿到。本模块**不单独维护 `__version__`**（与 tools / memory / mcp 等模块一致，版本号由顶层 `fast_agents/version.py` 统一）。
 
 ### 7.2 `models.py` —— 数据模型
 
@@ -425,7 +424,7 @@ __version__ = "1.0.1"
 - `SpanKind` / `SpanStatus` 继承 `str, Enum`，既可以当枚举用（`SpanKind.LLM`），也可以直接和字符串比较（`s.kind == "llm"`）；pydantic `model_dump(mode="json")` 时自动转成字符串值；
 - `SpanRecord` 默认值用 `Field(default_factory=...)`：`span_id` 默认 `_new_id()`（每个新 Span 自动生成），`start_time` 默认 `_now_ts()`（创建时打开始时间），`metadata` 默认空 dict（注意 `default_factory=dict` 而非 `default={}`，避免可变默认值坑）；
 - `finish()` 把「算耗时 / 设 output / 设状态 / 合并 metadata」四件事收口，所有结束 Span 的路径（手动 end_span、with 语法、tool_hook）都走它，保证 duration 计算口径一致；
-- 字段特意命名为 `input/output`（单数），对齐 route_map 字段风格、也便于 `s.input` 直接访问；历史上 OpenTelemetry 用 attributes、LangChain 用 inputs/outputs，这里刻意简化为单数，和路线图最小字段集命名一致。
+- 字段特意命名为 `input/output`（单数），对齐路线图最小字段集命名风格、也便于 `s.input` 直接访问；历史上 OpenTelemetry 用 attributes、LangChain 用 inputs/outputs，这里刻意简化为单数。
 
 ### 7.3 `store_base.py` —— 存储抽象
 
@@ -453,12 +452,12 @@ __version__ = "1.0.1"
 **关键实现**：
 
 1. **构造参数**：`TraceLogger(store=None, *, path=None, session_id=None, enabled=True)`；`store` 自定义后端优先；`path` 仅在 store=None 时传给 JsonlStore；`enabled=False` 时所有方法短路（start_span 返回占位 Span 可无脑 `.finish()`）；
-2. **线程本地栈 + ContextVar 双保险**：`self._local = threading.local()` 作主存储，`_local.trace_stack/span_stack` 各线程独立；模块级 `_active_span_id/_active_trace_id` ContextVar 作为 `_current_parent_id/_current_trace_id` 的 fallback；
+2. **实例级 ContextVar 栈**：`self._trace_stack_var` / `self._span_stack_var` 各持一份 `ContextVar[tuple]` 栈，每个实例 + 每个线程 / asyncio.Task 各持一份，天然隔离；`_stacks()` 读回两条栈，`_push_span()` 压栈，`_pop_span_if_top()` 只在栈顶匹配时弹出；
 3. **disabled 占位 Span**：`enabled=False` 时 `start_span` 返回一个 trace_id="disabled" 的占位 SpanRecord，调用方可以无脑 `.finish()`、改 `.output` 等，但 `end_span` 直接 return 不写 store——保证在「想临时关掉 trace 但不改打点代码」时也不报错；
-4. **懒启动默认 trace**：`_current_trace_id()` 在栈空且 ContextVar 也空时自动 `start_trace(name="default")`，避免 with 块没包 trace 就 start_span 时 trace_id 为 None；
-5. **with 语法的两种粒度**：`trace(name)` yield trace_id，`span(name, kind, input=, metadata=)` yield SpanRecord；with 块内抛异常时自动记 ERROR 并重新 raise；若调用方在块内手动 `.finish()` 过 span，则 `__exit__` 只弹栈+写 store，不重复 finish；
-6. **tool_hook**（v1.0.1 修正过）：读 `result.status/error/output/metadata`，从 `metadata["duration_ms"]` 取实测耗时回推 start_time，失败时标记 `duration_source="unavailable"`；tool span 统一命名为 `tool.<name>`，metadata 写入 `tool_name` 和 `tool_status`；
-7. **replay**：默认回放当前活跃 trace（若有），按 `(start_time, span_id)` 排序后返回可直接 json.dumps 的 dict 列表，所有枚举转字符串值、duration_ms 保留两位小数；
+4. **懒启动默认 trace**：`_current_trace_id()` 在 trace 栈空时自动 `start_trace(name="default")`，避免 with 块没包 trace 就 start_span 时 trace_id 为 None；
+5. **with 语法的两种粒度**：`trace(name)` yield trace_id，`span(name, kind, input=, metadata=)` yield SpanRecord；with 块内抛异常时自动记 ERROR 并重新 raise；若调用方在块内手动 `.finish()` 过 span（`s.end_time` 非 None），则 `__exit__` 只弹栈+写 store，不重复 finish；
+6. **tool_hook**：读 `result.status/error/output/metadata`，从 `metadata["duration_ms"]` 取实测耗时回推 start_time（`start_time = _now_ts() - duration_ms/1000`），工具未上报时标记 `duration_source="unavailable"`；tool span 统一命名为 `tool.<name>`，metadata 写入 `tool_name` 和 `tool_status`；
+7. **replay**：默认回放当前 trace 栈最外层（最早开启的）trace；按 `(start_time, span_id)` 排序后返回可直接 json.dumps 的 dict 列表，所有枚举转字符串值、duration_ms 保留两位小数；
 8. **上下文管理器协议**：`__enter__` 返回 self，`__exit__` 先 flush 再 close 并返回 False（不吞异常）——配合 `with TraceLogger(path="...") as tracer:` 自动收尾。
 
 ---
@@ -469,7 +468,7 @@ __version__ = "1.0.1"
 
 ```powershell
 cd D:\path\to\fast_agents
-python -m pytest test\test_trace.py -v     # 41/41 全过才算装好
+python -m pytest test\test_trace.py -v     # 43/43 全过才算装好
 python examples\trace\basic_usage.py       # 最小手动打点示例
 python examples\trace\jsonl_replay.py      # 落盘+回放示例
 ```
@@ -479,7 +478,6 @@ python examples\trace\jsonl_replay.py      # 落盘+回放示例
 ### 8.2 最小可运行示例（内存模式 + 手动打点）
 
 ```python
-"""examples/trace/basic_usage.py — 最小手动打点示例，无需 API Key。"""
 from fast_agents.trace import TraceLogger, SpanKind
 
 tracer = TraceLogger()  # 默认 :memory: 内存模式
@@ -507,31 +505,30 @@ trace trace_xxxxxxxx... 共 2 个 span:
   [custom] compute  0.0xms  success
 ```
 
+更完整的版本（含 agent/decision/tool 嵌套、replay 打印、enabled=False 关闭）见 `examples/trace/basic_usage.py`。
+
 ### 8.3 接到 LLM / Agent 上（自动打点）
 
 **给 LLM 挂 tracer（仅 LLM 打点，不管工具/Agent）**：
 
 ```python
-from fast_agents.llm import LLM
-from fast_agents.trace import TraceLogger
+from fast_agents import LLM, TraceLogger
 
 tracer = TraceLogger(path="traces/runs.jsonl")  # 落盘追加
-llm = LLM(model="gpt-4o-mini", api_key="sk-...", tracer=tracer)
+llm = LLM(tracer=tracer)
 # 之后每次 llm.invoke / stream_invoke / embed_* 都会自动记录一条 llm.* span
 ```
 
 **给 ReActAgent 挂 tracer（全链路自动打点）**：
 
 ```python
-from fast_agents.agents import ReActAgent
-from fast_agents.tools import ToolRegistry
-from fast_agents.trace import TraceLogger
+from fast_agents import LLM, ReActAgent, ToolRegistry, TraceLogger
 
 tracer = TraceLogger(path="traces/runs.jsonl")
 # tracer= 非 None 时：自动挂 LLM（若 llm.tracer 未被用户设置）+ 自动 attach 工具钩子 + run 内开 agent trace
-agent = ReActAgent(llm=llm, tool_registry=ToolRegistry(), tracer=tracer)
+agent = ReActAgent(name="助手", llm=LLM(), tool_registry=ToolRegistry(), tracer=tracer)
 answer = agent.run("你好")
-# tracer 里已经有 agent.run / agent.decision / llm.invoke / tool.* 一整棵树
+# tracer 里已经有 agent.run / decision.stepN / llm.invoke / tool.* 一整棵树
 print(tracer.replay())
 tracer.close()
 ```
@@ -555,7 +552,7 @@ tracer.attach_to_tool_registry(tool_registry)  # 一行接入；之后 registry.
 python -m pytest test/test_trace.py -v
 ```
 
-预期：**41 passed**。
+预期：**43 passed**。
 
 ---
 
@@ -608,7 +605,7 @@ TraceLogger(
 | 方法 | 参数 | 返回 | 说明 |
 |---|---|---|---|
 | `read_spans(session_id=None, trace_id=None, kind=None, limit=None)` | kind 传字符串如 `"llm"` | List[SpanRecord] | 从 store 按条件过滤（按写入顺序返回）|
-| `replay(trace_id=None, session_id=None)` | 默认回放当前活跃 trace | List[dict] | 按 (start_time, span_id) 排序，dict 可直接 json.dumps |
+| `replay(trace_id=None, session_id=None)` | 默认回放当前 trace 栈最外层 trace | List[dict] | 按 (start_time, span_id) 排序，dict 可直接 json.dumps |
 
 **生命周期**：
 
@@ -671,10 +668,10 @@ class MyStore(TraceStoreBase):
 
 1. **为什么不直接用 OpenTelemetry SDK？**——fast_agents 的目标是零重型依赖、能离线跑、能被新手看懂；OTel SDK 带一整套 TracerProvider / SpanProcessor / Exporter / Context 机制，对只想把 LLM/tool 打点落 jsonl 的场景是过度设计。借鉴它的 Trace/Span 模型足矣。
 2. **为什么默认 TraceLogger(enabled=True)，又说"默认关闭"？**——"默认关闭"指的是**框架默认行为**：LLM/Agent 不构造、不传 tracer 时零开销。TraceLogger 自身构造出来默认 enabled=True，因为你既然构造了它一般就是要打点；要临时关闭传 `enabled=False`，此时所有 start_span 返回占位 Span，打点代码无需删改。
-3. **为什么 tool_hook 要回推 start_time，而不是在工具调用前插 before_hook？**——现有 `ToolRegistry.add_hook` 只支持**后钩子**（签名 `(name, args, result)`），路线图 G1 明确"不改注册表逻辑"，所以只能从 ToolResult.metadata 读耗时回推；这是硬约束下的最优解。要更精确的前/后双钩子时机是 G2 的事（或者给 ToolRegistry 加 before_hook），v1.0.x 不做。
-4. **为什么用墙钟 time.time() 而不是 perf_counter 算 start_time？**——SpanRecord 的 start_time/end_time 是**给人看的墙钟时间**（能对应到日志时间点），duration_ms 由差值算出。短时间操作（LLM/tool 都在秒级以内）NTP 跳变的影响几乎不会出现；长时间 run 跨 NTP 校时窗口可能产生误差，v1.0.2 会把 duration 改用 perf_counter 差值计算。
-5. **为什么 JsonlStore 启动时要读全文件进 `_mem`？**——`read()` 需要按条件过滤；不读进内存就得每次 read 时扫全文件，频繁 replay 会重复 IO。v1.0.x 面向中小数据量（单次开发调试 / 几万条 span）全量缓存可接受；大数据量是 SQLiteStore 的事（v1.1.0）。
-6. **为什么 stream_invoke 不统计 token？**——OpenAI 流式接口要拿到 usage 必须请求时加 `stream_options={"include_usage": True}`，这会改变底层响应结构（最后一帧带 usage）；v1.0.1 不为了统计去改动流式消费逻辑，等确有需求再加（见第十二章）。
+3. **为什么 tool_hook 要回推 start_time，而不是在工具调用前插 before_hook？**——现有 `ToolRegistry.add_hook` 只支持**后钩子**（签名 `(name, args, result)`），路线图 G1 明确"不改注册表逻辑"，所以只能从 ToolResult.metadata 读耗时回推；这是硬约束下的最优解。要更精确的前/后双钩子时机，留给后续版本（见第十二章）。
+4. **为什么用墙钟 time.time() 而不是 perf_counter 算 start_time？**——SpanRecord 的 start_time/end_time 是**给人看的墙钟时间**（能对应到日志时间点），duration_ms 由差值算出。短时间操作（LLM/tool 都在秒级以内）NTP 跳变的影响几乎不会出现；长时间 run 跨 NTP 校时窗口可能产生误差，后续版本可把 duration 改用 perf_counter 差值计算（见第十二章）。
+5. **为什么 JsonlStore 启动时要读全文件进 `_mem`？**——`read()` 需要按条件过滤；不读进内存就得每次 read 时扫全文件，频繁 replay 会重复 IO。初版面向中小数据量（单次开发调试 / 几万条 span）全量缓存可接受；大数据量是 SQLiteStore 的事（见第十二章）。
+6. **为什么 stream_invoke 不统计 token？**——OpenAI 流式接口要拿到 usage 必须请求时加 `stream_options={"include_usage": True}`，这会改变底层响应结构（最后一帧带 usage）；初版不为了统计去改动流式消费逻辑，等确有需求再加（见第十二章）。
 7. **为什么 LLM token 要通过 `usage_sink` 这个旁路 dict 回传，而不是改 OpenAIClient 返回值？**——路线图硬约束"不改既有返回值语义"。`usage_sink` 是可选关键字参数，不传就完全不影响原逻辑；传了就在 invoke 结束时把 response.usage 填进去，LLM 层再合并进 span.metadata。
 
 ### 10.2 常见坑与排查
@@ -682,14 +679,14 @@ class MyStore(TraceStoreBase):
 | 现象 | 原因 / 解决 |
 |---|---|
 | 构造了 TraceLogger 但 LLM/Agent 没有任何 span 输出 | 必须把 tracer **显式传给** `LLM(..., tracer=tracer)` 或 `ReActAgent(..., tracer=tracer)`，仅仅构造不会自动全局生效；或者用 `tracer.attach_to_tool_registry(reg)` 手动挂工具 |
-| tool span 的 duration_ms 接近 0 且 metadata 里有 `duration_source=unavailable` | 该工具的 `ToolResult.metadata` 没有 `duration_ms` 字段——自定义工具请用 `ToolBase._time_invoke` 或手动写入 `result.metadata["duration_ms"]=...`，否则 trace 只能记成近零耗时 |
+| tool span 的 duration_ms 接近 0 且 metadata 里有 `duration_source=unavailable` | 该工具的 `ToolResult.metadata` 没有 `duration_ms` 字段——自定义工具请用 `ToolBase` 的计时逻辑或手动写入 `result.metadata["duration_ms"]=...`，否则 trace 只能记成近零耗时 |
 | 开了 tracer 但异常后 span 没写进去 | 检查是否手动调用了 `start_span` 但忘了 `end_span`（异常路径也要 end）；推荐 with 语法自动成对 |
 | with tracer.span(...) 块内异常被吞了 | 没有吞。`span().__exit__` 在记 ERROR 后会**重新 raise**，异常照常传播；只是额外记了一条 ERROR span |
 | JsonlStore 第二次启动读不到旧记录 | 检查 `append=True`（默认）并且路径一致；`append=False` 会清空重写 |
 | read_spans 返回空 | 检查 span 是否真的 end 了（with 块外才会写 store；块内 span.end_time 还是 None）；或者 trace_id/session_id/kind 过滤条件写错 |
 | metadata 里的对象变成了字符串 | 对象无法 JSON 序列化时 `_safe_serialize` 会退化为 `str(obj)`。想保留结构化信息，请传 pydantic 模型 / dict / list / 基本类型 |
-| 跨线程丢父链 | v1.0.x 每个线程自己维护 trace_stack/span_stack；跨线程任务需要在新线程里重新 start_trace 或手动传 parent_id；ContextVar 在同线程内的 contextlib 嵌套里是通的 |
-| 顶层 `fast_agents` 里 import 不到 TraceLogger | 顶层 `__init__` 不重导出 trace 内容，请用 `from fast_agents.trace import TraceLogger` 显式导入 |
+| 跨线程丢父链 | 状态栈是**实例级 ContextVar**：同线程/同协程（含 `asyncio.Task`，因其会拷贝上下文）内自动继承父链；但**新建线程不会继承**（`threading.Thread` 不拷贝 Context）。跨线程任务需要在新线程里重新 `start_trace` 或手动指定 parent_id |
+| 顶层 `fast_agents` 里 import 不到 TraceLogger | 顶层 `fast_agents/__init__.py` **已重导出** trace，可直接 `from fast_agents import TraceLogger`；若 import 不到，请确认安装/导入的是本仓库版本（旧版本可能未导出）|
 
 ### 10.3 跨平台注意事项
 
@@ -697,7 +694,7 @@ class MyStore(TraceStoreBase):
 2. **路径**：`Path(path).parent.mkdir(parents=True, exist_ok=True)`，Windows 下相对/绝对路径、带空格路径均可用；路径分隔符用 pathlib 处理，不硬编码 `/`；
 3. **文件编码**：jsonl 文件统一 `utf-8`；中文/Emoji 都能正确写入（`json.dumps(ensure_ascii=False)`）；
 4. **控制台打印**：replay() 返回 dict，打印时若 Windows 控制台中文乱码，执行 `chcp 65001` 或设置 `PYTHONIOENCODING=utf-8`；
-5. **文件锁**：JsonlStore 的线程锁只保护**同进程内多线程**；多进程写同一 jsonl 文件可能混行——v1.0.x 不做文件锁，建议每进程独立文件或走 SQLite 后端（v1.1.0）；
+5. **文件锁**：JsonlStore 的线程锁只保护**同进程内多线程**；多进程写同一 jsonl 文件可能混行——初版不做文件锁（见第十二章），建议每进程独立文件或走 SQLite 后端；
 6. **Python 版本**：仓库 `.python-version` 是 3.10，trace 模块用到的 `str | None` 类型语法要求 Python ≥ 3.10；`from __future__ import annotations` 已在每个文件顶部开启，保证前向引用不报错。
 
 ---
@@ -708,22 +705,26 @@ class MyStore(TraceStoreBase):
 
 | 测试文件 | 项数 | 覆盖点 | 运行命令 |
 |---|---|---|---|
-| `test/test_trace.py` | **41/41** | 见下表 | `python -m pytest test/test_trace.py -v` |
+| `test/test_trace.py` | **43/43** | 见下表 | `python -m pytest test/test_trace.py -v` |
 
-**41 项用例覆盖点**：
+**43 项用例覆盖点**：
 
-1. **基础生命周期**：默认构造不报错、enabled=False 不写入、with 上下文管理器自动成对、close 多次调用安全、set_session_id 切换会话；
-2. **Span 模型**：默认 span_id 自动生成、start_time 默认当前时刻、finish 自动算 duration_ms、finish 合并 metadata、error 自动置 ERROR、kind 传字符串归一、kind 传非法字符串退化为 CUSTOM；
-3. **父子链**：嵌套 span 自动设 parent_id、懒启动 default trace、trace() 上下文 yield trace_id 且能嵌套、with 块内异常自动 ERROR 并重新 raise、手动 start/end 成对写入；
-4. **工具钩子 tool_hook**：成功工具生成 tool span 且 metadata 带 tool_name/tool_status、错误工具 status=ERROR 且 error 非空、工具结果无 metadata 时退化且 duration_source=unavailable、工具 metadata 有 duration_ms 时回推 start_time 得到正确耗时（test_tool_hook_uses_real_duration_from_metadata）、缺失耗时标记、通过 registry end-to-end 记录真实耗时；
-5. **LLM token 元数据**：invoke 返回 usage 时 span.metadata 带 model/prompt_tokens/completion_tokens/total_tokens/usage（test_llm_invoke_records_token_metadata）、invoke 无 usage 时不带这些键、embed_query 记录 token 元数据、embed_documents 累加多批次 token、stream_invoke 无 token 元数据；
-6. **存储**：:memory: 模式不落盘、文件模式写盘且 append 模式跨实例读回、read_spans 按 session_id/trace_id/kind 过滤、limit 截断、_safe_serialize 处理 pydantic 模型/递归 dict/不可序列化对象、JsonlStore 写入异常不抛、flush/close 不抛；
-7. **replay**：按时间排序、返回字段完整、枚举转字符串、duration_ms 保留两位小数、无活跃 trace 时返回空列表。
+1. **Span 数据模型**：默认 span_id 自动生成、start_time 默认当前时刻、finish 自动算 duration_ms、finish 合并 metadata、error 自动置 ERROR、SpanKind 枚举取值；
+2. **存储 JsonlStore**：`:memory:` 写入读回、按 session_id/trace_id/kind 过滤、limit 截断、`:memory:` 与 None 等价、文件模式写盘且 append 模式跨实例读回、append=False 清空重写、落盘文件每行均为合法 JSONL；
+3. **基础生命周期与开关**：默认构造不报错、enabled=False 不写入、不传 tracer 时 LLM 走原逻辑零分支、with trace 上下文、with span 正常退出记录、with span 异常标记 ERROR；
+4. **父子链与时间**：嵌套 span 自动设 parent_id、手动 start/end 成对写入并计算耗时；
+5. **工具钩子 tool_hook**：成功工具生成 `tool.<name>` span 且 metadata 带 tool_name/tool_status、错误工具 status=ERROR 且 error 非空、从 metadata["duration_ms"] 取真实耗时并回推 start_time、缺失耗时标记 duration_source=unavailable、经 ToolRegistry 端到端记录真实耗时、disabled 时 attach 为 no-op；
+6. **LLM 打点与 token 元数据**：invoke 带 tracer 记录 span、invoke 不带 tracer 不记录、stream_invoke 记录 span、embed_query / embed_documents 记录 span；invoke 带 usage 时 metadata 含 model/prompt_tokens/completion_tokens/total_tokens/usage、无 usage 时不写这些键、embed_query 记录 token、embed_documents 累加多批次 token、stream_invoke 无 token 元数据；
+7. **Agent 接入**：ReActAgent 带 tracer 时记录 agent/decision/llm/tool 多种 span、不带 tracer 时行为与改动前一致；
+8. **查询与回放**：replay 返回按时间排序、字段完整、可打印的列表、自定义 store 可注入、set_session_id 切换与会话过滤、TraceLogger 上下文管理器退出时关闭 store；
+9. **状态隔离**：多 tracer 实例互不串扰父链（`test_state_is_per_instance_no_cross_pollution`）、状态栈为实例级而非模块级（`test_contextvar_is_instance_level_not_module_level`）。
 
 ### 11.2 关键回归断言
 
-- `test_tool_hook_uses_real_duration_from_metadata` —— 锁住 tool span 必须从 metadata 取真实耗时并回推 start_time（v1.0.1 修复项）；
-- `test_llm_invoke_records_token_metadata` 等 4 个 token 用例 —— 锁住 LLM span 必须正确写入/不写入 token 元数据（v1.0.1 新增项）；
+- `test_tool_hook_uses_real_duration_from_metadata` —— 锁住 tool span 必须从 `ToolResult.metadata["duration_ms"]` 取真实耗时并回推 start_time；
+- `test_llm_invoke_records_token_metadata` 等 token 用例 —— 锁住 LLM span 必须正确写入/不写入 token 元数据；
+- `test_state_is_per_instance_no_cross_pollution` —— 锁住两个 tracer 实例交错打点时，各自根 Span 的 parent_id 必须为 None，不互相串链；
+- `test_contextvar_is_instance_level_not_module_level` —— 锁住模块级不再有共享状态、实例上持有自己的 ContextVar 栈；
 - "不传 tracer 时 LLM.invoke 调用链不引入任何 trace 相关分支"——通过 LLM 现有测试全绿间接验证（`test_llm.py` 未改）；
 - "ReActAgent 不传 tracer 时行为与改动前一致"——通过 react_agent 现有测试全绿间接验证。
 
@@ -731,36 +732,55 @@ class MyStore(TraceStoreBase):
 
 ```text
 $ python -m pytest test/test_trace.py -q
-.........................................                                [100%]
-41 passed in 1.50s
+...........................................                              [100%]
+43 passed in 1.84s
 ```
 
 回归基线（与其它模块合跑）：
 
 ```text
 $ python -m pytest test/test_trace.py test/test_database.py test/test_tools.py -q
-......................................... (test_trace 41)
-................................................................................ (test_database 82 + test_tools 21 = 103)
-144 passed
+187 passed, 17 skipped in 3.55s
 ```
+
+说明：`test/test_trace.py` 43 项、`test/test_tools.py` 56 项、`test/test_database.py` 88 passed；另有 17 项依赖可选依赖 `chromadb` 的用例在未安装该可选依赖时被 `pytest.importorskip` 跳过（**skip 不是失败**，装上 `pip install fast-agents[chroma]` 后即参与运行）。
 
 ### 11.4 示例验证
 
 ```text
 $ python examples/trace/basic_usage.py
-trace trace_xxx 共 2 个 span:
-  [custom] hello  0.0xms  success
-  [custom] compute  0.0xms  success
+[1] session_id: sess_xxxxxxxxxxxx
+[4] 共记录 4 条 Span
+
+=== demo-pipeline 链路回放（按时间顺序）===
+- [   agent] agent.run               20.xxms  success  -> {'final_answer': '3 的平方是 9'}
+  - [decision] decision.step1           0.0xms  success  -> {'action': 'call compute', 'args': {'x': 3}}
+  - [    tool] tool.compute            20.xxms  success  -> 9
+
+[5] tool 类型 Span 共 1 条
+[6] tracer 已关闭
+[7] enabled=False 时无任何记录（零开销）
 
 $ python examples/trace/jsonl_replay.py
-[基本信息]
-  日志路径: .../examples/trace/_output/demo.jsonl
-  文件大小: ~2KB
-[回放结果] 共 5 条 span（跨实例读回成功）
-  ...
+[1] trace 落盘路径: examples/trace/_output/demo.jsonl
+[2] 已注册工具: ['add', 'multiply']
+[3] 计算结果: (2+3)*4 = 20
+[4] 文件已落盘，大小 2335 字节
+[5] 重新打开后读到 5 条历史 Span
+    session=demo-session: 5 条
+    kind=agent:    1 条
+    kind=decision: 2 条
+    kind=tool:     2 条
+
+=== 回放 trace=trace_xxxxxxxx... ===
+- [   agent] agent.run               1.0xxms  -> {'final_answer': '(2+3)*4 = 20'}
+  - [decision] decision.step1          0.0xms  -> {'action': 'call add', 'args': {'a': 2, 'b': 3}}
+  - [    tool] tool.add                0.0xms  -> 5
+  - [decision] decision.step2          0.0xms  -> {'action': 'call multiply', 'args': {'a': 5, 'b': 4}}
+  - [    tool] tool.multiply           0.0xms  -> 20
 ```
 
-两个示例均**无需 API Key**，离线可跑。
+两个示例均**无需 API Key**，离线可跑（耗时数字随机器波动）。
 
 ---
 
@@ -768,12 +788,12 @@ $ python examples/trace/jsonl_replay.py
 
 按优先级排（与《演进路线图.md》§十 G 模块编号一致）：
 
-1. **v1.0.2 G1 收尾 patch**——输入输出截断长度可配置（现在接入层硬编码）、`replay` 补 `build_tree()` 树形聚合辅助、统一 `error_type` 分类字段、duration 改用 perf_counter 差值抗墙钟跳变、JsonlStore 内存模式下不保留全量 `_mem`（或改环形缓冲），修复「状态双轨（threading.local + 模块级 ContextVar）」的跨实例污染隐患——纯 G1 收尾，零依赖、零破坏；
-2. **v1.1.0 G1.1 数据可消费**：新增 `summarize(trace_id/session_id)` 轻量统计 API（按 trace 汇总 token 消耗 / 平均耗时 / step 数 / 工具调用次数 / 错误率 / 工具选择分布），把 v1.0.1 写进 metadata 的 token 数据真正消费起来，作为 G3 评估工具的天然底座；
-3. **v1.1.0 G1.2 SQLiteStore 可选后端**：基于已交付的 `database.SQLiteClient` 实现 SQLiteStore，对 `trace_id/kind/start_time` 建索引，解决 JsonlStore 全量读进内存的数据量瓶颈，通过 `TraceLogger(store=SQLiteStore(path=...))` 一行切换，jsonl 仍是默认；
-4. **v1.2.0 G2 异步并发支持**：统一用 ContextVar 做跨协程父子链传播（替换双轨状态）、支持 async 工具/LLM 打点、多进程文件锁或文档化「每 worker 独立文件」、Sampler 采样器（按比例/错误率）、SpanEvent 时间点事件（首 token 到达、解析开始）、流式 token 统计（开 `stream_options={"include_usage": True}`）；
-5. **v1.3.0 G3 评估工具**：工具选择准确率、双 Agent Win Rate、结果对比、Token 成本日报——依赖 v1.1.0 的统计底座；
-6. **v1.4.0 G4 Web UI / 外部上报**：瀑布图看板（独立 HTML/SVG 或轻量前端）、可选 OTLP/Langfuse exporter——与"零依赖/离线可跑"红线隔离，做成独立可选 exporter，默认不装。
+1. **v1.0.1 · G1 收尾 patch**——输入输出截断长度可配置（现在接入层硬编码，如 agent 输出预览 300 字符）、`replay` 补 `build_tree()` 树形聚合辅助、统一 `error_type` 分类字段、duration 改用 perf_counter 差值抗墙钟跳变、JsonlStore 内存模式下不保留全量 `_mem`（或改环形缓冲）——纯 G1 收尾，零依赖、零破坏；
+2. **v1.1.0 · G1.1 数据可消费**：新增 `summarize(trace_id/session_id)` 轻量统计 API（按 trace 汇总 token 消耗 / 平均耗时 / step 数 / 工具调用次数 / 错误率 / 工具选择分布），把已写进 metadata 的 token 数据真正消费起来，作为 G3 评估工具的天然底座；
+3. **v1.1.0 · G1.2 SQLiteStore 可选后端**：基于已交付的 `database.SQLiteClient` 实现 SQLiteStore，对 `trace_id/kind/start_time` 建索引，解决 JsonlStore 全量读进内存的数据量瓶颈，通过 `TraceLogger(store=SQLiteStore(path=...))` 一行切换，jsonl 仍是默认；
+4. **v1.2.0 · G2 异步并发支持**：async 工具/LLM 打点接入、多进程文件锁或文档化「每 worker 独立文件」、Sampler 采样器（按比例/错误率）、SpanEvent 时间点事件（首 token 到达、解析开始）、流式 token 统计（开 `stream_options={"include_usage": True}`）；状态栈已是实例级 ContextVar，跨协程传播已就位，无需返工；
+5. **v1.3.0 · G3 评估工具**：工具选择准确率、双 Agent Win Rate、结果对比、Token 成本日报——依赖 v1.1.0 的统计底座；
+6. **v1.4.0 · G4 Web UI / 外部上报**：瀑布图看板（独立 HTML/SVG 或轻量前端）、可选 OTLP/Langfuse exporter——与"零依赖/离线可跑"红线隔离，做成独立可选 exporter，默认不装。
 
 ---
 
@@ -782,7 +802,7 @@ $ python examples/trace/jsonl_replay.py
 - [OpenTelemetry Trace API 规范](https://opentelemetry.io/docs/specs/otel/trace/api/) —— 借鉴 Trace/Span/SpanContext/Status 的核心概念与字段划分；
 - [LangChain Callbacks](https://python.langchain.com/docs/concepts/callbacks/) —— 借鉴 on_llm_start / on_tool_end 的事件时机与自动打点思路；
 - [OpenAI Agents SDK Tracing](https://openai.github.io/openai-agents-python/tracing/) —— 借鉴 `trace()` / `span()` 简洁的 with 语法 API 设计；
-- [fast_agents/database 模块编写说明](file:///docs/database模块编写说明.md) —— 对齐文档骨架；SQLiteClient 是 v1.1.0 SQLiteStore 的底层依赖；
+- [fast_agents/database 模块编写说明](file:///docs/database模块编写说明.md) —— 对齐文档骨架；SQLiteClient 是 SQLiteStore 后端的底层依赖；
 - [fast_agents/演进路线图.md §十 模块 G：infra](file:///docs/演进路线图.md) —— G1-G6 模块规划源头。
 
 ---
@@ -790,8 +810,8 @@ $ python examples/trace/jsonl_replay.py
 ## 附录：发布前自检清单
 
 - [x] 文档名 `trace模块编写说明.md`，落位 `docs/`；
-- [x] 开篇写清定位、配套代码路径、版本（v1.0.1）、平台（Win/macOS/Linux）与依赖（零新增依赖），且有可跳转目录；
-- [x] 更新历史记录 v1.0.1 初版变更（含迁移说明：不涉及，纯新增模块）；
+- [x] 开篇写清定位、配套代码路径、版本（v1.0.0）、平台（Win/macOS/Linux）与依赖（零新增依赖），且有可跳转目录；
+- [x] 更新历史记录 v1.0.0 初版变更（含迁移说明：不涉及，纯新增模块）；
 - [x] 第二章讲清 Trace/Span 概念分层与 6 条设计原则；
 - [x] 第三章包含对比总表（5 家）+ 异同表（含"缺少什么"）；
 - [x] 第四章有目录结构（单数目录 trace/）、分层图、4 条数据流/调用链路图、与 ReActAgent/LLM/ToolRegistry 的接入边界；
@@ -801,7 +821,7 @@ $ python examples/trace/jsonl_replay.py
 - [x] 快速上手命令是 Windows PowerShell，且提醒了 `test/` 与标准库同名问题；最小示例 ≤20 行、无需 API Key；
 - [x] API 速查按类分小节，列出所有对外方法的参数/返回/说明；
 - [x] 第十章包含 7 条关键设计决策、9 条常见坑（每条都有可执行解法）、6 条跨平台注意事项；
-- [x] 测试章节列出 41 项覆盖点 + 4 条关键回归断言 + 全绿基线 41 passed + 合跑 144 passed；
+- [x] 测试章节列出 43 项覆盖点 + 关键回归断言 + 全绿基线 43 passed + 合跑 187 passed（+17 skipped）；
 - [x] 演进路线与《演进路线图.md》G1-G4 编号一致；
 - [x] 章节数量、顺序、编号与其余 6 份模块文档（tools/memory/skills/mcp/context/database）完全一致；
 - [x] 全文无"待补充/TBD"残留，未实现项已列入第十二章；
