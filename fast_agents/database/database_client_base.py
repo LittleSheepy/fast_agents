@@ -38,7 +38,7 @@ class DatabaseClientBase(ABC):
     def close(self) -> None:
         """关闭连接。"""
         if self._conn is not None:
-            self._conn.close()
+            self._close()
             self._conn = None
 
     # ---------- DDL：建表 / 删表 / 查表 ----------
