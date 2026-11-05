@@ -4,6 +4,12 @@
 全部用内存数据库，跑完不留文件。
 运行方式：在项目根目录执行 `python examples/database/sqlite_usage.py`
 """
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from fast_agents.database import SQLiteClient
 
 
