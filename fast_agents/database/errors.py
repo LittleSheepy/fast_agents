@@ -39,3 +39,19 @@ class DatabaseOperationalError(DatabaseError):
 
 class DatabaseValidationError(DatabaseError):
     """校验层：入参不合法（列定义非法、必填缺失、危险操作被拒等）。"""
+
+
+class DatabaseIdentifierError(DatabaseValidationError):
+    """校验层：标识符（表名/列名/集合名等）不合法。"""
+
+
+class DatabaseIntegrityError(DatabaseOperationalError):
+    """执行层：约束冲突（主键重复、唯一键冲突、集合已存在等）。"""
+
+
+class DatabaseQueryError(DatabaseOperationalError):
+    """执行层：查询/写入失败（集合不存在、字段不存在等）。"""
+
+
+class DatabaseDriverMissingError(DatabaseConnectionError):
+    """连接层：可选驱动未安装（如pymysql/chromadb未装）。"""

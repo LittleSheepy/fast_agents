@@ -20,7 +20,9 @@
 - 异常体系：
   - ``DatabaseError``：模块异常基类（**刻意继承 ``ValueError``**，兼容既有 ``except ValueError``）；
   - ``DatabaseConnectionError`` / ``DatabaseOperationalError`` / ``DatabaseValidationError``：
-    分别对应连接层 / 执行层 / 校验层错误，上层可按类型精确分流。
+    分别对应连接层 / 执行层 / 校验层错误，上层可按类型精确分流；
+  - ``DatabaseIdentifierError`` / ``DatabaseIntegrityError`` / ``DatabaseQueryError`` / ``DatabaseDriverMissingError``：
+    分别对应标识符非法、约束冲突、查询失败、可选驱动未安装等具体场景。
 
 允许一个后端**同时实现两套抽象**（如未来 Postgres + pgvector），上层通过 ``isinstance``
 分别判断关系型 / 向量能力即可。
@@ -37,8 +39,12 @@ from .database_client_base import DatabaseClientBase
 from .mysql_client import MySQLClient
 from .errors import (
     DatabaseConnectionError,
+    DatabaseDriverMissingError,
     DatabaseError,
+    DatabaseIdentifierError,
+    DatabaseIntegrityError,
     DatabaseOperationalError,
+    DatabaseQueryError,
     DatabaseValidationError,
 )
 from .query import Filter, FilterOp, Query, SortOrder
@@ -51,7 +57,11 @@ __all__ = [
     # 异常体系
     "DatabaseError",
     "DatabaseConnectionError",
+    "DatabaseDriverMissingError",
+    "DatabaseIdentifierError",
+    "DatabaseIntegrityError",
     "DatabaseOperationalError",
+    "DatabaseQueryError",
     "DatabaseValidationError",
     # 关系型客户端
     "SQLiteClient",

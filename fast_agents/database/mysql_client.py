@@ -63,6 +63,13 @@ from .schema import (
 # 上层从 SQLite 切到 MySQL 时 SqlExpr 无需换类。
 from .sqlite_client import SqlExpr
 
+from .errors import (
+    DatabaseConnectionError,
+    DatabaseDriverMissingError,
+    DatabaseOperationalError,
+    DatabaseValidationError,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -211,7 +218,7 @@ class MySQLClient(DatabaseClientBase):
             import pymysql  # type: ignore
             from pymysql.cursors import DictCursor as _DictCursor  # type: ignore
         except ImportError as _e:  # pragma: no cover
-            raise ImportError(
+            raise DatabaseDriverMissingError(
                 "使用 MySQLClient 需要安装 pymysql 依赖：\n"
                 "  pip install pymysql\n"
                 "或安装 fast-agents 全量依赖：\n"
@@ -254,7 +261,7 @@ class MySQLClient(DatabaseClientBase):
                 init_command="SET SESSION sql_mode = 'STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'",
             )
         except self._pymysql.MySQLError as e:
-            raise ValueError(f"连接 MySQL 失败: {e}") from e
+            raise DatabaseConnectionError(f"连接 MySQL 失败: {e}") from e
 
     @property
     def conn(self) -> Any:
@@ -306,7 +313,7 @@ class MySQLClient(DatabaseClientBase):
             return {"lastrowid": lastrowid, "rowcount": rowcount}
         except self._pymysql.MySQLError as e:
             self._sync_transaction_state_after_error()
-            raise ValueError(f"执行SQL失败: {e}\nSQL: {sql}") from e
+            raise DatabaseOperationalError(f"执行SQL失败: {e}\nSQL: {sql}") from e
 
     def executemany(self, sql: str, params_list: list[tuple | dict]) -> dict[str, Any]:
         """批量执行写 SQL。"""
@@ -320,7 +327,7 @@ class MySQLClient(DatabaseClientBase):
             return {"lastrowid": lastrowid, "rowcount": rowcount}
         except self._pymysql.MySQLError as e:
             self._sync_transaction_state_after_error()
-            raise ValueError(f"批量执行SQL失败: {e}") from e
+            raise DatabaseOperationalError(f"批量执行SQL失败: {e}") from e
 
     def executescript(self, sql: str) -> None:
         """执行一段脚本（多条 SQL 以 ; 分隔），不在事务中时自动提交。
@@ -335,7 +342,7 @@ class MySQLClient(DatabaseClientBase):
                 self.conn.commit()
         except self._pymysql.MySQLError as e:
             self._sync_transaction_state_after_error()
-            raise ValueError(f"执行脚本失败: {e}\nSQL: {sql}") from e
+            raise DatabaseOperationalError(f"执行脚本失败: {e}\nSQL: {sql}") from e
 
     def _sync_transaction_state_after_error(self) -> None:
         """执行 SQL 出错后清理半事务，逻辑与 SQLiteClient 完全一致。"""
@@ -362,7 +369,7 @@ class MySQLClient(DatabaseClientBase):
                 return rows[0] if rows else None
             return list(rows)
         except self._pymysql.MySQLError as e:
-            raise ValueError(f"查询失败: {e}\nSQL: {sql}") from e
+            raise DatabaseOperationalError(f"查询失败: {e}\nSQL: {sql}") from e
 
     # ---------- DDL：建表 / 查表 / 删表 / 索引 ----------
     def table_exists(self, table: str) -> bool:
@@ -399,7 +406,7 @@ class MySQLClient(DatabaseClientBase):
         # 1) Schema 对象
         if isinstance(columns, Schema):
             if table and columns.table_name != table:
-                raise ValueError(f"Schema.table_name={columns.table_name!r} 与传入 table={table!r} 不一致")
+                raise DatabaseValidationError(f"Schema.table_name={columns.table_name!r} 与传入 table={table!r} 不一致")
             self._create_table_from_schema(columns, if_not_exists=if_not_exists)
             return
 
@@ -414,12 +421,12 @@ class MySQLClient(DatabaseClientBase):
         # 3) dict[str, str]
         if isinstance(columns, dict):
             if not columns:
-                raise ValueError("create_table 的 columns 不能为空")
+                raise DatabaseValidationError("create_table 的 columns 不能为空")
             col_defs = []
             for col_name, col_def in columns.items():
                 _check_ident(col_name, "列名")
                 if not isinstance(col_def, str) or not col_def.strip():
-                    raise ValueError(f"列 {col_name!r} 的类型定义必须是非空字符串")
+                    raise DatabaseValidationError(f"列 {col_name!r} 的类型定义必须是非空字符串")
                 col_defs.append(f"{_quote_ident_mysql(col_name)} {col_def.strip()}")
             self._create_table_raw(table, col_defs, if_not_exists=if_not_exists)
             return
@@ -497,7 +504,7 @@ class MySQLClient(DatabaseClientBase):
     def insert(self, table: str, data: dict[str, Any]) -> int:
         """插入一行，返回新行 id。"""
         if not data:
-            raise ValueError("insert 数据不能为空")
+            raise DatabaseValidationError("insert 数据不能为空")
         _check_ident(table, "表名")
         columns = ", ".join(_quote_ident_mysql(k) for k in data.keys())
         placeholders = ", ".join(["%s"] * len(data))
@@ -527,7 +534,7 @@ class MySQLClient(DatabaseClientBase):
             sql += f" WHERE {' AND '.join(conditions)}"
         if order_by:
             if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\s+(ASC|DESC))?$", order_by.strip()):
-                raise ValueError(f"非法 order_by: {order_by!r}")
+                raise DatabaseValidationError(f"非法 order_by: {order_by!r}")
             sql += f" ORDER BY {order_by}"
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
@@ -552,7 +559,7 @@ class MySQLClient(DatabaseClientBase):
         # IN：展开成 (%s, %s, ...)
         if op is FilterOp.IN:
             if not isinstance(f.value, (list, tuple)) or len(f.value) == 0:
-                raise ValueError(
+                raise DatabaseValidationError(
                     f"Filter(field={f.field!r}, op=IN) 的 value 必须是非空 list/tuple，"
                     f"收到 {type(f.value).__name__}"
                 )
@@ -561,7 +568,7 @@ class MySQLClient(DatabaseClientBase):
 
         # 其它二元操作符
         if f.value is None:
-            raise ValueError(
+            raise DatabaseValidationError(
                 f"Filter(field={f.field!r}, op={op.value}) 必须提供 value；"
                 f"判空请用 IS_NULL / NOT_NULL"
             )
@@ -585,7 +592,7 @@ class MySQLClient(DatabaseClientBase):
         if q.sort_by is not None:
             sort_cols = [q.sort_by] if isinstance(q.sort_by, str) else list(q.sort_by)
             if not sort_cols:
-                raise ValueError("sort_by 不能是空列表")
+                raise DatabaseValidationError("sort_by 不能是空列表")
             for col in sort_cols:
                 _check_ident(col, "排序字段名")
             direction = "ASC" if q.sort_order is SortOrder.ASC else "DESC"
@@ -595,13 +602,13 @@ class MySQLClient(DatabaseClientBase):
         if q.limit is not None:
             n = int(q.limit)
             if n < 0:
-                raise ValueError(f"limit 不能为负数: {n}")
+                raise DatabaseValidationError(f"limit 不能为负数: {n}")
             sql_parts.append(f"LIMIT {n}")
 
         if q.offset is not None:
             m = int(q.offset)
             if m < 0:
-                raise ValueError(f"offset 不能为负数: {m}")
+                raise DatabaseValidationError(f"offset 不能为负数: {m}")
             # MySQL 支持 LIMIT m, n 语法，单独 OFFSET 必须配合 LIMIT，没有 LIMIT 时补个大数
             if q.limit is None:
                 sql_parts.append("LIMIT 18446744073709551615")  # MySQL 官方文档推荐的"无上限"值
@@ -637,7 +644,7 @@ class MySQLClient(DatabaseClientBase):
     def update(self, table: str, data: dict[str, Any], where: dict[str, Any]) -> int:
         """更新行，返回影响行数。"""
         if not data or not where:
-            raise ValueError("update 需要 data 和 where")
+            raise DatabaseValidationError("update 需要 data 和 where")
         _check_ident(table, "表名")
         set_clause = ", ".join([f"{_quote_ident_mysql(k)} = %s" for k in data.keys()])
         where_parts: list[str] = []
@@ -655,7 +662,7 @@ class MySQLClient(DatabaseClientBase):
     def delete(self, table: str, where: dict[str, Any]) -> int:
         """删除行，返回影响行数。"""
         if not where:
-            raise ValueError("delete 必须传 where 防止误删全表")
+            raise DatabaseValidationError("delete 必须传 where 防止误删全表")
         _check_ident(table, "表名")
         where_parts: list[str] = []
         params: list[Any] = []
@@ -674,7 +681,10 @@ class MySQLClient(DatabaseClientBase):
         """进入 with 块：最外层显式开启事务，内层重入加入父事务。"""
         if self._tx_depth == 0:
             # 关闭自动提交，显式开启事务
-            self.conn.begin()
+            try:
+                self.conn.begin()
+            except self._pymysql.MySQLError as e:
+                raise DatabaseOperationalError(f"开启事务失败: {e}") from e
             self._tx_must_rollback = False
         self._tx_depth += 1
         return self
@@ -692,12 +702,12 @@ class MySQLClient(DatabaseClientBase):
             if exc_type is None and not self._tx_must_rollback:
                 try:
                     self.conn.commit()
-                except self._pymysql.MySQLError:
+                except self._pymysql.MySQLError as e:
                     try:
                         self.conn.rollback()
                     except self._pymysql.MySQLError:
                         pass
-                    raise
+                    raise DatabaseOperationalError(f"提交事务失败: {e}") from e
             else:
                 try:
                     self.conn.rollback()
@@ -750,7 +760,7 @@ class MySQLClient(DatabaseClientBase):
                     msg += f"，缺少字段: {sorted(missing)}"
                 if extra:
                     msg += f"，多余字段: {sorted(extra)}"
-                raise ValueError(msg)
+                raise DatabaseValidationError(msg)
         col_sql_str = ", ".join(_quote_ident_mysql(c) for c in columns)
         placeholders = ", ".join("%s" for _ in columns)
         sql = f"INSERT INTO {_quote_ident_mysql(table)} ({col_sql_str}) VALUES ({placeholders})"
@@ -786,17 +796,17 @@ class MySQLClient(DatabaseClientBase):
         - update_columns 冲突时更新的列，默认更新除 conflict_keys 外的所有列
         """
         if not data:
-            raise ValueError("upsert 数据不能为空")
+            raise DatabaseValidationError("upsert 数据不能为空")
         _check_ident(table, "表名")
 
         keys = [conflict_keys] if isinstance(conflict_keys, str) else list(conflict_keys)
         if not keys:
-            raise ValueError("upsert 的 conflict_keys 不能为空")
+            raise DatabaseValidationError("upsert 的 conflict_keys 不能为空")
         for k in keys:
             _check_ident(k, "冲突键")
         missing = [k for k in keys if k not in data]
         if missing:
-            raise ValueError(f"upsert 的 conflict_keys 必须都在 data 中，缺少: {missing}")
+            raise DatabaseValidationError(f"upsert 的 conflict_keys 必须都在 data 中，缺少: {missing}")
 
         columns = list(data.keys())
         for c in columns:
@@ -825,11 +835,11 @@ class MySQLClient(DatabaseClientBase):
     def update_where(self, table: str, values: dict[str, Any], query: Query) -> int:
         """按声明式 Query 条件批量更新，返回影响行数，接口与 SQLiteClient 完全一致。"""
         if not values:
-            raise ValueError("update_where 需要 values")
+            raise DatabaseValidationError("update_where 需要 values")
         if not isinstance(query, Query):
             raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
         if not query.filters:
-            raise ValueError("update_where 的 query.filters 不能为空（防止误更新全表）")
+            raise DatabaseValidationError("update_where 的 query.filters 不能为空（防止误更新全表）")
         _check_ident(table, "表名")
 
         set_parts: list[str] = []
@@ -852,7 +862,7 @@ class MySQLClient(DatabaseClientBase):
         if not isinstance(query, Query):
             raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
         if not query.filters:
-            raise ValueError("delete_where 的 query.filters 不能为空（防止误删全表）")
+            raise DatabaseValidationError("delete_where 的 query.filters 不能为空（防止误删全表）")
         _check_ident(table, "表名")
         where_sql, params = self._compile_filters(query.filters)
         sql = f"DELETE FROM {_quote_ident_mysql(table)} WHERE {where_sql}"

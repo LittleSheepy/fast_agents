@@ -24,6 +24,7 @@ from fast_agents.database import (
     Column,
     ColumnType,
     DatabaseClientBase,
+    DatabaseDriverMissingError,
     Filter,
     FilterOp,
     Index,
@@ -86,9 +87,9 @@ def test_module_top_level_import_does_not_require_pymysql():
 
 
 def test_constructor_without_pymysql_raises_install_hint(monkeypatch):
-    """未装 pymysql 时构造 MySQLClient 直接抛 ImportError，且给出安装命令。"""
+    """未装 pymysql 时构造 MySQLClient 直接抛 DatabaseDriverMissingError，且给出安装命令。"""
     ClientCls = _FreshMySQLClient(monkeypatch)
-    with pytest.raises(ImportError, match="pip install pymysql"):
+    with pytest.raises(DatabaseDriverMissingError, match="pip install pymysql"):
         ClientCls(host="127.0.0.1", database="fast_agents")
 
 
@@ -239,6 +240,144 @@ def test_real_mysql_crud_end_to_end():
     )) == 1
 
     db.drop_table(t, if_exists=True)
+    db.close()
+
+
+
+
+# ---------- 异常体系：与 SQLiteClient 完全对齐（离线，不需要真实连接） ----------
+def _install_fake_pymysql(monkeypatch):
+    """注入假的 pymysql 模块，离线验证异常映射（不依赖真实 MySQL）。
+
+    返回 (MySQLError, state)：
+    - state["connect_error"]：设置后 connect() 抛该异常（模拟连接失败）
+    - state["execute_error"]：设置后 cursor.execute() 抛该异常（模拟 SQL 执行失败）
+    """
+    import types
+
+    class MySQLError(Exception):
+        pass
+
+    state = {"connect_error": None, "execute_error": None}
+
+    class _FakeCursor:
+        lastrowid = 1
+        rowcount = 1
+
+        def execute(self, sql, params=None):
+            if state["execute_error"] is not None:
+                raise state["execute_error"]
+
+        def executemany(self, sql, params_list):
+            if state["execute_error"] is not None:
+                raise state["execute_error"]
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+        def ping(self, reconnect=True):
+            return None
+
+    fake = types.ModuleType("pymysql")
+    fake.MySQLError = MySQLError
+    cursors = types.ModuleType("pymysql.cursors")
+    cursors.DictCursor = object
+    fake.cursors = cursors
+
+    def _connect(**kwargs):
+        if state["connect_error"] is not None:
+            raise state["connect_error"]
+        return _FakeConn()
+
+    fake.connect = _connect
+    monkeypatch.setitem(sys.modules, "pymysql", fake)
+    monkeypatch.setitem(sys.modules, "pymysql.cursors", cursors)
+    return MySQLError, state
+
+
+def test_mysql_uses_same_error_classes_as_sqlite():
+    """MySQL 与 SQLite 共用同一组异常类（errors.py），不是各自定义一套。"""
+    from fast_agents.database import errors as _errors
+    assert _mc.DatabaseConnectionError is _errors.DatabaseConnectionError
+    assert _mc.DatabaseOperationalError is _errors.DatabaseOperationalError
+    assert _mc.DatabaseValidationError is _errors.DatabaseValidationError
+    assert _sc.DatabaseValidationError is _errors.DatabaseValidationError
+
+
+def test_mysql_error_classes_stay_in_valueerror_lineage():
+    """三类异常仍在 ValueError 谱系下，保证既有 except ValueError / pytest.raises(ValueError) 零破坏。"""
+    for cls in (_mc.DatabaseConnectionError, _mc.DatabaseOperationalError, _mc.DatabaseValidationError):
+        assert issubclass(cls, ValueError)
+
+
+def test_mysql_compile_validations_raise_validation_error():
+    """编译期入参校验抛 DatabaseValidationError（与 SQLite 行为一致）。"""
+    from fast_agents.database import DatabaseValidationError
+    with pytest.raises(DatabaseValidationError):
+        MySQLClient._compile_query(Query(table_name="t", limit=-1))
+    with pytest.raises(DatabaseValidationError):
+        MySQLClient._compile_query(Query(table_name="t", sort_by=[]))
+    with pytest.raises(DatabaseValidationError):
+        MySQLClient._compile_query(Query(table_name="t", offset=-1))
+    with pytest.raises(DatabaseValidationError):
+        MySQLClient._compile_filter(Filter(field="a", op=FilterOp.IN, value=[]), 0)
+
+
+def test_mysql_type_errors_stay_native_typeerror():
+    """调用方把类型传错仍抛原生 TypeError，不纳入异常体系（与 SQLite 一致）。"""
+    with pytest.raises(TypeError):
+        MySQLClient._compile_filter(object(), 0)
+
+
+def test_mysql_connect_failure_maps_to_connection_error(monkeypatch):
+    """连接失败包成 DatabaseConnectionError，原异常挂在 __cause__ 上。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    state["connect_error"] = MySQLError("connection refused")
+    from fast_agents.database import DatabaseConnectionError, MySQLClient as _MC
+    with pytest.raises(DatabaseConnectionError) as ei:
+        _MC(host="127.0.0.1", database="x")
+    assert isinstance(ei.value.__cause__, MySQLError)
+
+
+def test_mysql_execute_failure_maps_to_operational_error(monkeypatch):
+    """SQL 执行 / 批量 / 查询失败均包成 DatabaseOperationalError（连接成功后触发）。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import DatabaseOperationalError, MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    state["execute_error"] = MySQLError("syntax error")
+    with pytest.raises(DatabaseOperationalError):
+        db.execute("SELECT bad")
+    with pytest.raises(DatabaseOperationalError):
+        db.executemany("INSERT INTO t VALUES (%s)", [(1,)])
+    with pytest.raises(DatabaseOperationalError):
+        db.query("SELECT bad")
+    db.close()
+
+
+def test_mysql_close_is_safe_without_pending_transaction(monkeypatch):
+    """close 在无未提交事务时正常关闭，不抛异常（回归保护）。"""
+    _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
     db.close()
 
 

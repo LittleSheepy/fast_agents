@@ -34,7 +34,7 @@ from .database import (
 )
 from .trace import (
     TraceLogger, SpanKind, SpanStatus, SpanRecord,
-    TraceStoreBase, JsonlStore, MEMORY_PATH,
+    TraceStoreBase, JsonlStore, MEMORY_PATH, SQLiteStore,
 )
 
 __all__ = [
@@ -71,7 +71,7 @@ __all__ = [
     "DatabaseError", "DatabaseConnectionError",
     "DatabaseOperationalError", "DatabaseValidationError",
 
-    # Trace（可观测性，G1 初版）
+    # Trace（可观测性，G1 初版，v1.1.0 新增 SQLiteStore）
     "TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
-    "TraceStoreBase", "JsonlStore", "MEMORY_PATH",
+    "TraceStoreBase", "JsonlStore", "MEMORY_PATH", "SQLiteStore",
 ]
