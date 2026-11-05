@@ -20,12 +20,26 @@ from .schema import Schema
 class DatabaseClientBase(ABC):
     """数据库客户端抽象基类。子类必须实现下面所有方法。"""
 
-    # ---------- 连接 ----------
+    def __init__(self, timeout: float = 5.0):
+        self._conn = None
+        self.timeout = timeout
+
+    # ---------- 连接管理 ----------
     @abstractmethod
-    def connect(self) -> None: ...
+    def _connect(self) -> None: ...
+
+    def connect(self) -> None:
+        if self._conn is None:
+            self._connect()
 
     @abstractmethod
-    def close(self) -> None: ...
+    def _close(self) -> None: ...
+
+    def close(self) -> None:
+        """关闭连接。"""
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
 
     # ---------- DDL：建表 / 删表 / 查表 ----------
     @abstractmethod
