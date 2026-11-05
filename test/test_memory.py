@@ -921,24 +921,57 @@ def test_b10_auto_extract_watermark():
 
 
 def test_b11_manager_revise_forward():
-    """B11：MemoryManager 补 revise() 转发——调用方可直接通过Manager修订记忆，无需绕过门面"""
-    manager = MemoryManager(long_term_store=InMemoryStore())
-    rec = manager.remember("我住在北京", kind="fact", importance=0.7)
-    assert rec.content == "我住在北京"
-    old_id = rec.memory_id
+    """B11：MemoryManager.revise() 转发到底层Store，旧版本留痕、新版本可检索，空内容校验通过"""
+    tmpdir = tempfile.mkdtemp()
+    db_path = os.path.join(tmpdir, "b11_test.db")
+    # 统一作用域：store和manager都用default用户，避免作用域过滤导致查不到
+    store = SQLiteMemoryStore(db_path, user_id="default", session_id="default")
+    manager = MemoryManager(long_term_store=store, user_id="default", session_id="default")
 
-    # 通过Manager的revise方法修订内容（返回新记录，旧记录标记为superseded留审计历史）
-    new_rec = manager.revise(old_id, "我现在搬到上海了")
-    assert new_rec.content == "我现在搬到上海了"
-    assert new_rec.memory_id != old_id
-    assert new_rec.supersedes == old_id
-    # 新记录是active状态，旧记录被标记为superseded
-    new_got = manager.long_term.get(new_rec.memory_id)
-    old_got = manager.long_term.get(old_id)
-    assert new_got.content == "我现在搬到上海了"
-    assert new_got.status == "active"
-    assert old_got.status == "superseded"
-    print("✅ test_b11_manager_revise_forward 通过（B11 Manager 转发 revise 方法，保留审计历史）")
+    # 1. 写入一条初始记忆
+    old_record = manager.remember("用户住在上海", kind="fact", importance=0.8)
+    old_id = old_record.memory_id
+    # 初始检索召回旧内容
+    results = manager.retrieve("用户住在哪", limit=5)
+    assert any(r.content == "用户住在上海" for r in results), "初始写入后应能检索到旧内容"
+    assert len(results) >= 1
+
+    # 2. 修订这条记忆为新内容
+    new_record = manager.revise(old_id, "用户住在北京", source="user_updated")
+    assert new_record.content == "用户住在北京"
+    assert new_record.supersedes == old_id, f"新记忆应指向被替换的旧ID，实际{new_record.supersedes}"
+    assert new_record.memory_id != old_id, "修订后应生成新ID，不应覆盖旧记忆"
+
+    # 3. 检索现在只能召回新内容，旧内容被标记为superseded不参与检索
+    results_after = manager.retrieve("用户住在哪", limit=5)
+    active_contents = [r.content for r in results_after]
+    assert "用户住在北京" in active_contents, "修订后应召回新内容"
+    assert "用户住在上海" not in active_contents, "已被取代的旧内容不应出现在检索结果"
+
+    # 4. 旧记忆仍保留在库中（审计可查），状态为superseded
+    all_records = store.all(include_inactive=True)
+    old_in_db = next((r for r in all_records if r.memory_id == old_id), None)
+    assert old_in_db is not None, "旧记忆不应被删除，应保留供审计"
+    assert old_in_db.status == "superseded", f"旧记忆状态应为superseded，实际{old_in_db.status}"
+
+    # 5. 空内容校验
+    try:
+        manager.revise(old_id, "   ")
+        assert False, "空内容应该抛ValueError"
+    except ValueError:
+        pass
+
+    # 6. 不存在的ID抛KeyError
+    try:
+        manager.revise("non_exist_id", "随便写点什么")
+        assert False, "不存在的ID应该抛KeyError"
+    except KeyError:
+        pass
+
+    manager.close()
+    import shutil
+    shutil.rmtree(tmpdir)
+    print("✅ test_b11_manager_revise_forward 通过（B11 Manager.revise()：转发底层、旧版本留痕、空内容/不存在ID校验正常）")
 
 
 if __name__ == "__main__":
@@ -967,11 +1000,11 @@ if __name__ == "__main__":
     test_manager_compact_and_retrieve_touch()
     test_chroma_store_pure_lexical_degrade()
     test_chroma_store_b5_proxy_methods()
+    test_b10_auto_extract_watermark()
+    test_b11_manager_revise_forward()
     test_chroma_store_with_manager_integration()
     test_sqlite_upsert_full_column_overwrite()
     test_touch_scope_isolation_in()
     test_session_store_persistence()
     test_b8_time_is_cst()
-    test_b10_auto_extract_watermark()
-    test_b11_manager_revise_forward()
     print("\n🎉 全部测试通过")
