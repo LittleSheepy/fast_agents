@@ -174,6 +174,83 @@ def test_transaction_rollback_on_error(db):
     assert len(rows) == 0
 
 
+def test_transaction_flag_reset_after_error_in_with(db):
+    """问题 C：with 块内异常被内层 catch 住后，SQLite 在约束错误下不会自动回滚事务
+    （conn.in_transaction 仍为 True），此时 _in_transaction 标志应保持 True，
+    让 __exit__ 按正常提交/回滚路径走；退出 with 后标志必须复位到 False。"""
+    with db:
+        db.insert("test_users", {"name": "a"})
+        try:
+            db.insert("test_users", {"name": None})  # NOT NULL 失败
+        except ValueError:
+            pass
+        assert db._in_transaction is True  # 约束错误不自动回滚，标志仍为 True
+        db.insert("test_users", {"name": "b"})
+    # 退出 with 后标志必须复位
+    assert db._in_transaction is False
+    # 内层 catch 了异常，__exit__ 正常提交，a 和 b 都应写入
+    assert len(db.select("test_users")) == 2
+
+
+def test_transaction_state_single_source_of_truth(db):
+    """方案1：_in_transaction 是 _tx_depth 的只读派生，二者不可能失同步。
+
+    旧实现用独立布尔 _in_transaction 记录事务状态，存在与 _tx_depth 分叉的风险；
+    改为 property 后事务状态只有 _tx_depth 一个真实来源，无法人为制造失同步。
+    """
+    assert db._in_transaction is False
+    assert db._tx_depth == 0
+    # 只读 property 不允许外部赋值，从根上杜绝"人为置位"式失同步
+    with pytest.raises(AttributeError):
+        db._in_transaction = True  # type: ignore[misc]
+    # 进入事务后两者保持一致
+    db.__enter__()
+    try:
+        assert db._in_transaction is True
+        assert db._tx_depth == 1
+    finally:
+        db.__exit__(None, None, None)
+    assert db._in_transaction is False
+    assert db._tx_depth == 0
+    # 事务外出错不残留状态，后续 autocommit 正常工作
+    with pytest.raises(ValueError):
+        db.execute("THIS IS NOT VALID SQL")
+    assert db._in_transaction is False  # 标志始终派生自 _tx_depth，稳定为 False
+    db.insert("test_users", {"name": "ok"})
+    assert len(db.select("test_users")) == 1
+
+
+def test_transaction_flag_kept_false_after_error_outside_with(db):
+    """问题 C：事务外单条 execute 出错后标志必须保持 False，后续写操作能正常 autocommit。"""
+    assert db._in_transaction is False
+    with pytest.raises(ValueError):
+        db.execute("INSERT INTO test_users (name) VALUES (?)", (None,))
+    assert db._in_transaction is False
+    db.insert("test_users", {"name": "ok"})
+    assert len(db.select("test_users")) == 1
+
+
+def test_close_with_pending_transaction_rolls_back(tmp_path):
+    """问题 C：with 块里没正常退出（例如异常中断未走到 __exit__）时，close 必须
+    主动回滚未结束事务，不能遗留半事务或在 close 时被隐式回滚/提交造成意外。"""
+    import os
+    fp = os.path.join(str(tmp_path), "c.db")
+    db = SQLiteClient(fp)
+    db.ensure_table("t_close", {"id": "INTEGER PRIMARY KEY", "v": "TEXT"})
+    # 手动进入事务、写入但故意不 __exit__
+    db.__enter__()
+    db.execute("INSERT INTO t_close (v) VALUES (?)", ("x",))
+    assert db._in_transaction is True
+    # close 应回滚而非提交
+    db.close()
+    assert db._conn is None
+    assert db._in_transaction is False
+    # 重连验证：未提交的数据不应存在
+    db2 = SQLiteClient(fp)
+    assert db2.count("t_close") == 0
+    db2.close()
+
+
 # ==================== 异常 ====================
 def test_invalid_sql_raises(db):
     with pytest.raises((sqlite3.Error, ValueError)):
@@ -779,6 +856,30 @@ def test_batch_insert_invalid_table():
         assert False, "应该抛错"
     except ValueError:
         pass
+
+
+def test_batch_insert_persists_after_close():
+    """单独调用 batch_insert 后 close，重开连接数据必须存在——修复静默丢失问题。
+
+    根因：Python sqlite3 默认 isolation_level='' 会在 DML 前隐式开事务，
+    旧实现直接 self.conn.executemany 不 commit，close 时事务被回滚导致数据丢失。
+    修复后 batch_insert 走 self.executemany 封装，在事务外自动 commit。
+    """
+    import tempfile, os, shutil
+    tmp = tempfile.mkdtemp(prefix="bi_persist_")
+    path = os.path.join(tmp, "t.db")
+    try:
+        db = SQLiteClient(path)
+        db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT"})
+        n = db.batch_insert("t", [{"name": "a"}, {"name": "b"}, {"name": "c"}])
+        assert n == 3
+        db.close()
+        # 重开连接验证数据真的落盘了
+        db2 = SQLiteClient(path)
+        assert db2.count("t") == 3
+        db2.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ==================== 条件写入：upsert / update_where / delete_where ====================
@@ -1400,3 +1501,64 @@ def test_chroma_get_or_create_tolerates_existing_collection_without_metadata():
         db.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+# ----------------------------------------------------------------------
+# 12. 事务嵌套支持（重入忽略 + 最外层统一提交/回滚，最简方案）
+# ----------------------------------------------------------------------
+
+def test_nested_with_does_not_crash_and_commits_to_file(tmp_path):
+    """嵌套 with db: 不抛 cannot-start-transaction-within-transaction，数据落盘后重开仍能读到。"""
+    import os
+    db_path = os.path.join(str(tmp_path), "nt1.db")
+    db = SQLiteClient(db_path)
+    db.ensure_table("nt1", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
+    with db:
+        db.insert("nt1", {"v": 1})
+        with db:
+            db.insert("nt1", {"v": 2})
+        db.insert("nt1", {"v": 3})
+    db.close()
+    db2 = SQLiteClient(db_path)
+    assert db2.count("nt1") == 3
+    db2.close()
+
+
+def test_nested_with_inner_exception_rolls_back_entire_chain(tmp_path):
+    """内层 with 抛异常时，最外层整体回滚，一条都不写。"""
+    import os
+    db_path = os.path.join(str(tmp_path), "nt2.db")
+    db = SQLiteClient(db_path)
+    db.ensure_table("nt2", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
+    with pytest.raises(ValueError, match="boom"):
+        with db:
+            db.insert("nt2", {"v": 1})
+            with db:
+                db.insert("nt2", {"v": 2})
+                raise ValueError("boom")
+    assert db.count("nt2") == 0
+    db.close()
+
+
+def test_nested_with_outer_exception_rolls_back_all(tmp_path):
+    """外层 with 抛异常，嵌套里的写入也要整体回滚。"""
+    import os
+    db_path = os.path.join(str(tmp_path), "nt3.db")
+    db = SQLiteClient(db_path)
+    db.ensure_table("nt3", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
+    with pytest.raises(RuntimeError, match="outer"):
+        with db:
+            db.insert("nt3", {"v": 1})
+            with db:
+                db.insert("nt3", {"v": 2})
+            raise RuntimeError("outer")
+    assert db.count("nt3") == 0
+    db.close()
+
+
+def test_connection_isolation_level_is_none():
+    """isolation_level=None 关闭 Python 隐式事务，事务边界 100% 由代码控制。"""
+    db = SQLiteClient(":memory:")
+    assert db.conn.isolation_level is None
+    db.close()

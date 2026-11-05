@@ -89,10 +89,16 @@ class SQLiteClient(DatabaseClientBase):
             db_path: 数据库文件路径，默认 ``":memory:"`` 内存数据库。
             timeout: 连接等待超时秒数（SQLite 写锁等待）。
         """
+        super().__init__(timeout)
         self.db_path = db_path
-        self.timeout = timeout
         self._conn: Optional[sqlite3.Connection] = None
-        self._in_transaction = False
+        # 事务状态的唯一真实来源：
+        #   _tx_depth          —— with 事务嵌套深度（0 表示不在事务中）
+        #   _tx_must_rollback  —— 内层出错标记，最外层据此决定回滚
+        # 是否在事务中由只读属性 _in_transaction 派生（_tx_depth > 0），
+        # 不再单独保存布尔标志，从根本上消除"标志与真实状态失同步"的可能。
+        self._tx_depth = 0
+        self._tx_must_rollback = False
         self._connect()
 
     # ---------- 连接管理 ----------
@@ -103,6 +109,7 @@ class SQLiteClient(DatabaseClientBase):
                 self.db_path,
                 timeout=self.timeout,
                 detect_types=sqlite3.PARSE_DECLTYPES,
+                isolation_level=None,  # 关闭 Python 隐式事务，事务完全由代码控制
             )
             # 行返回字典格式
             self._conn.row_factory = sqlite3.Row
@@ -117,11 +124,6 @@ class SQLiteClient(DatabaseClientBase):
         except sqlite3.Error as e:
             raise ValueError(f"连接 SQLite 失败: {e}") from e
 
-    def connect(self) -> None:
-        """显式 connect（基类接口）；若已关闭则重连。"""
-        if self._conn is None:
-            self._connect()
-
     @property
     def conn(self) -> sqlite3.Connection:
         """获取底层连接（如果关闭则自动重连）。"""
@@ -130,9 +132,27 @@ class SQLiteClient(DatabaseClientBase):
         assert self._conn is not None
         return self._conn
 
-    def close(self) -> None:
-        """关闭连接。"""
+    @property
+    def _in_transaction(self) -> bool:
+        """当前是否处于显式事务中（``_tx_depth`` 的只读派生）。
+
+        唯一真实来源是 ``_tx_depth`` —— ``with db:`` 的事务嵌套深度计数器。
+        本属性不保存任何独立状态，因此不可能出现"标志与底层真实状态失同步"。
+        """
+        return self._tx_depth > 0
+
+    def _close(self) -> None:
+        """关闭连接。若仍残留未结束事务，先尝试回滚避免悬空事务。"""
         if self._conn is not None:
+            # 标志与真实状态同步：关闭前若还在事务中（无论怎么进来的），先尝试回滚，
+            # 避免因意外路径留下未提交事务导致 close() 时被隐式回滚或抛异常。
+            if self._tx_depth > 0:
+                try:
+                    self._conn.rollback()
+                except sqlite3.Error:
+                    pass
+                self._tx_depth = 0
+                self._tx_must_rollback = False
             self._conn.close()
             self._conn = None
 
@@ -141,7 +161,10 @@ class SQLiteClient(DatabaseClientBase):
         """执行写 SQL（INSERT/UPDATE/DELETE/CREATE/DROP）。
 
         - 不在事务中时自动提交（单次语句一个隐式事务）；
-        - 在显式事务中（`with db:`）时只执行不 commit，由 __exit__ 统一提交/回滚。
+        - 在显式事务中（`with db:`）时只执行不 commit，由 __exit__ 统一提交/回滚；
+        - 无论是否在事务中，只要执行失败都保证：
+            1) 连接状态可用（不残留半事务）；
+            2) 事务状态（``_tx_depth``）不被破坏——失败不改变嵌套深度。
         """
         try:
             cur = self.conn.execute(sql, params)
@@ -149,8 +172,11 @@ class SQLiteClient(DatabaseClientBase):
                 self.conn.commit()
             return {"lastrowid": cur.lastrowid, "rowcount": cur.rowcount}
         except sqlite3.Error as e:
-            if not self._in_transaction:
-                self.conn.rollback()
+            # 异常路径统一清理：
+            # - 事务外（_tx_depth == 0）：单语句自成事务，失败直接 rollback 清理半事务；
+            # - 事务内（_tx_depth > 0）：不打断事务边界，交由外层 __exit__ 统一 commit/rollback。
+            # 事务状态以 _tx_depth 为唯一来源，此处不再维护任何独立标志。
+            self._sync_transaction_state_after_error()
             raise ValueError(f"执行SQL失败: {e}\nSQL: {sql}") from e
 
     def executemany(self, sql: str, params_list: list[tuple | dict]) -> dict[str, Any]:
@@ -161,8 +187,7 @@ class SQLiteClient(DatabaseClientBase):
                 self.conn.commit()
             return {"lastrowid": cur.lastrowid, "rowcount": cur.rowcount}
         except sqlite3.Error as e:
-            if not self._in_transaction:
-                self.conn.rollback()
+            self._sync_transaction_state_after_error()
             raise ValueError(f"批量执行SQL失败: {e}") from e
 
     def executescript(self, sql: str) -> None:
@@ -172,9 +197,30 @@ class SQLiteClient(DatabaseClientBase):
             if not self._in_transaction:
                 self.conn.commit()
         except sqlite3.Error as e:
-            if not self._in_transaction:
-                self.conn.rollback()
+            self._sync_transaction_state_after_error()
             raise ValueError(f"执行脚本失败: {e}\nSQL: {sql}") from e
+
+    def _sync_transaction_state_after_error(self) -> None:
+        """执行 SQL 出错后清理可能残留的半事务。
+
+        仅在 execute/executemany/executescript 的异常分支调用。
+
+        事务状态以 ``_tx_depth`` 为唯一真实来源（``_in_transaction`` 是其只读派生），
+        因此本方法**不再维护任何标志**，只保留必要的连接级清理：
+
+        - 事务外（``_tx_depth == 0``）：单语句自成事务，失败时 rollback 清理半事务
+          （底层无活动事务时 rollback 为 no-op，安全，保持原行为）；
+        - 事务内（``_tx_depth > 0``）：**不处理**——事务边界完全由 ``__enter__`` / ``__exit__``
+          成对维护；commit / rollback 在无活动事务时均为 no-op，故即使底层因严重错误
+          自行 abort 了事务，``__exit__`` 也不会出错，无需在此同步标志。
+        """
+        if self._conn is None:
+            return
+        if self._tx_depth == 0:
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
 
     def query(
         self,
@@ -494,20 +540,55 @@ class SQLiteClient(DatabaseClientBase):
 
     # ---------- 事务上下文管理 ----------
     def __enter__(self) -> "SQLiteClient":
-        """进入 with 块，显式开启事务。"""
-        self.conn.execute("BEGIN")
-        self._in_transaction = True
+        """进入 with 块：最外层显式开启事务（BEGIN IMMEDIATE），内层重入直接加入父事务。
+
+        嵌套 with db:（例如 memory 层 _connect() 内再 with db:）不会重复发 BEGIN，
+        而是把事务深度计数器加一，等最外层 __exit__ 统一 commit/rollback——
+        内层异常会标记 _tx_must_rollback，保证整体原子性。
+        """
+        if self._tx_depth == 0:
+            self.conn.execute("BEGIN IMMEDIATE")
+            self._tx_must_rollback = False
+        self._tx_depth += 1
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        """退出 with 块：正常提交，异常回滚。"""
+        """退出 with 块：内层直接 depth--（异常时打回滚标记）；最外层统一提交/回滚。
+
+        保证无论 commit / rollback 自身是否抛错，``_tx_depth`` / ``_tx_must_rollback``
+        都会被复位（``_in_transaction`` 随之自动派生为 False）。
+        """
+        self._tx_depth -= 1
+        if self._tx_depth > 0:
+            # 内层退出：不 commit/rollback，由最外层兜底；有异常时标记必须回滚
+            if exc_type is not None:
+                self._tx_must_rollback = True
+            return False
+        # 最外层退出：统一处理 commit/rollback，无论是否抛错都复位 depth
+        # 无论 SQLite 是否因严重错误自行 abort 了事务，这里都要兜住：
+        #   - commit 失败（例如约束冲突、磁盘错误、schema 变更导致事务被 abort）→
+        #     尝试 rollback，把异常继续往外抛，保持原子性契约
+        #   - rollback 失败（例如"no transaction is active"——底层已自行回滚）→
+        #     吞掉，状态正常复位
         try:
-            if exc_type is None:
-                self.conn.commit()
+            if exc_type is None and not self._tx_must_rollback:
+                try:
+                    self.conn.commit()
+                except sqlite3.Error:
+                    # commit 失败：尽力回滚后把原异常抛出去，让调用方知道
+                    try:
+                        self.conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    raise
             else:
-                self.conn.rollback()
+                try:
+                    self.conn.rollback()
+                except sqlite3.Error:
+                    pass
         finally:
-            self._in_transaction = False
+            self._tx_depth = 0
+            self._tx_must_rollback = False
         return False
 
 
@@ -532,7 +613,11 @@ class SQLiteClient(DatabaseClientBase):
         return int(row["cnt"]) if row else 0
 
     def batch_insert(self, table: str, rows: list[dict[str, Any]]) -> int:
-        """批量插入多行，返回插入行数；空列表直接返回0。"""
+        """批量插入多行，返回插入行数；空列表直接返回0。
+
+        事务语义同 ``execute``/``executemany``：单独调用时自动提交，
+        在 ``with db:`` 内由外层事务统一提交/回滚。
+        """
         if not rows:
             return 0
         _check_ident(table, "表名")
@@ -555,10 +640,10 @@ class SQLiteClient(DatabaseClientBase):
         placeholders = ", ".join("?" for _ in columns)
         sql = f"INSERT INTO {_quote_ident(table)} ({col_sql_str}) VALUES ({placeholders})"
         params_list = [tuple(row[c] for c in columns) for row in rows]
-        try:
-            self.executemany(sql, params_list)
-        except sqlite3.Error as e:
-            raise ValueError(f"批量插入失败: {e}") from e
+        # 走 self.executemany 封装（而非 self.conn.executemany），
+        # 复用其「不在事务中时自动 commit、异常自动 rollback」的逻辑——
+        # 修复：单独调用 batch_insert 后 close，Python sqlite3 隐式事务被回滚导致数据静默丢失。
+        self.executemany(sql, params_list)
         return len(rows)
 
     # ---------- 条件写入：upsert / update_where / delete_where ----------
