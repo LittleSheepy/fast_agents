@@ -1,5 +1,12 @@
 """SQLite client —— fast_agents 最基础的数据库客户端。
 
+参考主流框架：
+- PEP 249（Python DB-API 2.0）的 Connection / Cursor 执行模型（底层由标准库 ``sqlite3`` 实现）；
+- SQLAlchemy Core 的 ``Connection.execute`` / ``ExecResult``——参数化执行 + 类字典结果集，
+  本模块 ``execute`` 返回 ``{"lastrowid", "rowcount"}``、``query`` 返回 ``list[dict]`` 即对齐其思路；
+- 标准库 ``sqlite3`` 的 ``row_factory = sqlite3.Row``（按键取值），本模块统一把查询结果转成
+  ``dict``，上层不必感知 ``sqlite3.Row``。
+
 零抽象、零新依赖，封装标准库 sqlite3 的连接管理与增删改查，
 返回字典格式结果，支持事务上下文管理；并提供基于 ``schema.py``
 的**声明式、幂等建表**能力，上层业务模块不需要自己拼 ``CREATE TABLE``。
