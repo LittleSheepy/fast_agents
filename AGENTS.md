@@ -160,7 +160,7 @@ python examples\trace\basic_usage.py
 4. **文档**：`docs/<模块>模块编写说明.md`，**严格按 `docs/xx模块编写说明模版.md` v2.0 骨架**（开篇 + 一～十三 + 附录），起版本 v1.0.0；
 5. **导出同步**：如需对外暴露，更新 `fast_agents/__init__.py`；同步 README.md「特性」「项目结构」「文档导航」三栏；同步 `docs/演进路线图.md` 对应条目状态。
 6. **依赖同步**：如有新增依赖，同步 `pyproject.toml` / `requirements.txt` / `uv.lock`（本任务预期绝大多数情况下为零新增依赖）。
-
+7. **交付包**：按照仓库目录存放交付文件并打包,未修改的不用打包。打包名字可以参考fast_agents_模块名_xxxx.zip 或者 fast_agents_模块名_xxxx.zip格式
 ---
 
 ## 7. 交付顺序
