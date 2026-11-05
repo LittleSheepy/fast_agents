@@ -881,6 +881,52 @@ def test_trace_logger_context_manager_closes():
     assert t._store._closed is True
 
 
+# ==================== 实例级 ContextVar：跨实例不串扰（v1.0.2 核心修复）====================
+def test_state_is_per_instance_no_cross_pollution():
+    """两个 TraceLogger 实例交错打点时，根 Span 的 parent_id 必须为 None，
+    不被另一个实例活跃的 Span 串扰（之前因模块级 ContextVar 会串）。"""
+    t1 = TraceLogger()
+    t2 = TraceLogger()
+    with t1.trace("A"):
+        with t1.span("A1", SpanKind.AGENT):
+            # 此时 t1 的 span_stack 栈顶是 A1，但 t2 此时还没开始任何 trace
+            with t2.trace("B"):
+                # t2 的根 Span 必须是根（parent_id=None），不能挂到 t1.A1 下面
+                root = t2.start_span("B1", SpanKind.LLM, input="q")
+                t2.end_span(root, output="a")
+                assert root.parent_id is None, (
+                    f"t2 的根 Span 错误地把 t1 的活跃 span 当成了 parent: {root.parent_id}"
+                )
+    # 两个 tracer 各收到自己的 span
+    assert len(t1.read_spans()) == 1
+    assert len(t2.read_spans()) == 1
+    t1.close()
+    t2.close()
+
+
+def test_contextvar_is_instance_level_not_module_level():
+    """模块级 _active_span_id/_active_trace_id 已被移除；栈状态挂在实例属性上，
+    保证 G2 做 async 并发时多 tracer 不互相污染。"""
+    import fast_agents.trace.trace_logger as mod
+    assert not hasattr(mod, "_active_span_id"), (
+        "模块级 _active_span_id 已被移除，改为实例级 ContextVar"
+    )
+    assert not hasattr(mod, "_active_trace_id"), (
+        "模块级 _active_trace_id 已被移除，改为实例级 ContextVar"
+    )
+    t = TraceLogger()
+    # 实例级 ContextVar 在 __init__ 中创建
+    assert hasattr(t, "_trace_stack_var")
+    assert hasattr(t, "_span_stack_var")
+    # 初始为空栈
+    assert t._trace_stack_var.get() == ()
+    assert t._span_stack_var.get() == ()
+    with t.trace("x"):
+        assert t._trace_stack_var.get()  # 压入一条
+    assert t._trace_stack_var.get() == ()  # 弹回空栈
+    t.close()
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
