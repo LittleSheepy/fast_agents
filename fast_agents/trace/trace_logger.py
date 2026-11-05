@@ -17,22 +17,12 @@ from __future__ import annotations
 
 import contextvars
 import threading
-import time
 from contextlib import contextmanager
-from typing import Any, Callable, Iterator, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from .jsonl_store import MEMORY_PATH, JsonlStore
 from .models import SpanKind, SpanRecord, SpanStatus, _new_id, _now_ts
 from .store_base import TraceStoreBase
-
-
-# ContextVar：当前激活的 Span id（支持线程/上下文传递，初版不做 async，线程内够用）
-_active_span_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "trace_active_span_id", default=None
-)
-_active_trace_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
-    "trace_active_trace_id", default=None
-)
 
 
 class TraceLogger:
@@ -44,6 +34,11 @@ class TraceLogger:
               传文件路径（如 ``"traces/runs.jsonl"``）时按行追加。
         session_id: 会话 id；不传则自动生成；可通过 ``set_session_id`` 随时切换。
         enabled: 是否实际打点；False 时所有方法都是空操作（与不传 tracer 等价）。
+
+    状态隔离说明（v1.0.2 修正）：早期版本使用模块级 ``contextvars.ContextVar``，
+    会导致多个 TraceLogger 实例互相污染父链；现改为每个实例自持一对 ContextVar，
+    同时兼顾：(1) 实例级隔离（主/子 Agent 各自 tracer 互不串扰）；(2) 跨协程
+    传播（asyncio.Task 自动拷贝上下文，为 G2 异步并发预留扩展）。
     """
 
     def __init__(
@@ -63,8 +58,15 @@ class TraceLogger:
             self._store = JsonlStore(path if path is not None else MEMORY_PATH, append=True)
         # 会话 id
         self._session_id = session_id or f"sess_{_new_id()[:12]}"
-        # 线程本地：每个线程自己维护当前 trace / span 栈（ContextVar 初版用 threading.local 做兜底更稳）
-        self._local = threading.local()
+        # 实例级 ContextVar：每个 tracer 自持一份栈，(1) 不与其它实例串；
+        # (2) 天然随 asyncio.Task 传播（G2 异步直接可用，无需返工）。
+        # 栈用 tuple 表示（ContextVar 推荐不可变类型），空栈为 ()。
+        self._trace_stack_var: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+            f"trace_stack_{id(self)}", default=()
+        )
+        self._span_stack_var: contextvars.ContextVar[tuple] = contextvars.ContextVar(
+            f"span_stack_{id(self)}", default=()
+        )
 
     # ---------- 配置 ----------
     @property
@@ -84,21 +86,16 @@ class TraceLogger:
     def start_trace(self, name: str = "root", session_id: Optional[str] = None) -> str:
         """开启一条新 Trace，返回 trace_id；新 Trace 开始后调用 start_span 会作为根 Span。"""
         trace_id = f"trace_{_new_id()}"
-        if not hasattr(self._local, "trace_stack"):
-            self._local.trace_stack = []
-            self._local.span_stack = []
-        self._local.trace_stack.append(trace_id)
-        _active_trace_id.set(trace_id)
+        self._trace_stack_var.set(self._trace_stack_var.get() + (trace_id,))
         if session_id is not None:
             self._session_id = session_id
         return trace_id
 
     def end_trace(self) -> None:
         """结束当前 Trace（仅弹栈；实际写入由每个 Span.finish 完成）。"""
-        if hasattr(self._local, "trace_stack") and self._local.trace_stack:
-            self._local.trace_stack.pop()
-            new_trace = self._local.trace_stack[-1] if self._local.trace_stack else None
-            _active_trace_id.set(new_trace)
+        stack = self._trace_stack_var.get()
+        if stack:
+            self._trace_stack_var.set(stack[:-1])
 
     @contextmanager
     def trace(self, name: str = "root", session_id: Optional[str] = None) -> Iterator[str]:
@@ -109,20 +106,31 @@ class TraceLogger:
         finally:
             self.end_trace()
 
-    # ---------- Span 生命周期 ----------
+    # ---------- 内部栈访问辅助 ----------
+    def _stacks(self) -> tuple[tuple, tuple]:
+        """返回当前协程上下文里的 (trace_stack, span_stack)，均为 tuple（不可变）。
+        每个 TraceLogger 实例 + 每个 asyncio.Task / 线程各持一份，天然隔离。"""
+        return self._trace_stack_var.get(), self._span_stack_var.get()
+
     def _current_trace_id(self) -> str:
-        if hasattr(self._local, "trace_stack") and self._local.trace_stack:
-            return self._local.trace_stack[-1]
-        t = _active_trace_id.get()
-        if t:
-            return t
+        t_stack, _ = self._stacks()
+        if t_stack:
+            return t_stack[-1]
         # 懒启动一条默认 trace
         return self.start_trace(name="default")
 
     def _current_parent_id(self) -> Optional[str]:
-        if hasattr(self._local, "span_stack") and self._local.span_stack:
-            return self._local.span_stack[-1]
-        return _active_span_id.get()
+        _, s_stack = self._stacks()
+        return s_stack[-1] if s_stack else None
+
+    def _push_span(self, span_id: str) -> None:
+        self._span_stack_var.set(self._span_stack_var.get() + (span_id,))
+
+    def _pop_span_if_top(self, span_id: str) -> None:
+        """若当前栈顶 span 与传入一致，则弹栈；否则说明用户手动操作了栈，不做调整。"""
+        stack = self._span_stack_var.get()
+        if stack and stack[-1] == span_id:
+            self._span_stack_var.set(stack[:-1])
 
     def start_span(
         self,
@@ -152,13 +160,11 @@ class TraceLogger:
             except ValueError:
                 kind = SpanKind.CUSTOM
 
-        if not hasattr(self._local, "span_stack"):
-            self._local.span_stack = []
-        if not hasattr(self._local, "trace_stack") or not self._local.trace_stack:
-            self.start_trace(name="default")
+        # 懒启动默认 trace
+        trace_id = self._current_trace_id()
 
         span = SpanRecord(
-            trace_id=self._current_trace_id(),
+            trace_id=trace_id,
             parent_id=self._current_parent_id(),
             session_id=session_id or self._session_id,
             name=name,
@@ -166,8 +172,7 @@ class TraceLogger:
             input=input,
             metadata=dict(metadata or {}),
         )
-        self._local.span_stack.append(span.span_id)
-        _active_span_id.set(span.span_id)
+        self._push_span(span.span_id)
         return span
 
     def end_span(
@@ -188,11 +193,7 @@ class TraceLogger:
             status = SpanStatus.ERROR
         span.finish(output=output, status=status, error=error, metadata=metadata)
         # 弹栈
-        if hasattr(self._local, "span_stack") and self._local.span_stack:
-            if self._local.span_stack[-1] == span.span_id:
-                self._local.span_stack.pop()
-                new_parent = self._local.span_stack[-1] if self._local.span_stack else None
-                _active_span_id.set(new_parent)
+        self._pop_span_if_top(span.span_id)
         # 写入 store（底层已保证异常不抛）
         try:
             self._store.write(span)
@@ -226,11 +227,7 @@ class TraceLogger:
                         self._store.write(s)
                     except Exception:
                         pass
-                if hasattr(self._local, "span_stack") and self._local.span_stack:
-                    if self._local.span_stack[-1] == s.span_id:
-                        self._local.span_stack.pop()
-                        new_parent = self._local.span_stack[-1] if self._local.span_stack else None
-                        _active_span_id.set(new_parent)
+                self._pop_span_if_top(s.span_id)
 
     # ---------- 工具钩子（对齐 ToolRegistry.add_hook 签名） ----------
     def tool_hook(self, name: str, tool_args: dict, result: Any) -> None:
@@ -336,10 +333,8 @@ class TraceLogger:
         """
         tid = trace_id
         if tid is None:
-            if hasattr(self._local, "trace_stack") and self._local.trace_stack:
-                tid = self._local.trace_stack[0]
-            else:
-                tid = _active_trace_id.get()
+            t_stack, _ = self._stacks()
+            tid = t_stack[0] if t_stack else None
         spans = self._store.read(session_id=session_id, trace_id=tid)
         spans.sort(key=lambda s: (s.start_time, s.span_id))
         return [
