@@ -125,3 +125,20 @@ class DatabaseClientBase(ABC):
 
     @abstractmethod
     def delete(self, table: str, where: dict) -> int: ...
+
+    # ---------- 事务：with 语句 ----------
+    @abstractmethod
+    def __enter__(self) -> "DatabaseClientBase":
+        """进入事务上下文（``with db:`` 时自动调用）。
+
+        约定：最外层调用开启事务，嵌套重入应「加入父事务」（由实现决定是空操作、
+        savepoint 还是深度计数），保证多段写入要么全成功、要么全回滚。
+        """
+
+    @abstractmethod
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        """退出事务上下文：正常提交、异常回滚。
+
+        返回值 False 表示异常继续向外抛出（不吞异常）；实现必须保证无论 commit /
+        rollback 自身是否抛错，都复位内部事务状态，避免留下悬挂事务。
+        """
