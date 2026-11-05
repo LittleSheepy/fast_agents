@@ -153,4 +153,4 @@ if __name__ == "__main__":
     demo_sqlite()
 
     # 有 MySQL 环境时取消注释跑 MySQL demo
-    # demo_mysql()
+    demo_mysql()
