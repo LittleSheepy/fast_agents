@@ -1265,6 +1265,84 @@ def test_timeout_abandoned_metadata_marker():
     print("✅ A16④ 单次超时结果带 timeout_abandoned=True 通过")
 
 
+# ── A22 ToolRegistry 清理与隔离 ──────────────────────────
+
+def test_register_strict_mode_raises_on_duplicate():
+    """strict=True 时同名工具重复注册应抛出 ValueError。"""
+    reg = ToolRegistry()
+
+    @tool
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    reg.register_tool(add)
+    try:
+        reg.register_tool(add, strict=True)
+        assert False, "strict 模式下重复注册应抛出异常"
+    except ValueError as e:
+        assert "已存在" in str(e)
+    print("✅ strict 模式重复注册抛出 ValueError 通过")
+
+
+def test_register_non_strict_mode_warns_and_overwrites():
+    """默认非严格模式保持原有行为：打印 warning 后静默覆盖。"""
+    reg = ToolRegistry()
+
+    @tool
+    def greet() -> str:
+        return "v1"
+
+    @tool
+    def greet_v2() -> str:
+        return "v2"
+    greet_v2.name = "greet"  # 同名不同实现
+
+    reg.register_tool(greet)
+    reg.register_tool(greet_v2)  # 默认 strict=False
+    r = reg.invoke_tool("greet")
+    assert r.succeeded
+    assert r.output == "v2"
+    print("✅ 非严格模式覆盖行为保持向后兼容通过")
+
+
+def test_clear_resets_approval_callback():
+    """clear() 必须同时重置 _tools、_hooks 和 _approval_callback。"""
+    reg = ToolRegistry()
+
+    @tool(metadata={"requires_approval": True})
+    def dangerous_op() -> str:
+        return "executed"
+
+    reg.register_tool(dangerous_op)
+    called = {"count": 0}
+
+    def always_reject(name, args):
+        called["count"] += 1
+        return False, None, "拒绝"
+
+    reg.set_approval_callback(always_reject)
+
+    # 注册回调后执行应该被拦截
+    r1 = reg.invoke_tool("dangerous_op")
+    assert not r1.succeeded
+    assert called["count"] == 1
+
+    # 清空后重新注册同名工具，不应该再触发旧的审批回调
+    reg.clear()
+    reg.register_tool(dangerous_op)
+    r2 = reg.invoke_tool("dangerous_op")
+    assert r2.succeeded, f"clear 后审批回调未重置，仍被拦截：{r2.error}"
+    assert called["count"] == 1, "clear 后旧审批回调不应再被调用"
+    print("✅ clear() 重置审批回调修复通过")
+
+
+def test_no_thread_local_dead_code():
+    """确认 ToolRegistry 实例不再持有 _thread_local 死代码属性。"""
+    reg = ToolRegistry()
+    assert not hasattr(reg, "_thread_local"), "_thread_local 死代码应已删除"
+    print("✅ 移除 _thread_local 死代码通过")
+
+
 if __name__ == "__main__":
     from pathlib import Path  # for test_terminal
     tests = [
@@ -1324,6 +1402,11 @@ if __name__ == "__main__":
         test_concurrent_timeout_returns_promptly,
         test_concurrent_no_nested_executor,
         test_timeout_abandoned_metadata_marker,
+        # ── A22 ToolRegistry 清理与隔离 ──
+        test_register_strict_mode_raises_on_duplicate,
+        test_register_non_strict_mode_warns_and_overwrites,
+        test_clear_resets_approval_callback,
+        test_no_thread_local_dead_code,
     ]
     failed = 0
     for t in tests:

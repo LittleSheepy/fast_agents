@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .structured_tool import StructuredTool
@@ -28,7 +27,6 @@ class ToolRegistry:
         self._approval_callback: Optional[ApprovalCallback] = None
         self.max_workers = max_workers
         self.default_timeout = default_timeout
-        self._thread_local = threading.local()
 
     def set_approval_callback(self, callback: Optional[ApprovalCallback]) -> None:
         """设置人工审批回调。设置后，所有标记为 requires_approval=True 的工具执行前会触发回调。
@@ -37,13 +35,21 @@ class ToolRegistry:
 
     # ── 注册 / 反注册 ────────────────────────────────────────
 
-    def register_tool(self, tool: Union[ToolBase, Callable]) -> ToolBase:
-        """注册一个工具；裸函数会被自动包装成 StructuredTool。"""
+    def register_tool(self, tool: Union[ToolBase, Callable], *, strict: bool = False) -> ToolBase:
+        """注册一个工具；裸函数会被自动包装成 StructuredTool。
+
+        Args:
+            tool: ToolBase 实例或可调用函数。
+            strict: 严格模式，为 True 时若同名工具已存在则抛出 ValueError，
+                为 False（默认）时保持原有行为——打印 warning 后静默覆盖。
+        """
         if callable(tool) and not isinstance(tool, ToolBase):
             tool = StructuredTool.from_function(tool)
         if not isinstance(tool, ToolBase):
             raise TypeError(f"无法注册 {type(tool)}：必须是 ToolBase 实例或可调用函数")
         if tool.name in self._tools:
+            if strict:
+                raise ValueError(f"工具 '{tool.name}' 已存在于注册表中，strict 模式下禁止重复注册")
             logger.warning("工具 '%s' 已存在，将被覆盖", tool.name)
         self._tools[tool.name] = tool
         return tool
@@ -284,8 +290,10 @@ class ToolRegistry:
     # ── 杂项 ─────────────────────────────────────────────────
 
     def clear(self) -> None:
+        """清空注册表：移除所有工具、hooks，并重置审批回调。"""
         self._tools.clear()
         self._hooks.clear()
+        self._approval_callback = None
 
     def __len__(self) -> int:
         return len(self._tools)
