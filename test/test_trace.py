@@ -3,13 +3,15 @@
 全部用内存 JsonlStore 或 pytest tmp_path 临时目录，不依赖外部服务、不产生真实 API 请求。
 覆盖点：
     - 默认关闭（tracer=None 零开销，不传时 LLM/Agent 行为不变）
-    - SpanKind / SpanStatus / SpanRecord 字段/finish
+    - SpanKind / SpanStatus / SpanRecord 字段/finish（含可选 end_time 精确对齐）
     - JsonlStore 内存模式 / 文件模式 / append / 过滤查询
+    - JsonlStore 文件模式不做内存镜像（大文件不涨内存）
     - TraceLogger start_trace/end_trace/with trace
     - start_span/end_span/with span（正常路径 + 异常路径）
     - 父子关系（parent_id 正确串联）
     - tool_hook 签名对齐 ToolRegistry.add_hook（ToolResult 成功/失败/截断）
-    - tool_hook 耗时取自 ToolResult.metadata['duration_ms'] 并回推 start_time（v1.0.1 修正）
+    - tool_hook 耗时取自 ToolResult.metadata['duration_ms'] 并单次取时刻回推
+      start_time，最终 duration_ms 严格等于工具自报值（零漂移）
     - attach_to_tool_registry 一行接入
     - LLM.invoke/stream_invoke/embed_query/embed_documents 在 tracer=None 时不打点、
       传 tracer 时正确记录 llm Span（mock 底层 _client，无需真 API Key）
@@ -19,6 +21,7 @@
     - 存储层预留位：用户可自定义 TraceStoreBase 子类
     - 文件路径下 jsonl 落盘可被新 JsonlStore 重新读取（跨进程回放）
     - 禁用 enabled=False 时不写入任何记录
+    - 实例级 ContextVar：跨 TraceLogger 实例不串扰、为 asyncio 并发做好准备
 
 运行方式（Windows PowerShell，在项目根目录）:
     python test\\test_trace.py
@@ -27,7 +30,11 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from typing import Any, List, Optional
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
@@ -213,6 +220,28 @@ def test_jsonl_store_file_is_valid_jsonl(tmp_path):
         assert obj["kind"] in ("llm", "tool", "decision", "agent", "custom")
 
 
+def test_file_store_does_not_accumulate_in_memory(tmp_path):
+    """文件模式下 _mem 必须始终为空——写入/读取都不往内存镜像累积数据，
+    防止长时间运行随 jsonl 文件线性涨内存。"""
+    p = str(tmp_path / "traces.jsonl")
+    store = JsonlStore(p, append=True)
+    assert store._is_memory is False
+    for i in range(50):
+        s = SpanRecord(trace_id="t", name=f"n{i}", kind=SpanKind.CUSTOM)
+        s.finish(output={"idx": i})
+        store.write(s)
+    # 关键断言：文件模式下 _mem 保持空
+    assert len(store._mem) == 0, f"文件模式下 _mem 不应累积数据，实际 len={len(store._mem)}"
+    # 但 read() 仍能正确返回全部记录（流式扫描文件）
+    rows = store.read()
+    assert len(rows) == 50
+    assert rows[0].name == "n0"
+    assert rows[-1].name == "n49"
+    store.close()
+    # close 后文件模式下 _mem 也保持空（兜底 clear）
+    assert len(store._mem) == 0
+
+
 # ==================== TraceLogger 默认关闭 ====================
 def test_tracer_disabled_writes_nothing():
     """enabled=False 时任何 span 操作都不写入。"""
@@ -391,11 +420,7 @@ def test_tool_hook_records_error():
 
 
 def test_tool_hook_uses_real_duration_from_metadata():
-    """tool_hook 从 ``ToolResult.metadata['duration_ms']`` 取真实耗时，并回推 start_time。
-
-    这是 v1.0.1 修复点：修复前误读 ToolResult 的顶层 duration_ms 属性（不存在），
-    导致 tool span 耗时恒为 ~0。
-    """
+    """tool_hook 从 ``ToolResult.metadata['duration_ms']`` 取真实耗时，并回推 start_time。"""
     t = TraceLogger()
     r = ToolResult.ok("5")
     r.metadata["duration_ms"] = 120  # 模拟 tool_base 写入的实测耗时（int 毫秒）
@@ -404,11 +429,11 @@ def test_tool_hook_uses_real_duration_from_metadata():
     spans = t.read_spans(kind="tool")
     assert len(spans) == 1
     s = spans[0]
-    # 耗时直接取工具自报值（修复前恒为 ~0）
-    assert abs(s.duration_ms - 120.0) < 5.0, f"duration_ms={s.duration_ms}"
-    # start_time 被回推，时间区间长度 ≈ 120ms（修复前区间塌缩在结束时刻附近）
+    # 耗时直接取工具自报值
+    assert abs(s.duration_ms - 120.0) < 1.0, f"duration_ms={s.duration_ms}"
+    # start_time 被回推，时间区间长度 ≈ 120ms
     assert s.end_time is not None
-    assert abs((s.end_time - s.start_time) * 1000.0 - 120.0) < 5.0
+    assert abs((s.end_time - s.start_time) * 1000.0 - 120.0) < 1.0
     assert s.metadata["tool_name"] == "add"
     assert s.metadata["tool_status"] == "success"
     assert "duration_source" not in s.metadata
@@ -427,6 +452,28 @@ def test_tool_hook_marks_duration_unavailable_when_missing():
     assert s.metadata["duration_source"] == "unavailable"
     assert s.duration_ms is not None and s.duration_ms >= 0.0
     t.close()
+
+
+def test_tool_hook_duration_is_exactly_reported_value():
+    """tool_hook 单次取时刻回推 start_time 并显式传入 end_time，
+    最终 duration_ms 必须严格等于工具自报值，偏差 < 0.01ms（浮点噪声量级，
+    而不是修复前的几百微秒处理开销累加）。"""
+    for reported_ms in (1.0, 120.0, 999.0):
+        t = TraceLogger()
+        r = ToolResult.ok("x")
+        r.metadata["duration_ms"] = reported_ms
+        t.tool_hook("probe", {}, r)
+        spans = t.read_spans(kind="tool")
+        assert len(spans) == 1
+        s = spans[0]
+        drift_ms = abs(s.duration_ms - reported_ms)
+        assert drift_ms < 0.01, (
+            f"reported={reported_ms}ms got={s.duration_ms}ms drift={drift_ms*1000:.2f}us > 10us"
+        )
+        # 同时校验时间区间长度同样无漂移
+        interval_ms = (s.end_time - s.start_time) * 1000.0
+        assert abs(interval_ms - reported_ms) < 0.01
+        t.close()
 
 
 def test_tool_hook_records_real_duration_via_registry_end_to_end():
@@ -590,7 +637,7 @@ def test_llm_embed_documents_with_tracer_records_span():
     t.close()
 
 
-# ==================== LLM 打点：token / model 元数据（v1.0.1）====================
+# ==================== LLM 打点：token / model 元数据 ====================
 def test_llm_invoke_records_token_metadata():
     """LLM.invoke 打点把底层回传的 token 用量写进 Span.metadata（model + usage 平铺字段）。"""
     t = TraceLogger()
@@ -817,14 +864,19 @@ def test_replay_returns_ordered_printable_list():
             outer.output = "done"
     rep = t.replay()
     assert len(rep) == 2
-    assert rep[0]["name"] == "outer" or rep[0]["name"] == "inner"
-    # 排序验证：inner.start_time >= outer.start_time
-    assert rep[0]["start_time" if False else "name"] is not None  # 字段存在
+    # 返回顺序按 start_time 升序：外层 span 先开先出
+    assert rep[0]["name"] == "outer"
+    assert rep[1]["name"] == "inner"
+    # 字段结构稳定（不暴露 start_time/end_time，内部用于排序即可）
     for entry in rep:
         assert set(entry.keys()) >= {
             "span_id", "parent_id", "kind", "name", "status", "duration_ms", "error",
             "input", "output", "metadata",
         }
+    # 真正按 start_time 有序：从 store 读回原始 SpanRecord 校验时序
+    all_spans = t.read_spans()
+    by_name = {s.name: s for s in all_spans}
+    assert by_name["inner"].start_time >= by_name["outer"].start_time
     t.close()
 
 
@@ -881,10 +933,10 @@ def test_trace_logger_context_manager_closes():
     assert t._store._closed is True
 
 
-# ==================== 实例级 ContextVar：跨实例不串扰（v1.0.2 核心修复）====================
+# ==================== 实例级 ContextVar：跨实例不串扰 ====================
 def test_state_is_per_instance_no_cross_pollution():
     """两个 TraceLogger 实例交错打点时，根 Span 的 parent_id 必须为 None，
-    不被另一个实例活跃的 Span 串扰（之前因模块级 ContextVar 会串）。"""
+    不被另一个实例活跃的 Span 串扰。"""
     t1 = TraceLogger()
     t2 = TraceLogger()
     with t1.trace("A"):
@@ -905,8 +957,8 @@ def test_state_is_per_instance_no_cross_pollution():
 
 
 def test_contextvar_is_instance_level_not_module_level():
-    """模块级 _active_span_id/_active_trace_id 已被移除；栈状态挂在实例属性上，
-    保证 G2 做 async 并发时多 tracer 不互相污染。"""
+    """状态栈挂在实例属性上，保证多 tracer 实例不互相污染，同时为 asyncio
+    并发任务场景天然提供 Task 级隔离。"""
     import fast_agents.trace.trace_logger as mod
     assert not hasattr(mod, "_active_span_id"), (
         "模块级 _active_span_id 已被移除，改为实例级 ContextVar"
