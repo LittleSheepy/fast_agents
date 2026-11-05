@@ -87,6 +87,8 @@ class MemoryManager:
         self.llm = llm
         self.auto_extract = auto_extract
         self.extract_prompt = extract_prompt or DEFAULT_EXTRACT_PROMPT
+        # B10 增量抽取水位线：记录上次抽取到的消息条数，只抽新增部分，省token、避免重复入库
+        self._extract_watermark: int = 0
 
         self.long_term: MemoryStoreBase = long_term_store or InMemoryStore()
         self.profile_store = profile_store
@@ -188,15 +190,29 @@ class MemoryManager:
         return self.long_term.add(record)
 
     def extract_and_store(self) -> List[MemoryRecord]:
-        """把短期窗口里的对话交给 LLM 抽取长期记忆并入库"""
+        """把短期窗口里「自上次抽取后新增的对话」交给 LLM 抽取长期记忆并入库（B10 增量水位线）
+
+        不再每轮把整段历史重新送给 LLM，只抽取未处理过的新增消息段，大幅节省 token、
+        避免同一段事实被反复抽取重复入库。
+        """
         if not self.llm:
             return []
         history = self.buffer.get_messages()
-        if not history:
+        total = len(history)
+        if total <= self._extract_watermark:
+            # 没有新消息，无需重复抽取
+            return []
+        # 只取上次水位线之后的新增部分
+        new_messages = history[self._extract_watermark:]
+        if not new_messages:
             return []
         conversation = "\n".join(
-            f"{m.role}: {m.content}" for m in history if m.content
+            f"{m.role}: {m.content}" for m in new_messages if m.content
         )
+        if not conversation.strip():
+            # 新增消息全是空内容，推进水位线后直接返回
+            self._extract_watermark = total
+            return []
         items = self._call_extract(conversation)
 
         stored: List[MemoryRecord] = []
@@ -217,6 +233,8 @@ class MemoryManager:
                     importance=min(1.0, max(0.0, importance)),
                 )
             )
+        # 抽取完成后推进水位线（无论抽取成功几条，这部分消息都已处理过，不再重复抽）
+        self._extract_watermark = total
         return stored
 
     def _call_extract(self, conversation: str) -> List[Dict[str, Any]]:
@@ -269,9 +287,25 @@ class MemoryManager:
         """撤回一条长期记忆（保留历史）"""
         return self.long_term.retract(memory_id)
 
+    def revise(
+        self,
+        memory_id: str,
+        content: str,
+        *,
+        source: str = "manual_revise",
+    ) -> MemoryRecord:
+        """修订一条已有长期记忆（保留历史修订记录，B11）
+
+        对应 Store 层的 revise 方法，现在 Manager 统一对外暴露，调用方无需绕过 Manager。
+        """
+        if not content or not content.strip():
+            raise ValueError("content 不能为空")
+        return self.long_term.revise(memory_id, content.strip(), source)
+
     def forget_session(self) -> None:
         """清空短期记忆（会话结束调用）"""
         self.buffer.clear()
+        self._extract_watermark = 0
 
     def compact(
         self,

@@ -855,6 +855,92 @@ def test_b8_time_is_cst():
     print("✅ test_b8_time_is_cst 通过（B8 时间统一北京时间 CST：默认 / 往返 / +08:00 / naive 兼容）")
 
 
+def test_b10_auto_extract_watermark():
+    """B10：auto_extract 增量水位线——只抽新增消息，不重复抽历史，省token、避免重复入库"""
+    call_count = 0
+    last_conversation_len = 0
+
+    class CountingFakeLLM:
+        def invoke(self, messages, temperature=0.0):
+            nonlocal call_count, last_conversation_len
+            call_count += 1
+            prompt = messages[0]["content"]
+            # 统计本次抽取传入的对话行数（即新增消息条数）
+            conv_part = prompt.split("对话内容：\n")[-1]
+            last_conversation_len = len([l for l in conv_part.split("\n") if l.strip()])
+            # 第一次抽取返回用户偏好，第二次返回新事实
+            if call_count == 1:
+                class R:
+                    content = '[{"content":"用户喜欢用Python编程","kind":"preference","importance":0.8}]'
+                return R()
+            elif call_count == 2:
+                class R:
+                    content = '[{"content":"用户项目使用fast_agents框架","kind":"fact","importance":0.7}]'
+                return R()
+            else:
+                class R:
+                    content = '[]'
+                return R()
+
+    llm = CountingFakeLLM()
+    manager = MemoryManager(
+        llm=llm,
+        auto_extract=True,
+        long_term_store=InMemoryStore(),
+    )
+    # 第一轮对话：第一次record触发第一次抽取，只处理新增的2条消息
+    manager.record("你好", "你好呀，有什么可以帮你的？")
+    assert call_count == 1, f"第一轮第一条后应调用1次抽取，实际{call_count}次"
+    assert last_conversation_len == 2, f"第一次抽取应只传2条新消息，实际{last_conversation_len}条"
+    manager.record("我喜欢用Python编程", "好的，记住你喜欢Python啦。")
+    assert call_count == 2, f"第一轮第二条后应共调用2次抽取，实际{call_count}次"
+    # 第二次抽取只新增2条消息，不会重复处理前2条历史（验证增量特性）
+    assert last_conversation_len == 2, f"第二次抽取应只传新增的2条消息，实际{last_conversation_len}条"
+    all_mems = manager.long_term.all()
+    assert len(all_mems) == 2
+    assert any("Python" in m.content for m in all_mems)
+
+    # 第三轮对话：再新增2条消息，只抽这2条
+    manager.record("对了我项目用fast_agents框架", "好的，记住你的项目用fast_agents。")
+    assert call_count == 3, f"第三轮后应共调用3次抽取，实际{call_count}次"
+    assert last_conversation_len == 2, f"第三次抽取应只传新增的2条消息，实际{last_conversation_len}条"
+    all_mems = manager.long_term.all()
+    assert len(all_mems) == 2
+    assert any("fast_agents" in m.content for m in all_mems)
+
+    # 再调用一次extract_and_store()，没有新消息，不会触发LLM调用
+    manager.extract_and_store()
+    assert call_count == 3, f"无新消息时不应重复抽取，调用次数仍为3，实际{call_count}次"
+
+    # 清空会话后水位线重置
+    manager.forget_session()
+    manager.record("新会话第一条", "新会话回复")
+    # 新会话第一次record会触发抽取，因为水位线归零了
+    assert call_count == 4
+    print("✅ test_b10_auto_extract_watermark 通过（B10 增量抽取水位线：不重复抽历史、无新消息不调用、重置会话清零）")
+
+
+def test_b11_manager_revise_forward():
+    """B11：MemoryManager 补 revise() 转发——调用方可直接通过Manager修订记忆，无需绕过门面"""
+    manager = MemoryManager(long_term_store=InMemoryStore())
+    rec = manager.remember("我住在北京", kind="fact", importance=0.7)
+    assert rec.content == "我住在北京"
+    old_id = rec.memory_id
+
+    # 通过Manager的revise方法修订内容（返回新记录，旧记录标记为superseded留审计历史）
+    new_rec = manager.revise(old_id, "我现在搬到上海了")
+    assert new_rec.content == "我现在搬到上海了"
+    assert new_rec.memory_id != old_id
+    assert new_rec.supersedes == old_id
+    # 新记录是active状态，旧记录被标记为superseded
+    new_got = manager.long_term.get(new_rec.memory_id)
+    old_got = manager.long_term.get(old_id)
+    assert new_got.content == "我现在搬到上海了"
+    assert new_got.status == "active"
+    assert old_got.status == "superseded"
+    print("✅ test_b11_manager_revise_forward 通过（B11 Manager 转发 revise 方法，保留审计历史）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -886,4 +972,6 @@ if __name__ == "__main__":
     test_touch_scope_isolation_in()
     test_session_store_persistence()
     test_b8_time_is_cst()
+    test_b10_auto_extract_watermark()
+    test_b11_manager_revise_forward()
     print("\n🎉 全部测试通过")
