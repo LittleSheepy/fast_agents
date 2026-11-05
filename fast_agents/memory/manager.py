@@ -287,20 +287,24 @@ class MemoryManager:
         """撤回一条长期记忆（保留历史）"""
         return self.long_term.retract(memory_id)
 
-    def revise(
-        self,
-        memory_id: str,
-        content: str,
-        *,
-        source: str = "manual_revise",
-    ) -> MemoryRecord:
-        """修订一条已有长期记忆（保留历史修订记录，B11）
+    def revise(self, memory_id: str, content: str, *, source: str = "manual_revise") -> MemoryRecord:
+        """修订一条长期记忆，旧版本自动标记为 superseded 留痕（B11）
 
-        对应 Store 层的 revise 方法，现在 Manager 统一对外暴露，调用方无需绕过 Manager。
+        转发底层 Store 的 revise 能力：旧记忆标记为被取代状态，保留可追溯的修订历史，
+        新记忆带 supersedes 指针指向旧 ID，符合审计要求。
+
+        Args:
+            memory_id: 要修订的记忆 ID（必须是 active 状态的有效记忆）
+            content: 修订后的新内容（不能为空）
+            source: 修订来源标记，默认 "manual_revise"
+
+        Raises:
+            ValueError: content 为空或记忆不是有效状态
+            KeyError: memory_id 不存在
         """
         if not content or not content.strip():
             raise ValueError("content 不能为空")
-        return self.long_term.revise(memory_id, content.strip(), source)
+        return self.long_term.revise(memory_id, content.strip(), source=source)
 
     def forget_session(self) -> None:
         """清空短期记忆（会话结束调用）"""
