@@ -26,7 +26,7 @@ from .mcp import (
     MCPConfig,
 )
 from .database import (
-    SQLiteClient, DatabaseClientBase,
+    SQLiteClient, MySQLClient, DatabaseClientBase,
     Schema, Column, ColumnType, Index,
     Query, Filter, FilterOp, SortOrder,
     DatabaseError, DatabaseConnectionError,
@@ -65,7 +65,7 @@ __all__ = [
     "StdioTransport", "SSETransport", "make_stdio", "MCPConfig",
 
     # Database（持久化层）
-    "SQLiteClient", "DatabaseClientBase",
+    "SQLiteClient", "MySQLClient", "DatabaseClientBase",
     "Schema", "Column", "ColumnType", "Index",
     "Query", "Filter", "FilterOp", "SortOrder",
     "DatabaseError", "DatabaseConnectionError",

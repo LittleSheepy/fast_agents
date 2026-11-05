@@ -20,6 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 # 向量后端可选依赖：pip install fast-agents[chroma]
 chroma = ["chromadb>=0.4,<1.0"]
+# MySQL 关系型后端可选依赖：pip install fast-agents[mysql]
+mysql = ["pymysql>=1.1.0"]
 
 [tool.uv.build-backend]
 module-root = ""
