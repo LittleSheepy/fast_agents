@@ -556,7 +556,7 @@ class SQLiteClient(DatabaseClientBase):
         sql = f"INSERT INTO {_quote_ident(table)} ({col_sql_str}) VALUES ({placeholders})"
         params_list = [tuple(row[c] for c in columns) for row in rows]
         try:
-            self.conn.executemany(sql, params_list)
+            self.executemany(sql, params_list)
         except sqlite3.Error as e:
             raise ValueError(f"批量插入失败: {e}") from e
         return len(rows)
