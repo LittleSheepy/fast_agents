@@ -7,8 +7,9 @@
 - **一条 Trace = 一次 run**，一个 Trace 下多个 Span（llm/tool/decision/agent）；
 - **最小字段集**：时间戳 / 类型 / 输入 / 输出 / 耗时 / session_id + 推荐补充：
   trace_id / span_id / parent_id / name / status / error / metadata；
-- **默认 JsonlStore 落盘**（路径可配），存储层通过 TraceStoreBase 抽象，
-  预留切 SQLite / 远端上报扩展位；
+- **默认 JsonlStore 落盘**（路径可配），支持 ``backend="sqlite"`` 一行切换 SQLiteStore，
+  或通过 ``path`` 后缀（.db/.sqlite/.sqlite3）自动识别后端；存储层通过 TraceStoreBase 抽象，
+  预留远端上报扩展位；
 - **零侵入接入**：
   - 工具打点：``tool_registry.add_hook(tracer.tool_hook)`` 或 ``attach_to_tool_registry(reg)``；
   - LLM / Agent：构造时传 ``tracer=...`` 即可自动打点（可选参数，默认 None 行为不变）。
@@ -16,12 +17,14 @@
 from __future__ import annotations
 
 import contextvars
+import os
 import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, List, Optional
 
 from .jsonl_store import MEMORY_PATH, JsonlStore
 from .models import SpanKind, SpanRecord, SpanStatus, _new_id, _now_ts
+from .sqlite_store import SQLiteStore
 from .store_base import TraceStoreBase
 
 
@@ -29,9 +32,12 @@ class TraceLogger:
     """全链路 Trace 记录器。
 
     Args:
-        store: TraceStoreBase 后端；默认 JsonlStore(path, append=True)。
-        path: 当 store=None 时，传给 JsonlStore 的路径；默认 ``":memory:"``（仅内存，不落盘）；
-              传文件路径（如 ``"traces/runs.jsonl"``）时按行追加。
+        store: TraceStoreBase 后端；显式传入时优先使用，忽略 path/backend。
+        path: 当 store=None 时，存储文件路径；默认 ``":memory:"``（仅内存，不落盘）；
+              传文件路径时，根据后缀自动选择后端：.jsonl/.jsonl/.ndjson → JsonlStore，
+              .db/.sqlite/.sqlite3 → SQLiteStore；也可通过 backend 参数显式指定。
+        backend: 显式指定存储后端：``"jsonl"`` 或 ``"sqlite"``；不传时根据 path 后缀自动识别，
+                 后缀无法识别时默认 jsonl（保持向后兼容）。
         session_id: 会话 id；不传则自动生成；可通过 ``set_session_id`` 随时切换。
         enabled: 是否实际打点；False 时所有方法都是空操作（与不传 tracer 等价）。
 
@@ -46,6 +52,7 @@ class TraceLogger:
         store: Optional[TraceStoreBase] = None,
         *,
         path: Optional[str] = None,
+        backend: Optional[str] = None,
         session_id: Optional[str] = None,
         enabled: bool = True,
     ):
@@ -53,9 +60,27 @@ class TraceLogger:
         self._lock = threading.Lock()
         # 存储后端
         if store is not None:
+            # 显式传入 store 实例优先
             self._store = store
         else:
-            self._store = JsonlStore(path if path is not None else MEMORY_PATH, append=True)
+            # 未显式传 store：根据 backend 参数或 path 后缀自动选择后端
+            default_path = path if path is not None else MEMORY_PATH
+            # 自动识别后缀：.db / .sqlite / .sqlite3 → sqlite；其它 → jsonl
+            _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
+            backend_lower = backend.lower() if backend is not None else None
+            use_sqlite = (backend_lower == "sqlite")
+            if not use_sqlite and backend_lower is None and default_path != MEMORY_PATH:
+                # 未显式指定 backend，根据文件后缀自动判断
+                try:
+                    ext = os.path.splitext(default_path)[1].lower()
+                    if ext in _SQLITE_SUFFIXES:
+                        use_sqlite = True
+                except Exception:
+                    pass
+            if use_sqlite:
+                self._store = SQLiteStore(default_path)
+            else:
+                self._store = JsonlStore(default_path, append=True)
         # 会话 id
         self._session_id = session_id or f"sess_{_new_id()[:12]}"
         # 实例级 ContextVar：每个 tracer 自持一份栈，(1) 不与其它实例串；

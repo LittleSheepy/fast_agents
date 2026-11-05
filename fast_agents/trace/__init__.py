@@ -12,6 +12,7 @@
 from .models import SpanKind, SpanRecord, SpanStatus
 from .store_base import TraceStoreBase
 from .jsonl_store import JsonlStore, MEMORY_PATH
+from .sqlite_store import SQLiteStore
 from .trace_logger import TraceLogger
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "TraceStoreBase",
     "JsonlStore",
     "MEMORY_PATH",
+    "SQLiteStore",
 ]
