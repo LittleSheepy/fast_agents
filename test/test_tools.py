@@ -1343,6 +1343,39 @@ def test_no_thread_local_dead_code():
     print("✅ 移除 _thread_local 死代码通过")
 
 
+def test_a23_builtin_lazy_import():
+    """A23：builtin 延迟导入——用占位父包隔离验证，导入/访问基础工具不拉 memory_tool/mcp_tool，访问后按需加载，API 兼容。"""
+    import subprocess
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parent.parent
+    code = (
+        "import os, sys, types\n"
+        "root = os.environ['FA_ROOT']\n"
+        "fa = types.ModuleType('fast_agents'); fa.__path__ = [os.path.join(root, 'fast_agents')]\n"
+        "tl = types.ModuleType('fast_agents.tools'); tl.__path__ = [os.path.join(root, 'fast_agents', 'tools')]\n"
+        "sys.modules['fast_agents'] = fa; sys.modules['fast_agents.tools'] = tl\n"
+        "def _loaded():\n"
+        "    return [m for m in sys.modules if m.startswith('fast_agents.tools.builtin.') and (m.endswith('memory_tool') or m.endswith('mcp_tool'))]\n"
+        "import fast_agents.tools.builtin as b\n"
+        "assert not _loaded(), '导入 builtin 时 memory_tool/mcp_tool 被提前加载'\n"
+        "b.CalculatorTool\n"
+        "assert not _loaded(), '访问 CalculatorTool 却加载了 memory_tool/mcp_tool'\n"
+        "b.RememberTool\n"
+        "assert any(m.endswith('memory_tool') for m in _loaded()), '访问 RememberTool 未按需加载 memory_tool'\n"
+        "assert 'RememberTool' in dir(b), 'dir() 未包含延迟导出名'\n"
+        "assert set(b.__all__) <= set(b._LAZY_IMPORTS), '__all__ 未全部由延迟映射覆盖'\n"
+        "from fast_agents.tools.builtin import CalculatorTool, build_mcp_tools\n"
+        "print('LAZY_OK')\n"
+    )
+    env = dict(os.environ)
+    env["FA_ROOT"] = str(repo_root)
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, cwd=str(repo_root), env=env)
+    assert r.returncode == 0 and "LAZY_OK" in r.stdout, f"A23 延迟导入校验失败:\n{r.stdout}\n{r.stderr}"
+    print("✅ A23 builtin 延迟导入（隔离验证：不提前拉起 memory/mcp、按需加载、API 兼容）通过")
+
+
 if __name__ == "__main__":
     from pathlib import Path  # for test_terminal
     tests = [
@@ -1407,6 +1440,8 @@ if __name__ == "__main__":
         test_register_non_strict_mode_warns_and_overwrites,
         test_clear_resets_approval_callback,
         test_no_thread_local_dead_code,
+        # ── A23 builtin 延迟导入 ──
+        test_a23_builtin_lazy_import,
     ]
     failed = 0
     for t in tests:

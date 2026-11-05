@@ -6,7 +6,7 @@
 - ToolResult / ToolStatus：结构化执行结果
 - ToolException：可恢复错误
 - ToolRegistry：工具注册表
-- builtin：内置工具集合（计算器/终端/搜索/文件读取）
+- builtin：内置工具集合（计算器/终端/搜索/文件操作/记忆/MCP）
 """
 
 from .tool_base import ToolBase
