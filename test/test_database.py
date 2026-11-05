@@ -8,7 +8,11 @@
     python test\test_database.py
     或：pytest test/test_database.py -v
 """
+import os
 import sqlite3
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
@@ -23,6 +27,11 @@ from fast_agents.database import (
     SortOrder,
     SqlExpr,
     SQLiteClient,
+    # 异常体系（errors.py）
+    DatabaseError,
+    DatabaseConnectionError,
+    DatabaseOperationalError,
+    DatabaseValidationError,
 )
 
 
@@ -255,6 +264,68 @@ def test_close_with_pending_transaction_rolls_back(tmp_path):
 def test_invalid_sql_raises(db):
     with pytest.raises((sqlite3.Error, ValueError)):
         db.execute("THIS IS NOT SQL")
+
+def test_exception_hierarchy():
+    """异常体系：DatabaseError 继承 ValueError，三个具体子类都挂在它下面。"""
+    assert issubclass(DatabaseError, ValueError)
+    for cls in (DatabaseConnectionError, DatabaseOperationalError, DatabaseValidationError):
+        assert issubclass(cls, DatabaseError)
+
+
+def test_execute_error_maps_to_operational(db):
+    """SQL 执行 / 查询失败 -> DatabaseOperationalError（可被上层精确分流）。"""
+    with pytest.raises(DatabaseOperationalError):
+        db.execute("THIS IS NOT SQL")
+    with pytest.raises(DatabaseOperationalError):
+        db.query("SELECT * FROM never_exist_table")
+
+
+def test_validation_error_maps(db):
+    """入参校验失败 -> DatabaseValidationError。"""
+    with pytest.raises(DatabaseValidationError):
+        db.insert("test_users", {})
+    with pytest.raises(DatabaseValidationError):
+        db.delete("test_users", {})
+    with pytest.raises(DatabaseValidationError):
+        db.update("test_users", {}, {"id": 1})
+
+
+def test_illegal_ident_maps_to_validation():
+    """非法标识符（schema.check_ident）也归到 DatabaseValidationError。"""
+    db = SQLiteClient(":memory:")
+    with pytest.raises(DatabaseValidationError):
+        db.ensure_table("bad name", {"id": "INTEGER PRIMARY KEY"})
+    db.close()
+
+
+def test_connection_error_maps():
+    """连不上的路径 -> DatabaseConnectionError（构造时即建连）。"""
+    with pytest.raises(DatabaseConnectionError):
+        SQLiteClient("/no/such/dir_xyz_zz/db.sqlite")
+
+
+def test_exception_still_caught_by_valueerror(db):
+    """向后兼容：新异常全部继承 ValueError，既有 except ValueError 通吃。"""
+    with pytest.raises(ValueError):
+        db.execute("THIS IS NOT SQL")
+    with pytest.raises(ValueError):
+        db.insert("test_users", {})
+    with pytest.raises(DatabaseError):  # 基类可统一兜底
+        db.execute("THIS IS NOT SQL")
+
+
+def test_exceptions_exported_from_top_level():
+    """顶层 fast_agents 包同步导出异常体系。"""
+    import fast_agents
+    for name in (
+        "DatabaseError",
+        "DatabaseConnectionError",
+        "DatabaseOperationalError",
+        "DatabaseValidationError",
+    ):
+        assert hasattr(fast_agents, name), name
+
+
 
 
 def test_close_and_reconnect(db):

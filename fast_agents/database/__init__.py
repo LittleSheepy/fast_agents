@@ -14,11 +14,22 @@
 零新增核心依赖：关系型能力仅用标准库 sqlite3 + pydantic；向量后端 chromadb 作为可选依赖
 （``pip install fast-agents[chroma]``），未安装时仅 ChromaClient 无法使用，其它能力完全不受影响。
 
+- 异常体系：
+  - ``DatabaseError``：模块异常基类（**刻意继承 ``ValueError``**，兼容既有 ``except ValueError``）；
+  - ``DatabaseConnectionError`` / ``DatabaseOperationalError`` / ``DatabaseValidationError``：
+    分别对应连接层 / 执行层 / 校验层错误，上层可按类型精确分流。
+
 允许一个后端**同时实现两套抽象**（如未来 Postgres + pgvector），上层通过 ``isinstance``
 分别判断关系型 / 向量能力即可。
 """
 from .chroma_client import ChromaClient
 from .database_client_base import DatabaseClientBase
+from .errors import (
+    DatabaseConnectionError,
+    DatabaseError,
+    DatabaseOperationalError,
+    DatabaseValidationError,
+)
 from .query import Filter, FilterOp, Query, SortOrder
 from .schema import Column, ColumnType, Index, Schema
 from .sqlite_client import SqlExpr, SQLiteClient
@@ -26,6 +37,11 @@ from .vector_client_base import VectorClientBase
 from .vector_query import VectorFilter, VectorFilterOp
 
 __all__ = [
+    # 异常体系
+    "DatabaseError",
+    "DatabaseConnectionError",
+    "DatabaseOperationalError",
+    "DatabaseValidationError",
     # 关系型客户端
     "SQLiteClient",
     "DatabaseClientBase",

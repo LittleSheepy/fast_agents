@@ -29,6 +29,8 @@ from .database import (
     SQLiteClient, DatabaseClientBase,
     Schema, Column, ColumnType, Index,
     Query, Filter, FilterOp, SortOrder,
+    DatabaseError, DatabaseConnectionError,
+    DatabaseOperationalError, DatabaseValidationError,
 )
 from .trace import (
     TraceLogger, SpanKind, SpanStatus, SpanRecord,
@@ -66,6 +68,8 @@ __all__ = [
     "SQLiteClient", "DatabaseClientBase",
     "Schema", "Column", "ColumnType", "Index",
     "Query", "Filter", "FilterOp", "SortOrder",
+    "DatabaseError", "DatabaseConnectionError",
+    "DatabaseOperationalError", "DatabaseValidationError",
 
     # Trace（可观测性，G1 初版）
     "TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
