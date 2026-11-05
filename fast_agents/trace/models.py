@@ -86,9 +86,16 @@ class SpanRecord(BaseModel):
         status: SpanStatus = SpanStatus.SUCCESS,
         error: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        end_time: Optional[float] = None,
     ) -> None:
-        """标记 Span 结束，自动计算耗时。"""
-        self.end_time = _now_ts()
+        """标记 Span 结束，自动计算耗时。
+
+        Args:
+            end_time: 可选的精确结束时间戳（秒）。默认 None 时取当前时刻
+                （行为与改动前一致）；传入时以该值作为 ``end_time``，用于
+                「后钩子」这类拿不到真实起止、但需精确对齐耗时的场景。
+        """
+        self.end_time = end_time if end_time is not None else _now_ts()
         self.duration_ms = (self.end_time - self.start_time) * 1000.0
         self.output = output
         self.status = status

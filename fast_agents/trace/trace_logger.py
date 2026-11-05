@@ -35,7 +35,7 @@ class TraceLogger:
         session_id: 会话 id；不传则自动生成；可通过 ``set_session_id`` 随时切换。
         enabled: 是否实际打点；False 时所有方法都是空操作（与不传 tracer 等价）。
 
-    状态隔离说明（v1.0.2 修正）：早期版本使用模块级 ``contextvars.ContextVar``，
+    状态隔离说明：早期版本使用模块级 ``contextvars.ContextVar``，
     会导致多个 TraceLogger 实例互相污染父链；现改为每个实例自持一对 ContextVar，
     同时兼顾：(1) 实例级隔离（主/子 Agent 各自 tracer 互不串扰）；(2) 跨协程
     传播（asyncio.Task 自动拷贝上下文，为 G2 异步并发预留扩展）。
@@ -182,16 +182,18 @@ class TraceLogger:
         status: SpanStatus = SpanStatus.SUCCESS,
         error: Optional[str] = None,
         metadata: Optional[dict] = None,
+        end_time: Optional[float] = None,
     ) -> None:
         """结束一个 Span 并写入 store。
 
         调用前可以手动修改 span.input/metadata；error 非空时自动置 status=ERROR。
+        end_time 为可选精确结束时刻（秒），默认 None 时取当前时刻（行为不变）。
         """
         if not self.enabled:
             return
         if error is not None and status == SpanStatus.SUCCESS:
             status = SpanStatus.ERROR
-        span.finish(output=output, status=status, error=error, metadata=metadata)
+        span.finish(output=output, status=status, error=error, metadata=metadata, end_time=end_time)
         # 弹栈
         self._pop_span_if_top(span.span_id)
         # 写入 store（底层已保证异常不抛）
@@ -236,11 +238,12 @@ class TraceLogger:
         钩子签名：``hook(tool_name: str, tool_args: dict, result: ToolResult)``；
         内部会自动开启一个 tool Span 记录输入/输出/耗时/状态，不抛异常。
 
-        计时说明（v1.0.1 修正）：ToolRegistry 的钩子是工具执行**完成后**才调用的，
+        计时说明：ToolRegistry 的钩子是工具执行**完成后**才调用的，
         「后钩子」里拿不到真实开始时刻。工具的真实耗时由 ``tool_base`` 写进
         ``ToolResult.metadata["duration_ms"]``（int 毫秒），这里读取该值，
-        并用「当前时刻（≈ 执行结束时刻）− duration_ms」回推 ``start_time``，
-        使 tool Span 的时间区间与父子的包含关系都正确；若工具未上报耗时，
+        并在钩子入口**只取一次**当前时间戳：既作为 tool Span 的 ``end_time``，
+        又用「该时刻 − duration_ms」回推 ``start_time``，使 ``duration_ms``
+        严格等于工具自报耗时、时间区间与父子包含关系都正确；若工具未上报耗时，
         则退化为一次近零耗时记录，并在 metadata 标记 ``duration_source``。
         """
         if not self.enabled:
@@ -274,11 +277,15 @@ class TraceLogger:
         except Exception:
             output_data = str(result) if result is not None else None
 
-        # 回推 start_time：后钩子触发时刻 ≈ 工具执行结束时刻
-        start_time = _now_ts()
+        # 计时修正：ToolRegistry 的后钩子只在工具执行完成**之后**触发，
+        # 因此钩子入口时刻 ≈ 工具结束时刻。全函数只在此取一次时间戳 hook_end_ts，
+        # 既作为 tool Span 的 end_time，又据此回推 start_time = end_time - duration_ms，
+        # 使 duration_ms 严格等于工具自报值，不再叠加钩子自身处理开销（消除计时漂移）。
+        hook_end_ts = _now_ts()
+        start_time = hook_end_ts
         if duration_ms is not None:
             try:
-                start_time = _now_ts() - float(duration_ms) / 1000.0
+                start_time = hook_end_ts - float(duration_ms) / 1000.0
             except (TypeError, ValueError):
                 duration_ms = None
 
@@ -297,10 +304,13 @@ class TraceLogger:
             input=tool_args if isinstance(tool_args, dict) else {"raw": str(tool_args)},
             metadata=span_metadata,
         )
-        # 覆盖默认 start_time，让 finish() 算出的 duration_ms ≈ 工具自报耗时
         if duration_ms is not None:
+            # 覆盖 start_span 内部生成的 start_time，并显式传入精确 end_time，
+            # 使 end_time - start_time ≡ duration_ms（严格等于工具自报耗时，零漂移）。
             s.start_time = start_time
-        self.end_span(s, output=output_data, status=status, error=error_msg)
+            self.end_span(s, output=output_data, status=status, error=error_msg, end_time=hook_end_ts)
+        else:
+            self.end_span(s, output=output_data, status=status, error=error_msg)
 
     def attach_to_tool_registry(self, registry: Any) -> None:
         """把 ``self.tool_hook`` 注册到给定 ToolRegistry；一行接入工具打点。"""
