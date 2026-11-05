@@ -2,7 +2,7 @@
 
 演示 SQLiteClient 建表、增删改查、批量插入、统计、事务、回滚等基础用法。
 全部用内存数据库，跑完不留文件。
-运行方式：在项目根目录执行 `python examples/database/basic_usage.py`
+运行方式：在项目根目录执行 `python examples/database/sqlite_usage.py`
 """
 from fast_agents.database import SQLiteClient
 
