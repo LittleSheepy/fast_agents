@@ -9,7 +9,7 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from .models import SpanKind, SpanRecord, _now_ts
 from .store_base import TraceStoreBase
@@ -53,6 +53,17 @@ def _safe_serialize(obj: Any) -> Any:
         return str(obj)
 
 
+def _match(d: dict, session_id, trace_id, kind) -> bool:
+    """单条记录是否匹配过滤条件。"""
+    if session_id is not None and d.get("session_id") != session_id:
+        return False
+    if trace_id is not None and d.get("trace_id") != trace_id:
+        return False
+    if kind is not None and d.get("kind") != kind:
+        return False
+    return True
+
+
 class JsonlStore(TraceStoreBase):
     """JSONL 一行一条 Span 的存储后端。
 
@@ -60,6 +71,11 @@ class JsonlStore(TraceStoreBase):
         path: jsonl 文件路径；传 ``":memory:"`` 或 ``None`` 则只在内存里保存（不落盘）。
         append: True 表示追加到已有文件（默认）；False 表示清空重写。
         encoding: 文件编码，默认 ``utf-8``。
+
+    设计：
+    - ``:memory:`` 模式：所有记录保存在 ``self._mem`` list 中，读写都走它，性能最高；
+    - 文件模式：写入时直接落盘、**不在内存保留全量镜像**（避免随文件线性涨内存）；
+      读取时按需流式扫描文件，命中 ``limit`` 即返回，不预加载。
     """
 
     def __init__(
@@ -73,30 +89,19 @@ class JsonlStore(TraceStoreBase):
         self.append = append
         self.encoding = encoding
         self._lock = threading.Lock()
-        self._mem: List[dict] = []  # 内存模式下的缓冲；文件模式下也用于 read() 读已写入内容
+        # _is_memory: True=纯内存模式（_mem 存全量数据，不落盘）；False=文件模式（_mem 不使用）
+        self._is_memory: bool = (not path) or (path == MEMORY_PATH)
+        self._mem: List[dict] = []  # 仅内存模式使用；文件模式始终为空
         self._fp = None
         self._closed = False
 
-        if path and path != MEMORY_PATH:
+        if not self._is_memory:
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             mode = "a" if append else "w"
             # buffering=1 行缓冲；newline="" 让 json 写入跨平台一致，由我们控制 \n
             self._fp = open(p, mode=mode, encoding=encoding, buffering=1, newline="")
-            # 读一遍已有文件，把历史记录装入 _mem，便于 read() 查询
-            if append and p.exists():
-                try:
-                    with open(p, mode="r", encoding=encoding, newline="") as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                self._mem.append(json.loads(line))
-                            except Exception:
-                                continue
-                except Exception:
-                    pass
+            # 文件模式下不再预读历史到内存：读时按需流式扫描，避免启动即占满内存。
 
     # ---------- TraceStoreBase 接口 ----------
     def write(self, span: SpanRecord) -> None:
@@ -118,9 +123,13 @@ class JsonlStore(TraceStoreBase):
                 data["status"] = st.value
             line = json.dumps(data, ensure_ascii=False, default=str)
             with self._lock:
-                self._mem.append(data)
-                if self._fp is not None:
-                    self._fp.write(line + "\n")
+                if self._is_memory:
+                    # 内存模式：全量存 _mem
+                    self._mem.append(data)
+                else:
+                    # 文件模式：只写文件，不保留内存镜像
+                    if self._fp is not None:
+                        self._fp.write(line + "\n")
         except Exception:
             # 打点通道任何异常都不向上抛，避免影响主业务
             pass
@@ -135,21 +144,65 @@ class JsonlStore(TraceStoreBase):
         """按条件过滤读取 Span 列表（按写入顺序返回）。"""
         results: List[SpanRecord] = []
         with self._lock:
-            items = list(self._mem)
-        for d in items:
-            if session_id is not None and d.get("session_id") != session_id:
-                continue
-            if trace_id is not None and d.get("trace_id") != trace_id:
-                continue
-            if kind is not None and d.get("kind") != kind:
-                continue
+            if self._is_memory:
+                # 内存模式：直接遍历 _mem
+                items_iter: Iterator[dict] = iter(list(self._mem))
+            else:
+                # 文件模式：流式打开文件逐行扫描，命中 limit 即停，不预加载
+                if self.path is None:
+                    return results
+                p = Path(self.path)
+                if not p.exists():
+                    return results
+                items_iter = self._iter_file(p)
+            for d in items_iter:
+                if not _match(d, session_id, trace_id, kind):
+                    continue
+                try:
+                    results.append(SpanRecord(**d))
+                except Exception:
+                    continue
+                if limit is not None and len(results) >= limit:
+                    break
+        return results
+
+    def _iter_file(self, p: Path) -> Iterator[dict]:
+        """内部：逐行解析 jsonl 文件，异常行静默跳过（与旧实现行为一致）。"""
+        try:
+            with open(p, mode="r", encoding=self.encoding, newline="") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+    def iter_records(self) -> Iterator[SpanRecord]:
+        """流式遍历所有记录（覆盖基类默认的 read() 全量载入）。"""
+        if self._is_memory:
+            with self._lock:
+                items = list(self._mem)
+            for d in items:
+                try:
+                    yield SpanRecord(**d)
+                except Exception:
+                    continue
+            return
+        # 文件模式：流式读文件
+        if not self.path:
+            return
+        p = Path(self.path)
+        if not p.exists():
+            return
+        for d in self._iter_file(p):
             try:
-                results.append(SpanRecord(**d))
+                yield SpanRecord(**d)
             except Exception:
                 continue
-            if limit is not None and len(results) >= limit:
-                break
-        return results
 
     def flush(self) -> None:
         """刷盘（文件模式）。"""
@@ -175,6 +228,9 @@ class JsonlStore(TraceStoreBase):
             except Exception:
                 pass
             self._fp = None
+        # 文件模式下 _mem 本来就为空，这里 clear 是兜底；内存模式不清（保持 close 后仍可读）
+        if not self._is_memory:
+            self._mem.clear()
 
     def __del__(self):
         try:
