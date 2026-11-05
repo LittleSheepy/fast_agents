@@ -1,5 +1,13 @@
 """数据库客户端抽象基类。
 
+参考主流框架：
+- PEP 249（Python DB-API 2.0）的 Connection / Cursor 分层——把「连接」与「执行」拆开，
+  本模块的 connect / close 对应其 Connection 生命周期；
+- SQLAlchemy Core 的 Engine / Connection / Dialect 多后端抽象——同一套上层接口、多种
+  方言实现（sqlite / mysql / postgresql ...），本模块取其「最小接口集」的克制版本；
+- 同仓库 ``memory/memory_store_base.py``、``tools/tool_base.py`` 的「抽象基类 +
+  子类实现最小接口集」组织方式。
+
 统一约定所有后端（SQLite / MySQL / Postgres / ...）必须实现的最小接口集：
 - 连接管理：connect / close
 - DDL（建/删/检查表）：create_table / ensure_table / ensure_schema / table_exists / drop_table
@@ -95,7 +103,7 @@ class DatabaseClientBase(ABC):
         """批量插入多行，返回插入行数；空列表直接返回0。"""
 
     @abstractmethod
-    def select(self, table: str, where: dict | None = None, limit: int | None = None) -> list[dict]: ...
+    def select(self, table: str, where: dict | None = None, order_by: str | None = None, limit: int | None = None) -> list[dict]: ...
 
     @abstractmethod
     def select_one(self, table: str, where: dict) -> dict | None: ...
