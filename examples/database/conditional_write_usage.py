@@ -4,6 +4,12 @@
 以及多列排序。全部用内存数据库，跑完不留文件。
 运行方式：在项目根目录执行 `python examples/database/conditional_write_usage.py`
 """
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 from fast_agents.database import (
     Filter,
     FilterOp,
