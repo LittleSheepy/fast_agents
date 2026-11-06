@@ -23,8 +23,9 @@
 
 ## 2. 开工前必做
 
-1. **先同步最新代码**（clone / pull），基于真实代码动手，不要凭记忆或凭空发明。
+1. **先同步最新代码**（clone / pull），重新克隆Gitee官方仓库,基于真实代码动手，不要凭记忆或凭空发明。
 2. 通读以下内容，对齐既有风格与约定：
+   - `AGENTS.md`：AI规范；
    - `README.md`：特性、项目结构、核心模块、设计取舍、路线图；
    - `docs/xx模块编写说明模版.md`：**所有模块文档的骨架**，新文档必须沿用；
    - 目标模块源码 + 同类已完成模块（`fast_agents/memory`、`tools`、`mcp`、`context`、`trace`、`database`）；
@@ -110,6 +111,9 @@ python examples\trace\basic_usage.py
 
 ### 🔴 R9 —— 时间使用CST时间
 - 统一时间用 CST
+- 
+### 🔴 R10 —— 使用最新代码
+- 每次回答一定要重新clone一次仓库。
 
 ---
 
