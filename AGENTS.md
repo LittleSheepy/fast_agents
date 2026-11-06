@@ -42,15 +42,18 @@
 第2步uv_venv.bat
 第3步uv_add.bat
 
-# 跑测试：
-python tests\test_memory.py
-python tests\test_tools.py
-python tests\test_context.py
-python tests\test_mcp.py
-python tests\test_database.py
-python tests\test_trace.py
-python tests\test_react_agent.py
-python tests\test_file_tool.py
+# 跑测试（按模块分目录）：
+python tests\init\test_init.py
+python tests\context\test_context.py
+python tests\database\test_database_sqlite.py
+python tests\database\test_database.py
+python tests\database\test_database_mysql.py
+python tests\memory\test_memory.py
+python tests\tools\test_tools.py
+python tests\tools\test_file_tool.py
+python tests\trace\test_trace.py
+python tests\mcp\test_mcp.py
+python tests\agents\test_react_agent.py
 
 # 跑示例（离线可跑，不需要 API Key）
 python examples\database\basic_usage.py
