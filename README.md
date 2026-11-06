@@ -10,7 +10,7 @@
 
 FastAgents 是一个从零手写的轻量 Agent 框架，**不依赖 LangChain 等重型编排库**，直接基于 OpenAI 原生 API 实现。
 
-当前包含八大能力：**LLM 客户端、消息系统、工具系统、ReAct Agent、记忆系统、技能系统、上下文工程（context）、Trace 全链路追踪**，另有一套**零依赖的 MCP 扩展模块**（让 Agent 接入外部工具服务器）。
+当前包含八大能力：**LLM 客户端、消息系统、工具系统、ReAct Agent、记忆系统、技能系统、MCP 外部接入、上下文工程（context）**，另有 **database**（持久化基础服务）与 **trace**（全链路追踪）两个基础设施模块。
 
 代码全部可读、有测试覆盖，适合作为「理解 Agent 原理」的学习范本，也能直接用于中小型项目。
 
@@ -32,6 +32,8 @@ FastAgents 是一个从零手写的轻量 Agent 框架，**不依赖 LangChain �
   - [Skills（技能系统）](#6-skills技能系统)
   - [MCP（外部工具接入）](#7-mcp外部工具接入扩展模块)
   - [Context（上下文工程）](#8-context上下文工程)
+  - [Trace（可观测性）](#9-trace可观测性--tracelogger-全链路记录)
+  - [Database（持久化基础服务）](#10-database持久化基础服务)
 - [使用示例](#使用示例)
 - [配置](#配置)
 - [测试](#测试)
@@ -53,6 +55,9 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | [`docs/Skill模块编写说明.md`](./docs/Skill模块编写说明.md) | `SKILL.md` 标准、三级渐进式加载、`@skill` / `BaseSkill` 两种写法、与 LangChain / Anthropic 的对比 |
 | [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md) | 零依赖 JSON-RPC 实现、**细粒度 vs 粗粒度展开**、`MCPConfig` 声明式配置、Windows 专项 |
 | [`docs/context模块编写说明.md`](./docs/context模块编写说明.md) | Token 预算与三级降级计数、五层拼装顺序、三级压缩策略、工具结果卸载与按需回读、与主流框架的取舍 |
+| [`docs/LLM模块编写说明.md`](./docs/LLM模块编写说明.md) | OpenAI 客户端轻封装、`invoke` / `stream_invoke`、embedding 分片并发与 query/document 语义区分、chat / embedding 模型独立配置 |
+| [`docs/database模块编写说明.md`](./docs/database模块编写说明.md) | 关系型双后端（`SQLiteClient` 零依赖 + `MySQLClient` 可选，接口 100% 对齐）、三种声明式建表、谓词下推（9 种 FilterOp）、统一异常体系、向量后端（Chroma） |
+| [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md) | Span/Trace 模型、`TraceLogger` 门面、`JsonlStore` 与 `SQLiteStore`、`ToolRegistry` 钩子打点、查询与回放 |
 | [`docs/演进路线图.md`](./docs/演进路线图.md) | 按模块（A~G）组织的后续规划，含优先级、依赖、验收标准 |
 
 > 写新模块文档时，骨架参考 [`docs/xx模块编写说明模版.md`](./docs/xx模块编写说明模版.md)。
@@ -71,7 +76,8 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
-| 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，默认 JSONL 一行一条落盘，支持内存模式与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时（v1.0.1）；状态栈改为实例级 ContextVar，多 tracer 不串扰、async 协程天然隔离（v1.0.2）|
+| 🗄 **持久化基础服务** | `SQLiteClient` 零依赖封装标准库 `sqlite3`（可选 `MySQLClient` / `ChromaClient`），提供连接管理、DDL / CRUD / 事务、三种声明式建表、幂等 migrate 补列、谓词下推（`select_where` / `select_one_where`）、`count` / `batch_insert` / `upsert`；统一异常体系（`DatabaseError` + 7 子类），标识符白名单 + 值参数化双重防注入 |
+| 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，默认 JSONL 一行一条落盘、可选 `SQLiteStore` 结构化后端，支持内存模式与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时（v1.0.1）；状态栈改为实例级 ContextVar，多 tracer 不串扰、async 协程天然隔离（v1.0.2）；新增 `SQLiteStore`，按文件后缀自动识别后端、幂等迁移、同 span_id 幂等覆盖（v1.1.0）|
 | 📦 **零重型依赖** | 记忆模块只用标准库（`sqlite3` / `json` / `pathlib`）；MCP 模块不用官方 SDK，只用标准库 + 可选 `requests`；Trace 模块零新增依赖（标准库 + pydantic） |
 
 ---
@@ -272,19 +278,25 @@ fast_agents/
 │   │   ├── compressor.py         #    ContextCompressor：三级压缩策略
 │   │   ├── builder.py            #    ContextBuilder：对 Agent 的门面
 │   │   └── tools.py              #    read_offloaded / list_files（文件读写编辑见 builtin/file_tool.py）
-│   ├── database/                 # ⑨ 持久化层（对齐 db 模块编写说明）
+│   ├── database/                 # ⑨ 持久化基础服务（database 模块编写说明）
 │   │   ├── __init__.py
-│   │   ├── database_client_base.py
-│   │   ├── schema.py
-│   │   ├── query.py
-│   │   └── sqlite_client.py
-│   ├── trace/                    # ⑩ TraceLogger 全链路记录（G1 · 默认 jsonl 落盘、可回放）
+│   │   ├── database_client_base.py   #    抽象基类：16 个抽象方法契约
+│   │   ├── sqlite_client.py          #    SQLiteClient：零依赖默认后端
+│   │   ├── mysql_client.py           #    MySQLClient：可选后端（接口 100% 对齐）
+│   │   ├── errors.py                 #    DatabaseError 基类 + 7 个语义子类
+│   │   ├── schema.py                 #    Column / ColumnType / Index / Schema
+│   │   ├── query.py                  #    Filter / FilterOp / Query / SortOrder
+│   │   ├── vector_client_base.py     #    VectorClientBase：向量后端抽象
+│   │   ├── vector_query.py           #    VectorFilter / VectorFilterOp
+│   │   └── chroma_client.py          #    ChromaClient：向量后端落地
+│   ├── trace/                    # ⑩ TraceLogger 全链路记录（G1 · jsonl/SQLite 落盘、可回放）
 │   │   ├── __init__.py
 │   │   ├── models.py             #    SpanRecord / SpanKind / SpanStatus
 │   │   ├── store_base.py         #    TraceStoreBase 抽象基类
 │   │   ├── jsonl_store.py        #    JsonlStore：jsonl 逐行落盘 + 内存模式
+│   │   ├── sqlite_store.py       #    SQLiteStore：结构化 SQLite 落盘（v1.1.0）
 │   │   └── trace_logger.py       #    TraceLogger 门面
-│   └── utils/                    # ⑪ 通用工具（当前为空占位）
+│   └── utils/                    # ⑪ 通用工具（time_utils.py 北京时间 CST 基准 / database_utils.py）
 ├── .skills/                      # 项目级技能目录（默认扫描位置）
 │   └── web-research/
 │       ├── SKILL.md
@@ -296,8 +308,9 @@ fast_agents/
 │   ├── context/                  # context 示例（离线可跑，不需要 API Key）
 │   ├── database/                 # database 示例（内存/临时库，不需要 API Key）
 │   ├── mcp/                      # MCP 示例（echo_server / quickstart / agent demo）
+│   ├── memory/                   # 记忆示例（会话落盘 / SQLite 长期记忆）
 │   ├── tools/                    # 工具示例（file_tools_demo.py）
-│   └── trace/                    # trace 示例（memory/jsonl 落盘 + 回放，离线可跑，不需要 API Key）
+│   └── trace/                    # trace 示例（jsonl / SQLite 落盘 + 回放，离线可跑，不需要 API Key）
 ├── test/                         # 测试与示例脚本
 ├── pyproject.toml
 ├── requirements.txt
@@ -305,7 +318,10 @@ fast_agents/
 ├── 第0步uv_安装.bat
 ├── 第1步uv_init.bat
 ├── 第2步uv_venv.bat
-└── 第3步uv_add.bat
+├── 第3步uv_add.bat
+├── 第4步uv_lock.bat
+├── 第5步uv_sync.bat
+└── 第5_1步uv_sync_all.bat
 ```
 
 > **命名提醒**：`fast_agents/skills/`（复数）是**技能系统的代码模块**；`.skills/`（带点、复数）是**项目级的技能包存放目录**。两者不是一回事。
@@ -1017,6 +1033,31 @@ for row in tracer.replay(tracer.read_spans()[0].trace_id):
 
 ---
 
+### 10. Database（持久化基础服务）
+
+`fast_agents/database/` 是**全框架共用的底层数据访问层**，零业务逻辑，只提供「连接 + DDL + CRUD + 事务 + 谓词下推 + 异常」原语。
+
+| 能力 | 说明 |
+|------|------|
+| 默认后端 | `SQLiteClient`——标准库 `sqlite3`（零依赖），非内存库默认 WAL + `foreign_keys=ON` |
+| 可选后端 | `MySQLClient`（需 `pymysql`）、`ChromaClient`（向量，需 `chromadb`）——延迟导入，未装驱动不影响其它后端 |
+| 建表 | 三种声明式写法：dict / `list[Column]` / `Schema`；`ensure_schema(migrate=True)` 幂等补列 |
+| 查询 | `insert` / `batch_insert` / `select` / `select_one` / `select_where` / `select_one_where` / `count` / `update` / `delete` / `upsert` + `with db:` 事务 |
+| 安全 | 标识符走正则白名单、值一律参数化（`?` / `%s`）防注入；异常统一为 `DatabaseError` 及 7 个子类 |
+
+```python
+from fast_agents.database import SQLiteClient
+
+db = SQLiteClient("app.db")
+db.create_table("users", [("id", "INTEGER PRIMARY KEY AUTOINCREMENT"), ("name", "TEXT NOT NULL")])
+db.insert("users", {"name": "Alice"})
+print(db.select("users"))            # [{'id': 1, 'name': 'Alice'}]
+```
+
+> 上层模块（memory 的 `sqlite_store.py` / `session_store.py` / `profile_store.py`、trace 的 `sqlite_store.py`）均已基于它落盘；完整说明见 [`docs/database模块编写说明.md`](./docs/database模块编写说明.md)。
+
+---
+
 ## 使用示例
 
 ### 示例 1：纯短期记忆
@@ -1174,6 +1215,8 @@ python test\test_memory.py
 python test\test_file_tool.py
 python test\test_context.py
 python test\test_mcp.py
+python test\test_database.py
+python test\test_trace.py
 ```
 
 > **不要**用 `python -m test.test_xxx`——`test` 是 Python 标准库模块名，会冲突。
@@ -1182,12 +1225,14 @@ python test\test_mcp.py
 
 | 测试文件 | 状态 | 说明 |
 |---------|------|------|
-| `test/test_react_agent.py` | ✅ 16/16 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
-| `test/test_tools.py` | ✅ 14/14 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表；`test_terminal` 在非 Windows 上自动跳过 |
-| `test/test_memory.py` | ✅ 23/23 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并 |
+| `test/test_react_agent.py` | ✅ 17/17 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
+| `test/test_tools.py` | ✅ 61/61 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
+| `test/test_memory.py` | ✅ 36/36 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B12 TTL 与到期回收 |
 | `test/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
 | `test/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
 | `test/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
+| `test/test_database.py` | ✅ 121 项（104 通过 + 17 跳过） | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系、向量后端；17 项向量端到端用例在未装 `chromadb` 时自动跳过（`test_database_mysql.py` 另有 18 项 MySQL 用例，需本地 MySQL） |
+| `test/test_trace.py` | ✅ 55/55 | Span 模型、TraceLogger、JsonlStore / SQLiteStore（写入读回 / 谓词过滤 / 跨 reopen 持久化 / 幂等迁移 / 流式遍历 / upsert 幂等）、LLM/Agent 打点、token 元数据、tool 真实耗时、查询与回放 |
 
 `test/demo.py` / `test/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
 
@@ -1232,9 +1277,10 @@ python test\test_mcp.py
 | 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；下一阶段「**记忆 v2**」：B8 时间统一为北京时间 CST 已落地、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
 | 🪟 **context** | ✅ 已实现（v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、embedding 召回扩展位 |
-| 🛠 **infra** | ⏳ 规划中 | `TraceLogger`、评估工具、异步、打包发布 |
+| 🗄 **database** | ✅ v1.1.0（关系型双后端 + 统一异常体系 + 向量后端） | 连接池 / 线程安全（J2）、Postgres 后端（J4 续）、多租户；memory / trace 后端已迁入（J3） |
+| 🛠 **infra / trace** | ✅ G1 已实现（TraceLogger v1.1.0，含 SQLiteStore）；其余 ⏳ 规划中 | 评估工具（G3）、异步并发（G2）、Web UI / 上报（G4）、打包发布（G5）、CI（G6） |
 
-**当前 P0 重点**：工具模块测试护栏（A15，回补 A8/A9/A10 的并发 / 审批 / 超时能力用例）。**当前 P1 重点**：并发 / 超时语义加固（A16）、RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）、TraceLogger（G1）——除新回补的 A15 外，原 P0 已全部清零。记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8 已落地，B9–B13 待推进）。
+**当前 P0 已清零**（A15 测试护栏、A16 并发语义加固均已归档）。**当前 P1 重点**：RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）；记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8、B9 已落地，B10–B13 待推进）。
 
 ---
 
@@ -1256,7 +1302,7 @@ python test\test_mcp.py
 
 - [Model Context Protocol](https://modelcontextprotocol.io) —— 协议规范（版本 `2024-11-05`）
 
-详细的实现说明（含架构图、逐文件讲解、避坑清单）见 `docs/` 下的六份模块编写说明（工具 / 记忆 / Skill / MCP / context / LLM）；
+详细的实现说明（含架构图、逐文件讲解、避坑清单）见 `docs/` 下的八份模块编写说明（LLM / 工具 / 记忆 / Skill / MCP / context / database / trace）；
 面向后续建设的分模块规划见 [`docs/演进路线图.md`](./docs/演进路线图.md)。
 
 ---
