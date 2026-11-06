@@ -1328,6 +1328,81 @@ def test_replay_uses_inner_most_active_trace_in_nested_context():
         t.close()
 
 
+# ==================== Bug3 幂等写入回归测试 ====================
+
+def test_end_span_is_idempotent_no_duplicate_records_jsonl():
+    """BUG3修复：同一Span重复调用end_span，JsonlStore只写1条，以第一次结果为准。"""
+    t = TraceLogger()
+    try:
+        s = t.start_span("test_span")
+        t.end_span(s, output="first_result", status=SpanStatus.SUCCESS)
+        # 第二次调用end_span，应该直接返回，不重复写入，也不覆盖第一次结果
+        t.end_span(s, output="second_result", status=SpanStatus.ERROR, error="duplicate call")
+        spans = t.read_spans()
+        assert len(spans) == 1
+        assert spans[0].output == "first_result"
+        assert spans[0].status == SpanStatus.SUCCESS
+        assert spans[0].error is None
+    finally:
+        t.close()
+
+
+def test_end_span_is_idempotent_no_duplicate_records_sqlite(tmpdir):
+    """BUG3修复：同一Span重复调用end_span，SQLiteStore只写1条，以第一次结果为准。"""
+    import os
+    path = os.path.join(tmpdir, "traces.db")
+    t = TraceLogger(path=path)
+    try:
+        s = t.start_span("test_span")
+        t.end_span(s, output="first_result", status=SpanStatus.SUCCESS)
+        # 第二次调用end_span，应该直接返回，不重复写入，也不覆盖第一次结果
+        t.end_span(s, output="second_result", status=SpanStatus.ERROR, error="duplicate call")
+        spans = t.read_spans()
+        assert len(spans) == 1
+        assert spans[0].output == "first_result"
+        assert spans[0].status == SpanStatus.SUCCESS
+        assert spans[0].error is None
+    finally:
+        t.close()
+
+
+def test_manual_end_span_in_context_normal_exit_does_not_duplicate():
+    """BUG3修复：with块内手动end_span后正常退出，不会产生重复记录。"""
+    t = TraceLogger()
+    try:
+        with t.span("test_span") as s:
+            s.output = "manual_end"
+            t.end_span(s)  # 块内手动结束
+        spans = t.read_spans()
+        assert len(spans) == 1
+        assert spans[0].output == "manual_end"
+        assert spans[0].status == SpanStatus.SUCCESS
+    finally:
+        t.close()
+
+
+def test_manual_end_span_in_context_exception_does_not_create_conflicting_records():
+    """BUG3修复：with块内手动end_span后抛异常，不会产生success+error两条矛盾记录，以第一次落库结果为准。"""
+    t = TraceLogger()
+    try:
+        try:
+            with t.span("test_span") as s:
+                s.output = "manual_success"
+                t.end_span(s)  # 手动标记成功
+                raise ValueError("block exception after manual end")
+        except ValueError:
+            pass
+        spans = t.read_spans()
+        # 只有1条记录，不会出现两条矛盾记录
+        assert len(spans) == 1
+        # 以第一次手动end的结果为准：success，output=manual_success
+        assert spans[0].output == "manual_success"
+        assert spans[0].status == SpanStatus.SUCCESS
+        assert spans[0].error is None
+    finally:
+        t.close()
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -1344,6 +1419,7 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
+    test_end_span_is_idempotent_no_duplicate_records_sqlite()
     pass
 
 

@@ -53,6 +53,9 @@ class SpanRecord(BaseModel):
     并补充 OpenTelemetry 风格的追踪链字段：``trace_id / span_id / parent_id / name / status``。
     """
 
+    # ---------- 内部幂等标记（不持久化） ----------
+    _persisted: bool = False
+
     # ---------- 追踪链 ----------
     trace_id: str = Field(..., description="整条链路的唯一 id，一次 run 内所有 Span 共享")
     span_id: str = Field(default_factory=_new_id, description="当前 Span 自身 id")
@@ -79,6 +82,8 @@ class SpanRecord(BaseModel):
     # ---------- 扩展 ----------
     metadata: Dict[str, Any] = Field(default_factory=dict, description="额外元数据，如模型名、token 用量")
 
+    model_config = {"arbitrary_types_allowed": True}
+
     # ---------- 便捷方法 ----------
     def finish(
         self,
@@ -97,9 +102,9 @@ class SpanRecord(BaseModel):
         """
         self.end_time = end_time if end_time is not None else _now_ts()
         self.duration_ms = (self.end_time - self.start_time) * 1000.0
-        self.output = output
+        self.output = output or self.output
         self.status = status
-        self.error = error
+        self.error = error or self.error
         if metadata:
             self.metadata.update(metadata)
 

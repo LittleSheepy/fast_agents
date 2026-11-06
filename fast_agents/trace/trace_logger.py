@@ -213,17 +213,36 @@ class TraceLogger:
 
         调用前可以手动修改 span.input/metadata；error 非空时自动置 status=ERROR。
         end_time 为可选精确结束时刻（秒），默认 None 时取当前时刻（行为不变）。
+
+        幂等保证：同一 Span 重复调用 end_span 会直接返回，不会重复写入存储，
+        也不会覆盖第一次落库时的结果。
         """
-        if not self.enabled:
+        if not self.enabled or span._persisted:
             return
+        # 仅当参数显式传入时才覆盖已有值，保留用户手动提前设置的字段
         if error is not None and status == SpanStatus.SUCCESS:
             status = SpanStatus.ERROR
-        span.finish(output=output, status=status, error=error, metadata=metadata, end_time=end_time)
+
+        if output is not None or span.output is None:
+            span.output = output
+        if status != SpanStatus.SUCCESS or span.status == SpanStatus.SUCCESS:
+            span.status = status
+        if error is not None or span.error is None:
+            span.error = error
+        if metadata:
+            span.metadata.update(metadata)
+        if span.end_time is None:
+            span.finish(output=span.output, status=span.status, error=span.error, metadata=None, end_time=end_time)
+        else:
+            # 已经 finish 过，不重新计算耗时
+            if metadata:
+                span.metadata.update(metadata)
         # 弹栈
         self._pop_span_if_top(span.span_id)
         # 写入 store（底层已保证异常不抛）
         try:
             self._store.write(span)
+            span._persisted = True
         except Exception:
             pass
 
@@ -244,17 +263,11 @@ class TraceLogger:
             self.end_span(s, output=None, error=f"{type(e).__name__}: {e}")
             raise
         else:
-            # 若调用方已手动 finish，则 end_time 已有值，这里直接写入
-            if s.end_time is None:
-                self.end_span(s, output=s.output, status=s.status, error=s.error, metadata=s.metadata)
-            else:
-                # 已经 finish 过，直接写
-                if self.enabled:
-                    try:
-                        self._store.write(s)
-                    except Exception:
-                        pass
-                self._pop_span_if_top(s.span_id)
+            # 若调用方已手动 finish，则 end_time 已有值，直接写入（end_span 会自动幂等）
+            self.end_span(s, output=s.output, status=s.status, error=s.error, metadata=s.metadata)
+        finally:
+            # 兜底弹栈：确保无论如何栈都正确弹出，避免父链错乱
+            self._pop_span_if_top(s.span_id)
 
     # ---------- 工具钩子（对齐 ToolRegistry.add_hook 签名） ----------
     def tool_hook(self, name: str, tool_args: dict, result: Any) -> None:
@@ -379,7 +392,7 @@ class TraceLogger:
                 # 无活跃trace时，自动找最近一条结束的root trace（parent_id为None的最新Span所属trace）
                 all_spans = self._store.read()
                 # 倒序找最近结束的根Span
-                all_spans.sort(key=lambda s: s.start_time, reverse=True)
+                all_spans.sort(key=lambda s: (s.start_time, s.span_id), reverse=True)
                 for s in all_spans:
                     if s.parent_id is None:
                         tid = s.trace_id
