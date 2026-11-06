@@ -111,9 +111,11 @@ python examples\trace\basic_usage.py
 
 ### 🔴 R9 —— 时间使用CST时间
 - 统一时间用 CST
-- 
+
 ### 🔴 R10 —— 使用最新代码
 - 每次回答一定要重新clone一次仓库。
+- 
+### 🔴 R11 —— 只考虑windows平台，不考虑跨平台。
 
 ---
 
