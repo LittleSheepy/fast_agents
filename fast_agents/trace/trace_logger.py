@@ -364,12 +364,26 @@ class TraceLogger:
     ) -> List[dict]:
         """回放一条 Trace 或一次会话，按时间顺序返回可打印的 dict 列表。
 
-        默认回放当前活跃 trace；若没有则返回空列表。
+        默认回放规则：
+        - 有活跃 trace 时，回放当前最内层活跃 trace（嵌套场景自动取当前正在运行的最内层）；
+        - 无活跃 trace 时，自动回放最近一次结束的 root trace（即最近一次完整运行）；
+        - 显式传入 trace_id / session_id 时按参数精确过滤。
         """
         tid = trace_id
-        if tid is None:
+        if tid is None and session_id is None:
             t_stack, _ = self._stacks()
-            tid = t_stack[0] if t_stack else None
+            if t_stack:
+                # 嵌套trace场景：取栈顶（当前最内层活跃trace_id），与 start_span 归属逻辑一致
+                tid = t_stack[-1]
+            else:
+                # 无活跃trace时，自动找最近一条结束的root trace（parent_id为None的最新Span所属trace）
+                all_spans = self._store.read()
+                # 倒序找最近结束的根Span
+                all_spans.sort(key=lambda s: s.start_time, reverse=True)
+                for s in all_spans:
+                    if s.parent_id is None:
+                        tid = s.trace_id
+                        break
         spans = self._store.read(session_id=session_id, trace_id=tid)
         spans.sort(key=lambda s: (s.start_time, s.span_id))
         return [

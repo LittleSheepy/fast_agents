@@ -941,6 +941,57 @@ def test_replay_returns_ordered_printable_list():
     t.close()
 
 
+def test_replay_defaults_to_latest_trace_when_no_active():
+    """修复BUG2-1：无活跃trace且未指定trace_id时，replay默认回放最近一条结束的trace，
+    既不返回全量所有Span，也不返回空列表（对齐"回放最近一次运行"的用户直觉）。"""
+    t = TraceLogger()
+    # 先写第一条trace
+    with t.trace("trace-a"):
+        with t.span("a", SpanKind.CUSTOM):
+            pass
+    import time
+    time.sleep(0.001)
+    # 再写第二条更新的trace
+    with t.trace("trace-b"):
+        with t.span("b1", SpanKind.CUSTOM):
+            pass
+        with t.span("b2", SpanKind.CUSTOM):
+            pass
+    # 此时无活跃trace，replay()应只返回最新的trace-b（2条），不是全量（3条）也不是空
+    rep = t.replay()
+    assert len(rep) == 2, f"默认应回放最近一条trace，实际返回{len(rep)}条（期望2，全量应为3）"
+    assert {item["name"] for item in rep} == {"b1", "b2"}
+    # 显式指定trace_id仍能正常回放老trace
+    span_a = [s for s in t.read_spans() if s.name == "a"][0]
+    rep_explicit = t.replay(trace_id=span_a.trace_id)
+    assert len(rep_explicit) == 1
+    assert rep_explicit[0]["name"] == "a"
+    # 指定session_id也能正常回放
+    rep_session = t.replay(session_id=t.session_id)
+    assert len(rep_session) == 3  # 会话维度回放所有3条
+    t.close()
+
+
+def test_replay_uses_inner_most_active_trace_in_nested_context():
+    """修复BUG2-2：嵌套trace时，replay取栈顶（当前最内层活跃trace），而非最外层。"""
+    t = TraceLogger()
+    # 先开outer trace
+    with t.trace("outer-trace"):
+        with t.span("outer-span"):
+            pass
+        # 在outer内部开inner嵌套trace
+        with t.trace("inner-trace"):
+            with t.span("inner-span"):
+                pass
+            # 当前活跃的是inner-trace，replay默认应只回放inner（1条），不是outer（1条）也不是全量（2条）
+            rep = t.replay()
+            inner_spans = t.read_spans(trace_id=[s.trace_id for s in t.read_spans() if s.name == "inner-span"][0])
+            assert len(inner_spans) == 1
+            assert len(rep) == 1, f"嵌套场景应只回放最内层活跃trace，实际返回{len(rep)}条"
+            assert rep[0]["name"] == "inner-span"
+    t.close()
+
+
 # ==================== 自定义存储后端（预留位验证）====================
 def test_custom_store_can_be_injected():
     """用户可以实现 TraceStoreBase 子类并注入 TraceLogger，预留 SQLite/远端扩展位。"""
@@ -1235,6 +1286,44 @@ def test_tracer_explicit_store_takes_precedence():
     try:
         assert t.store is mem_jsonl
         assert not isinstance(t.store, SQLiteStore)
+    finally:
+        t.close()
+
+
+def test_replay_defaults_to_latest_trace_when_no_active():
+    """BUG2修复：无活跃trace时，默认回放最近一次结束的root trace，不返回全量也不返回空。"""
+    t = TraceLogger()
+    try:
+        # 第一条trace
+        with t.trace("first"):
+            with t.span("first_span") as s:
+                s.output = 1
+        # 第二条trace（最新）
+        with t.trace("second"):
+            with t.span("second_span") as s:
+                s.output = 2
+        # 现在无活跃trace，replay()应该默认返回最新的第二条trace
+        replay = t.replay()
+        assert len(replay) == 1
+        assert replay[0]["name"] == "second_span"
+    finally:
+        t.close()
+
+
+def test_replay_uses_inner_most_active_trace_in_nested_context():
+    """BUG2修复：嵌套trace场景下，replay()默认取当前最内层活跃trace，不会错取外层。"""
+    t = TraceLogger()
+    try:
+        with t.trace("outer"):
+            with t.span("outer_span") as s1:
+                s1.output = "outer"
+                with t.trace("inner"):
+                    with t.span("inner_span") as s2:
+                        s2.output = "inner"
+                    # 此时活跃trace是内层inner，replay()应只返回inner的span，不会返回outer的
+                    replay = t.replay()
+                    assert len(replay) == 1
+                    assert replay[0]["name"] == "inner_span"
     finally:
         t.close()
 
