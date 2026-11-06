@@ -4,7 +4,7 @@
 - 同时支持**本地持久化目录**（单机开发）和**远端 Chroma Server**（生产部署）；
 - 可选依赖：核心依赖里**不包含** chromadb，使用前需 ``pip install fast-agents[chroma]``
   （等价于 ``pip install chromadb>=0.4,<1.0``）；未安装时构造 ChromaClient 会抛清晰的
-  ImportError 提示；
+  DatabaseDriverMissingError 提示；
 - 与 SQLiteClient 风格对齐：集合名白名单校验、空条件删除拦截、所有对外返回统一
   为 ``list[dict]``（不向外泄露 Chroma SDK 的 dict-of-lists 原始结构）。
 
@@ -38,6 +38,13 @@ import re
 import threading
 from typing import Any, Sequence
 
+from .errors import (
+    DatabaseDriverMissingError,
+    DatabaseIdentifierError,
+    DatabaseIntegrityError,
+    DatabaseQueryError,
+    DatabaseValidationError,
+)
 from .vector_client_base import VectorClientBase
 from .vector_query import VectorFilter, VectorFilterOp, VectorWhere
 
@@ -63,7 +70,7 @@ def _check_collection_name(name: str, label: str = "集合名") -> None:
     if not isinstance(name, str):
         raise TypeError(f"{label}必须是字符串，收到 {type(name)}")
     if not _COLLECTION_NAME_RE.match(name):
-        raise ValueError(
+        raise DatabaseIdentifierError(
             f"非法{label}: {name!r}；需 3-63 字符、字母开头，只允许字母/数字/下划线/连字符"
         )
 
@@ -73,7 +80,7 @@ def _check_dimension(dimension: int | None) -> None:
     if dimension is None:
         return
     if not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0:
-        raise ValueError(f"dimension 必须是正整数，收到 {dimension!r}")
+        raise DatabaseValidationError(f"dimension 必须是正整数，收到 {dimension!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -95,14 +102,14 @@ def _compile_vector_filter(f: VectorFilter | dict[str, Any]) -> dict[str, Any]:
 
     if f.op in (VectorFilterOp.AND, VectorFilterOp.OR):
         if not f.filters or len(f.filters) < 2:
-            raise ValueError(f"{f.op.value} 组合至少需要 2 个子条件")
+            raise DatabaseValidationError(f"{f.op.value} 组合至少需要 2 个子条件")
         return {f.op.value: [_compile_vector_filter(sub) for sub in f.filters]}
 
     # 叶子条件
     if not f.field:
-        raise ValueError(f"叶子条件 {f.op.value} 需要 field")
+        raise DatabaseValidationError(f"叶子条件 {f.op.value} 需要 field")
     if f.value is None and f.op not in (VectorFilterOp.EQ, VectorFilterOp.NE):
-        raise ValueError(f"{f.op.value} 条件需要 value")
+        raise DatabaseValidationError(f"{f.op.value} 条件需要 value")
     return {f.field: {f.op.value: f.value}}
 
 
@@ -136,8 +143,12 @@ class ChromaClient(VectorClientBase):
         add_chunk_size: ``add`` 单批 upsert 的条数上限，默认 1000；<=0 表示不分块。
 
     Raises:
-        ImportError: 未安装 chromadb 依赖时。
-        ValueError: path 与 host 同时传或都不传、集合名非法、空条件删除等。
+        DatabaseDriverMissingError: 未安装 chromadb 依赖时。
+        DatabaseIdentifierError: 集合名非法时。
+        DatabaseValidationError: path 与 host 同时传或都不传、维度 / ids / limit 等入参非法时。
+        DatabaseQueryError: 集合不存在、创建或写入失败时。
+        DatabaseIntegrityError: create_collection 时集合已存在。
+        （以上异常均继承 DatabaseError，而 DatabaseError 继承 ValueError，兼容原 ``except ValueError`` 写法。）
     """
 
     def __init__(
@@ -157,14 +168,14 @@ class ChromaClient(VectorClientBase):
         try:
             import chromadb  # type: ignore
         except ImportError as e:
-            raise ImportError(
+            raise DatabaseDriverMissingError(
                 "使用 ChromaClient 需要先安装 chromadb 可选依赖：\n"
                 "    pip install fast-agents[chroma]\n"
                 "或直接：pip install chromadb>=0.4,<1.0"
             ) from e
 
         if (path is None) == (host is None):
-            raise ValueError("ChromaClient 必须在 path（本地）与 host（远端）中二选一")
+            raise DatabaseValidationError("ChromaClient 必须在 path（本地）与 host（远端）中二选一")
 
         self._path = path
         self._host = host
@@ -261,12 +272,12 @@ class ChromaClient(VectorClientBase):
             col = self._client.get_collection(name)
         except Exception as e:
             # Chroma 不同版本抛的异常类型不一致，统一用 ValueError
-            raise ValueError(f"集合 {name!r} 不存在") from e
+            raise DatabaseQueryError(f"集合 {name!r} 不存在") from e
         return self._cache_collection(name, col)
 
     def _metric_to_metadata(self, metric: str) -> dict[str, Any]:
         if metric not in _VALID_METRICS:
-            raise ValueError(f"非法 metric: {metric!r}；只支持 {sorted(_VALID_METRICS)}")
+            raise DatabaseValidationError(f"非法 metric: {metric!r}；只支持 {sorted(_VALID_METRICS)}")
         return {"hnsw:space": metric}
 
     # ---------- 集合管理 ----------
@@ -302,10 +313,10 @@ class ChromaClient(VectorClientBase):
         except Exception as e:
             text = f"{type(e).__name__} {e}".lower()
             if "uniqueconstraint" in text or "already exists" in text:
-                raise ValueError(
+                raise DatabaseIntegrityError(
                     f"集合 {name!r} 已存在（如需幂等请用 get_or_create_collection）"
                 ) from e
-            raise ValueError(f"创建集合 {name!r} 失败：{e}") from e
+            raise DatabaseQueryError(f"创建集合 {name!r} 失败：{e}") from e
         self._cache_collection(name, col)
         if dimension is not None:
             self._dimensions[name] = dimension
@@ -355,13 +366,13 @@ class ChromaClient(VectorClientBase):
         metadatas: list[dict[str, Any]] | None = None,
     ) -> int:
         if not ids:
-            raise ValueError("add 的 ids 不能为空")
+            raise DatabaseValidationError("add 的 ids 不能为空")
         if embeddings is None and documents is None and metadatas is None:
-            raise ValueError("add 的 embeddings / documents / metadatas 至少要有一个")
+            raise DatabaseValidationError("add 的 embeddings / documents / metadatas 至少要有一个")
         if len(set(ids)) != len(ids):
             # Chroma 内部会抛 DuplicateIDError，这里提前拦下并给一致的中文错误
             dup = sorted({i for i in ids if ids.count(i) > 1})
-            raise ValueError(f"add 的 ids 存在重复：{dup}")
+            raise DatabaseValidationError(f"add 的 ids 存在重复：{dup}")
         n = len(ids)
         for field, lst in (
             ("embeddings", embeddings),
@@ -369,7 +380,7 @@ class ChromaClient(VectorClientBase):
             ("metadatas", metadatas),
         ):
             if lst is not None and len(lst) != n:
-                raise ValueError(f"{field} 长度({len(lst)}) 与 ids 长度({n}) 不一致")
+                raise DatabaseValidationError(f"{field} 长度({len(lst)}) 与 ids 长度({n}) 不一致")
 
         # 先拿到集合（顺带从 metadata 读回已声明维度）
         col = self._get_collection(collection)
@@ -377,14 +388,14 @@ class ChromaClient(VectorClientBase):
         if embeddings is not None:
             dims = {len(e) for e in embeddings}
             if len(dims) > 1:
-                raise ValueError(f"同一批 embeddings 维度不一致：{sorted(dims)}")
+                raise DatabaseValidationError(f"同一批 embeddings 维度不一致：{sorted(dims)}")
             dim = next(iter(dims))
             declared = self._dimensions.get(collection)
             if declared is None:
                 # 未声明维度的集合：以首次写入的维度为准并记住
                 self._dimensions[collection] = dim
             elif dim != declared:
-                raise ValueError(
+                raise DatabaseValidationError(
                     f"embedding 维度({dim}) 与集合 {collection!r} 声明的维度({declared}) 不一致"
                 )
 
@@ -427,7 +438,7 @@ class ChromaClient(VectorClientBase):
             # 兜底把维度类错误翻译成 clearer 的中文提示（Chroma 空集合不校验维度，
             # 但集合内已有向量时维度不符会抛 InvalidDimensionException）
             if "dimension" in str(e).lower():
-                raise ValueError(f"写入集合 {collection!r} 失败：{e}") from e
+                raise DatabaseQueryError(f"写入集合 {collection!r} 失败：{e}") from e
             raise
 
     # ---------- 删除 ----------
@@ -439,7 +450,7 @@ class ChromaClient(VectorClientBase):
     ) -> int:
         if not ids and where is None:
             # 安全约定：禁止空条件删全量
-            raise ValueError("delete 的 ids 和 where 不能同时为空（防止误删全量）")
+            raise DatabaseValidationError("delete 的 ids 和 where 不能同时为空（防止误删全量）")
         col = self._get_collection(collection)
 
         # 语义固定：传了 ids 就按 id 删；否则按 where 删（不依赖 Chroma 未文档化的混用行为）
@@ -467,7 +478,7 @@ class ChromaClient(VectorClientBase):
         include_metadatas: bool = True,
     ) -> list[dict[str, Any]]:
         if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
-            raise ValueError(f"limit 必须是正整数，收到 {limit!r}")
+            raise DatabaseValidationError(f"limit 必须是正整数，收到 {limit!r}")
         col = self._get_collection(collection)
         where_dict = _compile_where(where)
         includes: list[str] = []
@@ -503,13 +514,13 @@ class ChromaClient(VectorClientBase):
         include_embeddings: bool = False,
     ) -> list[dict[str, Any]]:
         if not isinstance(query_embedding, (list, tuple)) or len(query_embedding) == 0:
-            raise ValueError("query_embedding 必须是非空向量 list[float]")
+            raise DatabaseValidationError("query_embedding 必须是非空向量 list[float]")
         if not isinstance(n_results, int) or isinstance(n_results, bool) or n_results <= 0:
-            raise ValueError(f"n_results 必须是正整数，收到 {n_results!r}")
+            raise DatabaseValidationError(f"n_results 必须是正整数，收到 {n_results!r}")
         col = self._get_collection(collection)
         declared = self._dimensions.get(collection)
         if declared is not None and len(query_embedding) != declared:
-            raise ValueError(
+            raise DatabaseValidationError(
                 f"query_embedding 维度({len(query_embedding)}) 与集合 {collection!r} "
                 f"声明的维度({declared}) 不一致"
             )
