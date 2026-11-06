@@ -639,7 +639,7 @@ def test_manager_compact_and_retrieve_touch():
             def merge_similar(self, **kw):
                 raise RuntimeError("boom")
 
-        assert MemoryManager(long_term_store=_Boom()).compact() == {"archived": 0, "merged": 0}
+        assert MemoryManager(long_term_store=_Boom()).compact() == {"archived": 0, "merged": 0, "expired": 0}
         mgr.close()
     print("✅ test_manager_compact_and_retrieve_touch 通过（B5 维护入口）")
 
@@ -974,6 +974,189 @@ def test_b11_manager_revise_forward():
     print("✅ test_b11_manager_revise_forward 通过（B11 Manager.revise()：转发底层、旧版本留痕、空内容/不存在ID校验正常）")
 
 
+# ===================== B12 / v1.8.1：记忆 TTL 与到期清理 =====================
+
+def test_b12_ttl_retrieve_filter():
+    """B12① 检索路径过滤：expires_at 已过期的 active 记忆不应被 retrieve 返回，
+    但 all(include_inactive=True) 仍可查到（软删/留痕，未到 compact 时间也拦得住）"""
+    from fast_agents.utils.time_utils import cstnow
+    mgr = MemoryManager(long_term_store=InMemoryStore(), user_id="u1", session_id="s1")
+
+    # 永不过期的偏好一条（偏好类无条件召回，最能证明过滤后正常项仍能召回）
+    forever = mgr.remember("永久偏好：用户偏好中文回答", kind="preference", importance=0.9)
+
+    # 已过期的一条：直接构造 expires_at 在过去
+    expired_rec = mgr.long_term.add(MemoryRecord(
+        user_id="u1", session_id="s1", content="临时安排：明天下午3点开PR评审会",
+        kind="episode", source="manual", importance=0.9,
+        expires_at=cstnow() - timedelta(seconds=1),
+    ))
+
+    # retrieve 不该召回到期项；永久偏好正常召回
+    hits = mgr.retrieve("明天下午3点", limit=5)
+    assert not any(h.memory_id == expired_rec.memory_id for h in hits), \
+        "已过期的记忆不应被检索召回"
+    assert any(h.memory_id == forever.memory_id for h in hits), "永久偏好应正常召回"
+
+    # 底层 all()（仅 active）仍能看到它（因为还没跑 compact 清理状态）——证明过滤发生在检索路径，
+    # 而不是靠「提前改状态」
+    all_active = mgr.long_term.all(include_inactive=False)
+    assert any(r.memory_id == expired_rec.memory_id for r in all_active), \
+        "compact 前该条仍是 active，all() 应可见（验证过滤发生在 search 路径）"
+
+    # all(include_inactive=True) 当然也能看到——证明数据没被物理删除
+    assert any(r.memory_id == expired_rec.memory_id for r in mgr.long_term.all(include_inactive=True))
+    print("✅ test_b12_ttl_retrieve_filter 通过（B12 检索路径过滤：过期项不召回、不物理删）")
+
+
+def test_b12_compact_purge_expired():
+    """B12② compact 到期清理：expired 统计、状态转 retracted、metadata.expired_at 留痕、未到期项不变"""
+    from fast_agents.utils.time_utils import cstnow
+    mgr = MemoryManager(long_term_store=InMemoryStore(), user_id="u1", session_id="s1")
+
+    # expires_at 在过去 → 应被清理
+    gone = mgr.long_term.add(MemoryRecord(
+        user_id="u1", session_id="s1", content="临时：本周三之前用方案X",
+        kind="episode", source="manual", importance=0.7,
+        expires_at=cstnow() - timedelta(hours=1),
+    ))
+    # expires_at 在未来 → 不动
+    alive = mgr.long_term.add(MemoryRecord(
+        user_id="u1", session_id="s1", content="长期：用户用 macOS 开发",
+        kind="fact", source="manual", importance=0.8,
+        expires_at=cstnow() + timedelta(days=30),
+    ))
+    # 永不过期 → 不动
+    forever = mgr.remember("永久：用户偏好中文回答", kind="preference", importance=0.9)
+
+    report = mgr.compact()
+    assert report["expired"] == 1, report
+    assert report["archived"] == 0 and report["merged"] == 0
+
+    gone_reloaded = mgr.long_term.get(gone.memory_id)
+    assert gone_reloaded.status == "retracted", f"到期应转 retracted，实际 {gone_reloaded.status}"
+    assert "expired_at" in gone_reloaded.metadata, "metadata 应留 expired_at 时间戳"
+
+    assert mgr.long_term.get(alive.memory_id).status == "active"
+    assert mgr.long_term.get(forever.memory_id).status == "active"
+
+    # 幂等：再跑一次 compact 不应重复计数
+    report2 = mgr.compact()
+    assert report2["expired"] == 0, "purge_expired 必须幂等，重复跑不应重复清理"
+    print("✅ test_b12_compact_purge_expired 通过（B12 到期清理：retracted + 留痕 + 幂等）")
+
+
+def test_b12_expires_at_sqlite_persistence():
+    """B12③ SQLite 落库：expires_at 往返一致带 +08:00；老库自动补列；_update 后字段不丢；
+    manager.remember(ttl=...) 能正确换算成 expires_at"""
+    import sqlite3
+    from fast_agents.utils.time_utils import cstnow
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "mem.db")
+        store = SQLiteMemoryStore(path, user_id="u1", session_id="s1")
+
+        # 直接写一条 expires_at 在未来
+        future_expire = cstnow() + timedelta(hours=24)
+        rec = store.add(MemoryRecord(
+            content="24小时后过期的临时事项", kind="episode", source="t",
+            expires_at=future_expire,
+        ))
+        got = store.get(rec.memory_id)
+        assert got.expires_at is not None
+        assert got.expires_at.utcoffset() == timedelta(hours=8), "expires_at 应带 +08:00"
+        # 比较到秒（isoformat 转回来可能丢微秒，不影响语义）
+        assert abs((got.expires_at - future_expire).total_seconds()) < 2
+
+        # 物理层字符串带 +08:00
+        con = sqlite3.connect(path)
+        raw_exp = con.execute(
+            "SELECT expires_at FROM memories WHERE memory_id = ?",
+            (rec.memory_id,),
+        ).fetchone()[0]
+        con.close()
+        assert "+08:00" in raw_exp, raw_exp
+
+        # update 后 expires_at 不丢（验证 update_where 里已正确回写该列）
+        rec.importance = 0.95
+        store.update(rec)
+        assert store.get(rec.memory_id).expires_at is not None
+        assert abs((store.get(rec.memory_id).expires_at - future_expire).total_seconds()) < 2
+
+        # 通过 manager.remember(ttl=...) 写入：expires_at ≈ now + ttl
+        mgr = MemoryManager(long_term_store=store, user_id="u1", session_id="s1")
+        r = mgr.remember("ttl 写入：1小时内有效", kind="fact", importance=0.6,
+                         ttl=timedelta(hours=1))
+        loaded = store.get(r.memory_id)
+        assert loaded.expires_at is not None
+        delta = loaded.expires_at - cstnow()
+        assert timedelta(minutes=55) <= delta <= timedelta(minutes=65), \
+            f"ttl=1h 写入后 expires_at 应在 ~1h 后，实际差 {delta}"
+
+        # 老库自动补列：用同一个 db 文件重新打开，没有「no such column: expires_at」
+        store2 = SQLiteMemoryStore(path, user_id="u1", session_id="s1")
+        # 永不过期的 None 不被误写成字符串 / 0
+        no_ttl = store2.add(MemoryRecord(content="永不过期", kind="fact", source="t"))
+        assert store2.get(no_ttl.memory_id).expires_at is None
+        store2.close()
+        store.close()
+        mgr.close()
+    print("✅ test_b12_expires_at_sqlite_persistence 通过（B12 SQLite 落库往返 / +08:00 / 迁移 / update 不丢 / ttl 换算）")
+
+
+def test_b12_no_ttl_behavior_unchanged():
+    """B12④ 向后兼容：不传 ttl 时 expires_at 为 None，检索与 compact 行为与改造前完全一致；
+    同时验证 SemanticMemoryStore / ChromaMemoryStore 包装器也在 search 路径上过滤到期项。"""
+    from fast_agents.utils.time_utils import cstnow
+
+    # 1. 不传 ttl → expires_at=None，不影响检索
+    mgr = MemoryManager(long_term_store=InMemoryStore())
+    r = mgr.remember("用户喜欢中文回答", kind="preference", importance=0.9)
+    assert mgr.long_term.get(r.memory_id).expires_at is None
+    hits = mgr.retrieve("随便一个问题")
+    assert any(h.memory_id == r.memory_id for h in hits)
+
+    # 2. 无过期项时 compact 的 expired 为 0；archived/merged 口径不变
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "mem.db")
+        mgr2 = MemoryManager(long_term_store=SQLiteMemoryStore(path, user_id="u1"),
+                             user_id="u1")
+        mgr2.remember("一条普通永久事实", kind="fact", importance=0.6)
+        rep = mgr2.compact()
+        assert rep == {"archived": 0, "merged": 0, "expired": 0}, rep
+        mgr2.close()
+
+    # 3. 包装器（Semantic / Chroma）的 search 也必须在 rank 前过滤到期项
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.db")
+        inner = SQLiteMemoryStore(db, user_id="u1")
+        expired_id = inner.add(MemoryRecord(
+            user_id="u1", session_id="s", content="临时事项：已过期的提醒",
+            source="t", kind="fact", importance=0.7,
+            expires_at=cstnow() - timedelta(seconds=1),
+        )).memory_id
+        inner.add(MemoryRecord(
+            user_id="u1", session_id="s", content="长期事实：Python 解释执行",
+            source="t", kind="fact", importance=0.8,
+        ))
+
+        sem = SemanticMemoryStore(SQLiteMemoryStore(db, user_id="u1"), _SemanticFakeLLM())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sem_hits = sem.search("临时提醒", limit=5)
+        assert not any(h.memory_id == expired_id for h in sem_hits), \
+            "SemanticMemoryStore search 应过滤到期项"
+
+        ch = ChromaMemoryStore(SQLiteMemoryStore(db, user_id="u1"), _FakeLLMNoEmbedding())
+        ch_hits = ch.search("临时提醒", limit=5)
+        assert not any(h.memory_id == expired_id for h in ch_hits), \
+            "ChromaMemoryStore search 应过滤到期项"
+        ch.close()
+        sem.close()
+        inner.close()
+    print("✅ test_b12_no_ttl_behavior_unchanged 通过（B12 向后兼容 + 两包装器 search 过滤一致）")
+
+
 if __name__ == "__main__":
     test_buffer_sliding_window()
     test_buffer_summary()
@@ -1007,4 +1190,8 @@ if __name__ == "__main__":
     test_touch_scope_isolation_in()
     test_session_store_persistence()
     test_b8_time_is_cst()
+    test_b12_ttl_retrieve_filter()
+    test_b12_compact_purge_expired()
+    test_b12_expires_at_sqlite_persistence()
+    test_b12_no_ttl_behavior_unchanged()
     print("\n🎉 全部测试通过")

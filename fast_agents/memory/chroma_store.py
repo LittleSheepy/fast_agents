@@ -282,6 +282,8 @@ class ChromaMemoryStore(MemoryStoreBase):
         # 阶段 2：chroma_ids 非空，这里做一次 id 集合合流去重
         chroma_ids = self._query_chroma(q_vec, top_k=limit * self._CHROMA_TOP_K_MULTIPLIER)
         records = self.inner.all(include_inactive=False)
+        # B12：rank 之前先过滤已到期的 active 记忆
+        records = [r for r in records if not r.is_expired()]
         if chroma_ids:
             # 让 chroma 召回的 id 与 inner 全量合并（inner 兜底避免漏掉偏好/最近条目）
             id_order = list(chroma_ids)

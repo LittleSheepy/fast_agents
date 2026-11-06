@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from fast_agents.utils.time_utils import cstnow
+from fast_agents.utils.time_utils import cstnow, to_cst
 
 # 记忆类型：与 HelloAgents 的 MemoryStore.KINDS 对齐
 # preference  偏好（用户喜好、习惯）
@@ -49,7 +49,20 @@ class MemoryRecord(BaseModel):
     supersedes: Optional[str] = None
     access_count: int = 0
     last_accessed_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    def is_expired(self, now: Optional[datetime] = None) -> bool:
+        """判断记忆是否已过期（B12）。
+
+        - expires_at 为 None（永不过期）恒返回 False；
+        - 否则按 CST 比较 now >= expires_at；now 缺省取 cstnow()；
+        - 只判断时间，不看 status——调用方按需过滤（purge_expired 只对 active 处理）。
+        """
+        if self.expires_at is None:
+            return False
+        moment = to_cst(now) if now is not None else cstnow()
+        return moment >= to_cst(self.expires_at)
 
     def to_dict(self) -> Dict[str, Any]:
         data = self.model_dump()
@@ -57,6 +70,9 @@ class MemoryRecord(BaseModel):
         data["updated_at"] = self.updated_at.isoformat()
         data["last_accessed_at"] = (
             self.last_accessed_at.isoformat() if self.last_accessed_at else None
+        )
+        data["expires_at"] = (
+            self.expires_at.isoformat() if self.expires_at else None
         )
         return data
 

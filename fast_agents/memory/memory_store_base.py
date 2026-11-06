@@ -77,8 +77,13 @@ class MemoryStoreBase(ABC):
         v1.3.0（B7）起默认实现在 Base：通过 all() 拉回记录，再用
         scoring.rank_records 走统一打分公式与排序。子类若要做数据库侧
         排序 / 向量检索 / 索引过滤，可直接覆盖本方法。
+
+        v1.8.1（B12）起在 rank 之前先过滤掉已到期的活跃记忆——到期记录已被
+        purge_expired 标记为 retracted，但两次 compact() 之间仍可能以 active
+        状态存在，必须在检索路径上再挡一道，避免偏好类强制召回漏过滤。
         """
-        return rank_records(query, self.all(), limit, include_preferences=include_preferences)
+        candidates = [r for r in self.all() if not r.is_expired()]
+        return rank_records(query, candidates, limit, include_preferences=include_preferences)
 
     def touch(self, memory_ids: Iterable[str]) -> int:
         """记录一次「命中」：自增 access_count、刷新 last_accessed_at
@@ -139,6 +144,36 @@ class MemoryStoreBase(ABC):
             self.update(record)
             archived.append(record)
         return archived
+
+    def purge_expired(self, *, now: Optional[datetime] = None) -> List[MemoryRecord]:
+        """把已到期的记忆批量软删（status → retracted）（B12）
+
+        与 archive_stale 的区别：
+        - archive_stale 判定依据是「低重要度 + 久未命中」（被动衰减）；
+        - purge_expired 判定依据是「expires_at <= now」（写入时约定的硬过期时刻），
+          与 importance / access_count 无关——重要度 0.9 的「明早 9 点提交 PR」
+          过了 9 点就该退出检索，不能等 90 天衰减。
+
+        行为约定：
+        - 只处理 status == 'active' 的记录（幂等，重复调用无副作用）；
+        - 到期 = 改 status 为 'retracted'（不是 archived），与 retract() 路径一致，
+          物理删除只有显式 delete()；
+        - 在 metadata["expired_at"] 记下触发时间，保留审计链；
+        - 返回被清理的记录列表。
+
+        注：本方法不负责清理向量（memory_embeddings / chroma）——主记录转 retracted
+        后 search() 不会再召回，占位可接受；若要彻底干净可由包装器在调用后补充。
+        """
+        moment = to_cst(now) or cstnow()
+        purged: List[MemoryRecord] = []
+        for record in self.all():
+            if not record.is_expired(now=moment):
+                continue
+            record.status = "retracted"
+            record.metadata["expired_at"] = moment.isoformat()
+            self.update(record)
+            purged.append(record)
+        return purged
 
     def merge_similar(
         self, *, threshold: float = 0.85, max_records: int = 500

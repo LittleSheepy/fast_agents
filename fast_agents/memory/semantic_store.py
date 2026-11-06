@@ -294,6 +294,8 @@ class SemanticMemoryStore(MemoryStoreBase):
             return self.inner.search(query, limit, include_preferences=include_preferences)
 
         records = self.inner.all(include_inactive=False)
+        # B12：rank 之前过滤已到期的 active 记忆，和基类 search 保持一致
+        records = [r for r in records if not r.is_expired()]
 
         def semantic_getter(r: MemoryRecord) -> Optional[float]:
             vec = self._load_vec(r)

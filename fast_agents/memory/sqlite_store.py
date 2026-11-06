@@ -73,6 +73,8 @@ class SQLiteMemoryStore(MemoryStoreBase):
             # B5 新增列：新库直接建，老库 ensure_schema(migrate=True) 自动补
             Column(name="access_count",     type=ColumnType.INTEGER, nullable=False, default=0),
             Column(name="last_accessed_at", type=ColumnType.TIMESTAMP),
+            # B12 新增：可选有效期；新库直接建，老库 ensure_schema(migrate=True) 自动补
+            Column(name="expires_at",       type=ColumnType.TIMESTAMP),
             Column(name="metadata",         type=ColumnType.TEXT, nullable=False),
         ],
         indexes=[
@@ -181,6 +183,10 @@ class SQLiteMemoryStore(MemoryStoreBase):
                 to_cst(datetime.fromisoformat(row["last_accessed_at"]))
                 if row["last_accessed_at"] else None
             ),
+            expires_at=(
+                to_cst(datetime.fromisoformat(row["expires_at"]))
+                if row.get("expires_at") else None
+            ),
             metadata=json.loads(row["metadata"] or "{}"),
         )
 
@@ -201,6 +207,7 @@ class SQLiteMemoryStore(MemoryStoreBase):
             "supersedes":  r.supersedes,
             "access_count":     r.access_count,
             "last_accessed_at": to_cst_iso(r.last_accessed_at),
+            "expires_at":       to_cst_iso(r.expires_at),
             "metadata":    json.dumps(r.metadata, ensure_ascii=False),
         }
 
@@ -289,6 +296,7 @@ class SQLiteMemoryStore(MemoryStoreBase):
                 "updated_at":       record.updated_at.isoformat(),
                 "access_count":     record.access_count,
                 "last_accessed_at": record.last_accessed_at.isoformat() if record.last_accessed_at else None,
+                "expires_at":       record.expires_at.isoformat() if record.expires_at else None,
                 "metadata":         json.dumps(record.metadata, ensure_ascii=False),
             },
             Query(

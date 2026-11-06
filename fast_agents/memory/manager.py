@@ -17,9 +17,10 @@ Agent 侧不需要知道底下是 SQLite 还是内存。
 from typing import Any, Dict, List, Optional
 
 import json
+from datetime import timedelta
 
 from ..messages.message import Message
-from fast_agents.utils.time_utils import to_cst
+from fast_agents.utils.time_utils import cstnow, to_cst
 from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory, DEFAULT_SUMMARY_PROMPT
 from .in_memory_store import InMemoryStore
@@ -179,13 +180,26 @@ class MemoryManager:
     def remember(
         self, content: str, *, kind: MemoryKind = "fact",
         source: str = "user_stated", importance: float = 0.5,
+        ttl: Optional[timedelta] = None,
     ) -> MemoryRecord:
-        """手动写入一条长期记忆"""
+        """手动写入一条长期记忆
+
+        Args:
+            content: 记忆正文
+            kind: 记忆类型（preference / fact / episode / procedure / inference）
+            source: 来源标记
+            importance: 重要度 0~1
+            ttl: 可选有效期（相对当前时间）；到期后该条记忆会被 compact() 清理（status→retracted），
+                且在清理之前就不会被检索返回。None 表示永不过期（默认，向后兼容）。
+                典型用法：`ttl=timedelta(hours=24)` 表示「这条只在 24 小时内有效」。
+        """
         if not content or not content.strip():
             raise ValueError("content 不能为空")
+        expires_at = (cstnow() + ttl) if ttl is not None else None
         record = MemoryRecord(
             user_id=self.user_id, session_id=self.session_id, content=content.strip(),
             source=source, kind=kind, importance=float(importance),
+            expires_at=to_cst(expires_at) if expires_at else None,
         )
         return self.long_term.add(record)
 
@@ -318,7 +332,7 @@ class MemoryManager:
         stale_days: int = 90,
         similarity_threshold: float = 0.85,
     ) -> Dict[str, int]:
-        """维护长期记忆：归档「低重要度 + 久未命中」的、合并高度重复的（B5）
+        """维护长期记忆：归档冷记忆、合并重复、清理到期项（B5 + B12）
 
         Args:
             max_importance: 重要度低于该值的记忆才可能被归档
@@ -326,12 +340,16 @@ class MemoryManager:
             similarity_threshold: 合并阈值（相似度 ≥ 该值视为重复）
 
         Returns:
-            {"archived": 归档条数, "merged": 合并条数}
+            {"archived": 归档条数, "merged": 合并条数, "expired": 到期清理条数}
 
         建议在会话空闲时手动调用（也可以挂到定时任务），不要每轮都跑：
         合并是两两比较，有一定开销。任一环节失败只警告、不抛异常。
+
+        到期清理（B12）说明：带 ttl/expires_at 的记忆一旦过了有效期会被标记为
+        retracted（软删、留痕），不再参与检索；在两次 compact() 之间，search()
+        也会主动过滤掉已到期项，防止过期信息被注入 prompt。
         """
-        report = {"archived": 0, "merged": 0}
+        report = {"archived": 0, "merged": 0, "expired": 0}
         try:
             report["archived"] = len(
                 self.long_term.archive_stale(
@@ -346,6 +364,10 @@ class MemoryManager:
             )
         except Exception as e:  # noqa: BLE001
             print(f"⚠️ 记忆合并失败（已跳过）: {e}")
+        try:
+            report["expired"] = len(self.long_term.purge_expired())
+        except Exception as e:  # noqa: BLE001
+            print(f"⚠️ 记忆到期清理失败（已跳过）: {e}")
         return report
 
     # ---------- 4. 用户画像（B3） ----------
