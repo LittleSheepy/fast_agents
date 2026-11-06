@@ -248,7 +248,7 @@ class [类名](BaseModel):
 
 ## 七、逐个文件讲解（源码导读） ●
 
-【写什么】每个源码文件一小节，固定三段：**它负责什么 → 关键实现 → 为什么这么写**。
+【写什么】每个源码文件一小节，固定四段：**它负责什么 → 关键实现 → 为什么这么写 → 与主流框架对比**。
 
 ```markdown
 ### 7.[N] `[文件名].py` —— [一句话职责]
@@ -262,6 +262,8 @@ class [类名](BaseModel):
 2. 把实测踩出的坑写进对应文件（如 Windows 编码、路径空格、线程读帧），第十节只做汇总；
 3. 节末给一句「这个文件是你自己要改时最该看的地方」；
 4. 若某文件同时属于两个模块（如 `tools/builtin/mcp_tool.py`），在本模块说明里只讲本模块视角，交叉引用对方文档。
+5. **参考主流框架**（LangChain / LlamaIndex / OpenAI Agents SDK / OpenTelemetry / MCP / Anthropic Skills 等）的对应实现并做对比；
+  - **只借鉴设计思路与概念**（如 Trace/Span、ToolBase、Callback Hook），**不照搬 API、不引入其依赖**。
 
 ---
 

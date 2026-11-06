@@ -174,9 +174,9 @@ python examples\trace\basic_usage.py
 
 ## 8. 设计约定
 
-- 新模块、功能动笔前，**参考主流框架**（LangChain / LlamaIndex / OpenAI Agents SDK / OpenTelemetry / MCP / Anthropic Skills 等）的对应实现并做对比；
+- 新模块、功能、文件动笔前，**参考主流框架**（LangChain / LlamaIndex / OpenAI Agents SDK / OpenTelemetry / MCP / Anthropic Skills 等）的对应实现并做对比；
   - **只借鉴设计思路与概念**（如 Trace/Span、ToolBase、Callback Hook），**不照搬 API、不引入其依赖**；
-  - 对比写进模块 docstring 开头。
+  - 对比写进模块说明文档：整体功能对比写到序号三，单个文件参考写到序号七。
 - 新增能力**默认非侵入**（需要用户显式开启/注入才生效），避免影响既有链路。
 - 有多种方案时**先摆差异、再找确认**，不要默默拍板。
 - 一句话原则：**能跑、可读、零依赖默认路径、有测试、有文档。**
