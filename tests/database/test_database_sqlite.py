@@ -5,7 +5,7 @@
        标识符注入防护白名单校验、异常体系继承关系。
 
 运行方式（Windows PowerShell，在项目根目录）:
-    python tests\\database\\test_database_sqlite.py
+    python tests/database/test_database_sqlite.py
     （无需安装任何额外依赖，纯标准库）
 """
 import os
@@ -27,6 +27,42 @@ from tests._runner import raises  # noqa: E402
 
 
 # ==================== 测试用例 ====================
+
+# ==================== 基础连接 ====================
+def test_connect_file(tmp_path):
+    """连接文件数据库成功，WAL/外键默认启用。"""
+    path = tmp_path / "test.db"
+    client = SQLiteClient(str(path))
+    row = client.query("PRAGMA journal_mode", fetch_one=True)
+    client.close()
+    assert row is not None
+
+# ---------- count / batch_insert 测试 ----------
+
+def test_batch_insert_persists_after_close():
+    """单独调用 batch_insert 后 close，重开连接数据必须存在——修复静默丢失问题。
+
+    根因：Python sqlite3 默认 isolation_level='' 会在 DML 前隐式开事务，
+    旧实现直接 self.conn.executemany 不 commit，close 时事务被回滚导致数据丢失。
+    修复后 batch_insert 走 self.executemany 封装，在事务外自动 commit。
+    """
+    import tempfile, os, shutil
+    tmp = tempfile.mkdtemp(prefix="bi_persist_")
+    path = os.path.join(tmp, "t.db")
+    try:
+        db = SQLiteClient(path)
+        db.ensure_table("t", {"id": "INTEGER PRIMARY KEY", "name": "TEXT"})
+        n = db.batch_insert("t", [{"name": "a"}, {"name": "b"}, {"name": "c"}])
+        assert n == 3
+        db.close()
+        # 重开连接验证数据真的落盘了
+        db2 = SQLiteClient(path)
+        assert db2.count("t") == 3
+        db2.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 
 def test_enter_transaction_failure_raises_operational_error_not_attributeerror():
     """回归：__enter__ 里 BEGIN IMMEDIATE 失败时应抛 DatabaseOperationalError，
@@ -160,6 +196,60 @@ def test_update_delete_data_and_where_keys_are_ident_checked():
     assert db.select_one("t_dk", where={"id": 1})["v"] == 20
     db.close()
 
+
+# ==================== 事务 ====================
+
+# ----------------------------------------------------------------------
+# 12. 事务嵌套支持（重入忽略 + 最外层统一提交/回滚，最简方案）
+# ----------------------------------------------------------------------
+
+def test_nested_with_does_not_crash_and_commits_to_file(tmp_path):
+    """嵌套 with db: 不抛 cannot-start-transaction-within-transaction，数据落盘后重开仍能读到。"""
+    import os
+    db_path = os.path.join(str(tmp_path), "nt1.db")
+    db = SQLiteClient(db_path)
+    db.ensure_table("nt1", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
+    with db:
+        db.insert("nt1", {"v": 1})
+        with db:
+            db.insert("nt1", {"v": 2})
+        db.insert("nt1", {"v": 3})
+    db.close()
+    db2 = SQLiteClient(db_path)
+    assert db2.count("nt1") == 3
+    db2.close()
+
+
+def test_nested_with_inner_exception_rolls_back_entire_chain(tmp_path):
+    """内层 with 抛异常时，最外层整体回滚，一条都不写。"""
+    import os
+    db_path = os.path.join(str(tmp_path), "nt2.db")
+    db = SQLiteClient(db_path)
+    db.ensure_table("nt2", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
+    with raises(ValueError, match="boom"):
+        with db:
+            db.insert("nt2", {"v": 1})
+            with db:
+                db.insert("nt2", {"v": 2})
+                raise ValueError("boom")
+    assert db.count("nt2") == 0
+    db.close()
+
+
+def test_nested_with_outer_exception_rolls_back_all(tmp_path):
+    """外层 with 抛异常，嵌套里的写入也要整体回滚。"""
+    import os
+    db_path = os.path.join(str(tmp_path), "nt3.db")
+    db = SQLiteClient(db_path)
+    db.ensure_table("nt3", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
+    with raises(RuntimeError, match="outer"):
+        with db:
+            db.insert("nt3", {"v": 1})
+            with db:
+                db.insert("nt3", {"v": 2})
+            raise RuntimeError("outer")
+    assert db.count("nt3") == 0
+    db.close()
 
 # ============================================================
 # 入口
