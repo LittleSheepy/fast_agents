@@ -561,7 +561,7 @@ class SQLiteClient(DatabaseClientBase):
         if self._tx_depth == 0:
             try:
                 self.conn.execute("BEGIN IMMEDIATE")
-            except self._sqlite3.Error as e:
+            except sqlite3.Error as e:
                 raise DatabaseOperationalError(f"开启事务失败: {e}") from e
             self._tx_must_rollback = False
         self._tx_depth += 1
@@ -589,11 +589,11 @@ class SQLiteClient(DatabaseClientBase):
             if exc_type is None and not self._tx_must_rollback:
                 try:
                     self.conn.commit()
-                except self._sqlite3.Error as e:
+                except sqlite3.Error as e:
                     # commit 失败：尽力回滚后用统一异常抛出，不让驱动原生异常泄漏给上层
                     try:
                         self.conn.rollback()
-                    except self._sqlite3.Error:
+                    except sqlite3.Error:
                         pass
                     raise DatabaseOperationalError(f"提交事务失败: {e}") from e
             else:
