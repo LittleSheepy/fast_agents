@@ -391,14 +391,15 @@ class TraceLogger:
             else:
                 # 无活跃trace时，自动找最近一条结束的root trace（parent_id为None的最新Span所属trace）
                 all_spans = self._store.read()
-                # 倒序找最近结束的根Span
-                all_spans.sort(key=lambda s: (s.start_time, s.span_id), reverse=True)
+                # 倒序找最近结束的根Span，优先按创建序号排序保证Windows低精度时间戳下顺序正确
+                all_spans.sort(key=lambda s: (getattr(s, "_create_seq", 0), s.start_time, s.span_id), reverse=True)
                 for s in all_spans:
                     if s.parent_id is None:
                         tid = s.trace_id
                         break
         spans = self._store.read(session_id=session_id, trace_id=tid)
-        spans.sort(key=lambda s: (s.start_time, s.span_id))
+        # 优先按创建序号排序，无序号时兜底按时间+span_id，彻底解决Windows低精度时间戳排序不稳定问题
+        spans.sort(key=lambda s: (getattr(s, "_create_seq", 0), s.start_time, s.span_id))
         return [
             {
                 "span_id": s.span_id,

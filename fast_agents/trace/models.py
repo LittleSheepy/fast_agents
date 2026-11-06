@@ -10,12 +10,14 @@
 """
 from __future__ import annotations
 
+import itertools
 import uuid
 import time
+import threading
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class SpanKind(str, Enum):
@@ -41,8 +43,18 @@ def _new_id() -> str:
 
 
 def _now_ts() -> float:
-    """当前时间戳（秒，带小数，time.time() 单调递增，适合算耗时）。"""
+    """当前时间戳（秒，带小数，time.time() 系统时间，适合记录时间点；耗时计算时自动做下限保护，避免负值）。"""
     return time.time()
+
+
+# 全局自增序号，线程安全，保证创建顺序唯一可排序，彻底解决Windows低精度时间戳排序混乱问题
+_seq_counter = itertools.count(1)
+_seq_lock = threading.Lock()
+
+
+def _next_seq() -> int:
+    with _seq_lock:
+        return next(_seq_counter)
 
 
 class SpanRecord(BaseModel):
@@ -54,7 +66,7 @@ class SpanRecord(BaseModel):
     """
 
     # ---------- 内部幂等标记（不持久化） ----------
-    _persisted: bool = False
+    _persisted: bool = PrivateAttr(default=False)
 
     # ---------- 追踪链 ----------
     trace_id: str = Field(..., description="整条链路的唯一 id，一次 run 内所有 Span 共享")
@@ -69,7 +81,7 @@ class SpanRecord(BaseModel):
     # ---------- 时间 ----------
     start_time: float = Field(default_factory=_now_ts, description="开始时间戳（秒，time.time()）")
     end_time: Optional[float] = Field(default=None, description="结束时间戳")
-    duration_ms: Optional[float] = Field(default=None, description="耗时（毫秒）；end 后自动计算")
+    duration_ms: Optional[float] = Field(default=None, description="耗时（毫秒）；end 后自动计算，下限保护为0，不出现负值")
 
     # ---------- 输入输出 ----------
     input: Any = Field(default=None, description="入参；会被 json.dumps 序列化（无法序列化的转 str）")
@@ -83,6 +95,17 @@ class SpanRecord(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict, description="额外元数据，如模型名、token 用量")
 
     model_config = {"arbitrary_types_allowed": True}
+
+    def model_post_init(self, __context: Any) -> None:
+        """初始化时分配唯一创建序号，优先使用metadata内持久化的序号保证跨进程排序一致"""
+        if "_create_seq" in self.metadata:
+            # 反序列化场景：从持久化数据中恢复原有创建序号，保证重读后顺序一致
+            self._create_seq = self.metadata.pop("_create_seq")
+        else:
+            # 新创建场景：分配全局递增序号，并写入metadata持久化
+            with _seq_lock:
+                self._create_seq = next(_seq_counter)
+            self.metadata["_create_seq"] = self._create_seq
 
     # ---------- 便捷方法 ----------
     def finish(
@@ -101,7 +124,8 @@ class SpanRecord(BaseModel):
                 「后钩子」这类拿不到真实起止、但需精确对齐耗时的场景。
         """
         self.end_time = end_time if end_time is not None else _now_ts()
-        self.duration_ms = (self.end_time - self.start_time) * 1000.0
+        # 耗时下限保护：end_time早于start_time时截断为0，避免出现负耗时
+        self.duration_ms = max(0.0, (self.end_time - self.start_time) * 1000.0)
         self.output = output or self.output
         self.status = status
         self.error = error or self.error

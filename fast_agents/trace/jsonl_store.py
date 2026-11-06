@@ -27,30 +27,38 @@ def _safe_serialize(obj: Any) -> Any:
     - pydantic v2 BaseModel → model_dump(mode="json")；
     - dict / list / tuple → 递归处理；
     - 其它对象 → str(obj)（兜底，保证不抛异常）。
+    - 最兜底：任何异常都返回统一占位字符串，绝对不抛异常导致整条Span丢失。
     """
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    # pydantic v2 BaseModel
-    if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-        try:
-            return _safe_serialize(obj.model_dump(mode="json"))
-        except Exception:
-            return str(obj)
-    # pydantic v1 兜底（.dict()）
-    if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-        try:
-            return _safe_serialize(obj.dict())
-        except Exception:
-            return str(obj)
-    if isinstance(obj, dict):
-        return {str(k): _safe_serialize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_safe_serialize(v) for v in obj]
     try:
-        json.dumps(obj)
-        return obj
-    except (TypeError, ValueError, OverflowError):
-        return str(obj)
+        if obj is None or isinstance(obj, (str, int, float, bool)):
+            return obj
+        # pydantic v2 BaseModel
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            try:
+                return _safe_serialize(obj.model_dump(mode="json"))
+            except Exception:
+                return str(obj) if not isinstance(obj, type) else f"<{obj.__name__}>"
+        # pydantic v1 兜底（.dict()）
+        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+            try:
+                return _safe_serialize(obj.dict())
+            except Exception:
+                return str(obj) if not isinstance(obj, type) else f"<{obj.__name__}>"
+        if isinstance(obj, dict):
+            return {str(k): _safe_serialize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_safe_serialize(v) for v in obj]
+        try:
+            json.dumps(obj)
+            return obj
+        except (TypeError, ValueError, OverflowError):
+            return str(obj) if not isinstance(obj, type) else f"<{obj.__name__}>"
+    except Exception:
+        # 最兜底：哪怕str(obj)都抛异常，也返回占位符，绝对不丢整条Span
+        try:
+            return repr(obj)
+        except Exception:
+            return f"<unserializable_object_{type(obj).__name__}>"
 
 
 def _match(d: dict, session_id, trace_id, kind) -> bool:
@@ -109,14 +117,16 @@ class JsonlStore(TraceStoreBase):
         if self._closed:
             return
         try:
-            # Bug修复：先处理input/output/metadata不可序列化对象，再做model_dump，
+            # 核心顺序：先单独序列化input/output/metadata这三个Any字段，
+            # 彻底兜住所有不可序列化对象，再执行model_dump，
             # 避免model_dump(mode="json")提前抛异常导致整条Span被静默丢弃
-            span.input = _safe_serialize(span.input)
-            span.output = _safe_serialize(span.output)
-            span.metadata = _safe_serialize(span.metadata or {})
-            # 使用 model_dump(mode="json")，pydantic v2 会自动把 enum/datetime/UUID 转成 JSON 安全形式
-            data = span.model_dump(mode="json", exclude_none=False)
-            # 兜底：kind/status 保证是字符串值（pydantic mode="json" 已经处理，这里再守一次）
+            # 先拷贝一份Span副本处理，不修改外部传入的原span对象，无副作用
+            span_copy = span.model_copy(deep=True)
+            span_copy.input = _safe_serialize(span_copy.input)
+            span_copy.output = _safe_serialize(span_copy.output)
+            span_copy.metadata = _safe_serialize(span_copy.metadata or {})
+            data = span_copy.model_dump(exclude_none=False)
+            # 兜底：kind/status 保证是字符串值
             k = data.get("kind")
             if hasattr(k, "value"):
                 data["kind"] = k.value
