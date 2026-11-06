@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from .errors import DatabaseValidationError
+from .errors import DatabaseIdentifierError
 
 
 class ColumnType(str, Enum):
@@ -65,7 +65,7 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def check_ident(name: str, kind: str = "标识符") -> None:
     """检查表名/列名/索引名是合法标识符，防止 SQL 注入。"""
     if not isinstance(name, str) or not _IDENT_RE.match(name):
-        raise DatabaseValidationError(f"非法{kind}: {name!r}（只允许字母/数字/下划线，且不以数字开头）")
+        raise DatabaseIdentifierError(f"非法{kind}: {name!r}（只允许字母/数字/下划线，且不以数字开头）")
 
 
 def quote_ident(name: str) -> str:
