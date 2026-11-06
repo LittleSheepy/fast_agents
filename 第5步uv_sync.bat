@@ -1,3 +1,3 @@
 @echo off
-uv add -r requirements.txt
+uv sync
 pause
