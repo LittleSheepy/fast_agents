@@ -393,9 +393,14 @@ class SQLiteClient(DatabaseClientBase):
         sql = f"SELECT * FROM {_quote_ident(table)}"
         params: dict = {}
         if where:
-            conditions = " AND ".join([f"{_quote_ident(k)} = :w_{k}" for k in where.keys()])
-            sql += f" WHERE {conditions}"
-            params = {f"w_{k}": v for k, v in where.items()}
+            conditions: list[str] = []
+            for k, v in where.items():
+                if v is None:
+                    conditions.append(f"{_quote_ident(k)} IS NULL")
+                else:
+                    conditions.append(f"{_quote_ident(k)} = :w_{k}")
+                    params[f"w_{k}"] = v
+            sql += f" WHERE {' AND '.join(conditions)}"
         if order_by:
             # order_by 允许形如 "id DESC"，由调用方保证合法；仅作基本字符集校验
             if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\s+(ASC|DESC))?$", order_by.strip()):
@@ -534,10 +539,15 @@ class SQLiteClient(DatabaseClientBase):
             raise DatabaseValidationError("update 需要 data 和 where")
         _check_ident(table, "表名")
         set_clause = ", ".join([f"{_quote_ident(k)} = :set_{k}" for k in data.keys()])
-        where_clause = " AND ".join([f"{_quote_ident(k)} = :w_{k}" for k in where.keys()])
-        sql = f"UPDATE {_quote_ident(table)} SET {set_clause} WHERE {where_clause}"
-        params = {f"set_{k}": v for k, v in data.items()}
-        params.update({f"w_{k}": v for k, v in where.items()})
+        where_conds: list[str] = []
+        params: dict[str, Any] = {f"set_{k}": v for k, v in data.items()}
+        for k, v in where.items():
+            if v is None:
+                where_conds.append(f"{_quote_ident(k)} IS NULL")
+            else:
+                where_conds.append(f"{_quote_ident(k)} = :w_{k}")
+                params[f"w_{k}"] = v
+        sql = f"UPDATE {_quote_ident(table)} SET {set_clause} WHERE {' AND '.join(where_conds)}"
         return self.execute(sql, params)["rowcount"]
 
     def delete(self, table: str, where: dict[str, Any]) -> int:
@@ -545,9 +555,15 @@ class SQLiteClient(DatabaseClientBase):
         if not where:
             raise DatabaseValidationError("delete 必须传 where 防止误删全表")
         _check_ident(table, "表名")
-        where_clause = " AND ".join([f"{_quote_ident(k)} = :w_{k}" for k in where.keys()])
-        sql = f"DELETE FROM {_quote_ident(table)} WHERE {where_clause}"
-        params = {f"w_{k}": v for k, v in where.items()}
+        where_conds: list[str] = []
+        params: dict[str, Any] = {}
+        for k, v in where.items():
+            if v is None:
+                where_conds.append(f"{_quote_ident(k)} IS NULL")
+            else:
+                where_conds.append(f"{_quote_ident(k)} = :w_{k}")
+                params[f"w_{k}"] = v
+        sql = f"DELETE FROM {_quote_ident(table)} WHERE {' AND '.join(where_conds)}"
         return self.execute(sql, params)["rowcount"]
 
     # ---------- 事务上下文管理 ----------
