@@ -42,22 +42,20 @@
 第2步uv_venv.bat
 第3步uv_add.bat
 
-# 跑测试：test/ 与 Python 标准库同名，必须「直接执行」，禁止 python -m
-python test\test_memory.py
-python test\test_tools.py
-python test\test_context.py
-python test\test_mcp.py
-python test\test_database.py
-python test\test_trace.py
-python test\test_react_agent.py
-python test\test_file_tool.py
+# 跑测试：
+python tests\test_memory.py
+python tests\test_tools.py
+python tests\test_context.py
+python tests\test_mcp.py
+python tests\test_database.py
+python tests\test_trace.py
+python tests\test_react_agent.py
+python tests\test_file_tool.py
 
 # 跑示例（离线可跑，不需要 API Key）
 python examples\database\basic_usage.py
 python examples\trace\basic_usage.py
 ```
-
-> ⚠️ **不要**用 `python -m test.test_xxx`——`test` 是 Python 标准库模块名，会冲突。
 
 ---
 
@@ -103,7 +101,7 @@ python examples\trace\basic_usage.py
 - 测试与示例必须**离线可跑**，不依赖 API Key / 外部服务（LLM 相关用 fake/mock）。
 
 ### 🔴 R8 —— 只给改动文件，路径严格对齐
-- 源码按项目路径存放（根目录为 `fast_agents/`、测试在 `test/`、示例在 `examples/`、文档在 `docs/`）；
+- 源码按项目路径存放（根目录为 `fast_agents/`、测试在 `tests/`、示例在 `examples/`、文档在 `docs/`）；
 - **只给新增/修改的文件**，未改动的文件不要塞进交付；
 - **严禁把所有文件堆在同一文件夹**。
 
@@ -150,12 +148,49 @@ python examples\trace\basic_usage.py
 
 ---
 
-## 6. 交付物清单
+## 6. 测试代码风格与结构（约定）
+
+### 6.1 测试入口有：main(测试所有，调用run_all)、main_of_new_add(AI新加测试要放这里一份)
+- 每个测试文件有两个入口：`main` 和 `main_of_new_add`
+- `main`:测试所有，调用run_all
+```python
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+```
+- `main_of_new_add`:AI新加测试也要放这里一份，以便我能只运行到测试的。
+```python
+def main_of_new_add():
+    """ 新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    test_update_delete_data_and_where_keys_are_ident_checked()
+
+    # AI新添加的测试(AI可以删除覆盖)
+    test_enter_transaction_failure_raises_operational_error_not_attributeerror() # AI新加的测试
+```
+
+### 6.2 不要使用pyterst
+
+### 6.3 尽量不要跨函数，尽量在一个函数中完成测试
+
+### 6.4 按照模块存放tests下不同文件夹
+
+---
+
+## 7. 交付物清单
 
 新模块默认成套交付，缺一不可：
 
 1. **源码**：`fast_agents/<模块>/` 下完整模块，含 `__init__.py`；
-2. **测试**：`test/test_<模块>.py`，用 `sys.path.insert(0, ...)` 固定写法（参考现有所有 test 文件），**全内存或临时目录**、无外部依赖、直接 `python test\test_xxx.py` 可跑；给出 N/N 基线；
+2. **测试**：`tests/<模块>/test_<模块>.py`，目录结构镜像源码包；用 `sys.path.insert(0, ...)` 固定写法（参考现有所有 test 文件），**不依赖 pytest**、**全内存或临时目录**、无外部依赖、直接 `python tests/<模块>/test_xxx.py` 可跑；每个测试文件入口统一为 `main(globals())` + `main_of_new_add(globals(), "test_bN_")`（公共运行器在 `tests/_runner.py`，提供 `raises/skip/tmp_path/MonkeyPatch` 等零依赖工具）；给出 N/N 基线；
 3. **示例**：`examples/<模块>/` 下至少一个可离线运行的示例；
 4. **文档**：`docs/<模块>模块编写说明.md`，**严格按 `docs/xx模块编写说明模版.md` v2.0 骨架**（开篇 + 一～十三 + 附录），起版本 v1.0.0；
 5. **导出同步**：如需对外暴露，更新 `fast_agents/__init__.py`；同步 README.md「特性」「项目结构」「文档导航」三栏；同步 `docs/演进路线图.md` 对应条目状态。
@@ -163,7 +198,7 @@ python examples\trace\basic_usage.py
 7. **交付包**：按照仓库目录存放交付文件并打包,未修改的不用打包。打包名字可以参考fast_agents_模块名_xxxx.zip 或者 fast_agents_模块名_xxxx.zip格式
 ---
 
-## 7. 交付顺序
+## 8. 交付顺序
 
 1. **设计说明**：说清做什么 / 不做什么 / 关键取舍 / 改动范围；
 2. **完整源码**：按项目路径给出新增/修改的每个文件内容；
@@ -172,7 +207,7 @@ python examples\trace\basic_usage.py
 
 ---
 
-## 8. 设计约定
+## 9. 设计约定
 
 - 新模块、功能、文件动笔前，**参考主流框架**（LangChain / LlamaIndex / OpenAI Agents SDK / OpenTelemetry / MCP / Anthropic Skills 等）的对应实现并做对比；
   - **只借鉴设计思路与概念**（如 Trace/Span、ToolBase、Callback Hook），**不照搬 API、不引入其依赖**；
@@ -184,7 +219,7 @@ python examples\trace\basic_usage.py
 
 ---
 
-## 9. 参考
+## 10. 参考
 
 - AGENTS.md 开放标准：<https://agents.md/>
 - 模块文档骨架：`docs/xx模块编写说明模版.md`
