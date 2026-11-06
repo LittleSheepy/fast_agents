@@ -242,6 +242,67 @@ def test_file_store_does_not_accumulate_in_memory(tmp_path):
     assert len(store._mem) == 0
 
 
+def test_jsonl_store_handles_unserializable_input_output():
+    """Bug1 回归：input/output/metadata 包含不可 JSON 序列化的自定义对象时，
+    整条 Span 不应被静默丢弃（旧实现会在 model_dump(mode="json") 阶段抛异常被吞掉，导致读不到任何记录）。
+    行为对齐 SQLiteStore：不可序列化对象兜底转为 str(obj)，Span 正常落库可回读。"""
+    class Weird:
+        def __str__(self):
+            return "<Weird>"
+
+    store = JsonlStore(MEMORY_PATH)
+    s = SpanRecord(
+        trace_id="t1",
+        name="weird-span",
+        kind=SpanKind.CUSTOM,
+        input={"obj": Weird(), "normal": 123},
+        metadata={"bad": Weird()},
+    )
+    s.finish(output=Weird())
+    store.write(s)
+
+    rows = store.read()
+    assert len(rows) == 1, f"不可序列化对象导致整条Span丢失，实际返回{len(rows)}条"
+    span = rows[0]
+    # 正常字段保留
+    assert span.name == "weird-span"
+    assert span.input["normal"] == 123
+    # 不可序列化对象兜底为字符串表示
+    assert span.input["obj"] == "<Weird>"
+    assert span.output == "<Weird>"
+    assert span.metadata["bad"] == "<Weird>"
+    store.close()
+
+
+def test_jsonl_store_file_handles_unserializable(tmp_path):
+    """文件模式下同样能正确处理不可序列化对象，落盘后跨实例可回读。"""
+    class Weird:
+        def __str__(self):
+            return "<WeirdFile>"
+
+    p = str(tmp_path / "traces.jsonl")
+    s1 = JsonlStore(p, append=True)
+    sp = SpanRecord(
+        trace_id="t1",
+        name="weird-file",
+        kind=SpanKind.TOOL,
+        input=Weird(),
+    )
+    sp.finish(output={"res": Weird()})
+    s1.write(sp)
+    s1.flush()
+    s1.close()
+
+    # 重新打开验证可正常回读，没有丢数据
+    s2 = JsonlStore(p, append=True)
+    rows = s2.read(trace_id="t1")
+    s2.close()
+    assert len(rows) == 1
+    assert rows[0].name == "weird-file"
+    assert rows[0].input == "<WeirdFile>"
+    assert rows[0].output["res"] == "<WeirdFile>"
+
+
 # ==================== TraceLogger 默认关闭 ====================
 def test_tracer_disabled_writes_nothing():
     """enabled=False 时任何 span 操作都不写入。"""

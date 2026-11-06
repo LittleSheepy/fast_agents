@@ -109,11 +109,13 @@ class JsonlStore(TraceStoreBase):
         if self._closed:
             return
         try:
+            # Bug修复：先处理input/output/metadata不可序列化对象，再做model_dump，
+            # 避免model_dump(mode="json")提前抛异常导致整条Span被静默丢弃
+            span.input = _safe_serialize(span.input)
+            span.output = _safe_serialize(span.output)
+            span.metadata = _safe_serialize(span.metadata or {})
             # 使用 model_dump(mode="json")，pydantic v2 会自动把 enum/datetime/UUID 转成 JSON 安全形式
             data = span.model_dump(mode="json", exclude_none=False)
-            data["input"] = _safe_serialize(data.get("input"))
-            data["output"] = _safe_serialize(data.get("output"))
-            data["metadata"] = _safe_serialize(data.get("metadata") or {})
             # 兜底：kind/status 保证是字符串值（pydantic mode="json" 已经处理，这里再守一次）
             k = data.get("kind")
             if hasattr(k, "value"):
