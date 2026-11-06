@@ -1225,14 +1225,14 @@ python test\test_trace.py
 
 | 测试文件 | 状态 | 说明 |
 |---------|------|------|
-| `test/test_react_agent.py` | ✅ 17/17 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
-| `test/test_tools.py` | ✅ 61/61 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
-| `test/test_memory.py` | ✅ 36/36 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B12 TTL 与到期回收 |
-| `test/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
-| `test/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
-| `test/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
-| `test/test_database.py` | ✅ 121 项（104 通过 + 17 跳过） | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系、向量后端；17 项向量端到端用例在未装 `chromadb` 时自动跳过（`test_database_mysql.py` 另有 18 项 MySQL 用例，需本地 MySQL） |
-| `test/test_trace.py` | ✅ 55/55 | Span 模型、TraceLogger、JsonlStore / SQLiteStore（写入读回 / 谓词过滤 / 跨 reopen 持久化 / 幂等迁移 / 流式遍历 / upsert 幂等）、LLM/Agent 打点、token 元数据、tool 真实耗时、查询与回放 |
+| `tests/agents/test_react_agent.py` | ✅ 17/17 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
+| `tests/tools/test_tools.py` | ✅ 61/61 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
+| `tests/memory/test_memory.py` | ✅ 36/36 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B12 TTL 与到期回收 |
+| `tests/tools/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
+| `tests/context/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
+| `tests/mcp/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
+| `tests/database/test_database.py` | ✅ 122 项（105 通过 + 17 跳过） | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系、向量后端；17 项向量端到端用例在未装 `chromadb` 时自动跳过（`tests/database/test_database_mysql.py` 另有 18 项 MySQL 用例，需本地 MySQL） |
+| `tests/trace/test_trace.py` | ✅ 59/59 | Span 模型、TraceLogger、JsonlStore / SQLiteStore（写入读回 / 谓词过滤 / 跨 reopen 持久化 / 幂等迁移 / 流式遍历 / upsert 幂等）、LLM/Agent 打点、token 元数据、tool 真实耗时、查询与回放 |
 
 `test/demo.py` / `test/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
 
