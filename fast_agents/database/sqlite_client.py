@@ -388,13 +388,14 @@ class SQLiteClient(DatabaseClientBase):
         order_by: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        """查询多行，where 做等值匹配。"""
+        """查询多行，where 做等值匹配；值为 None 时自动编译为 IS NULL。"""
         _check_ident(table, "表名")
         sql = f"SELECT * FROM {_quote_ident(table)}"
         params: dict = {}
         if where:
             conditions: list[str] = []
             for k, v in where.items():
+                _check_ident(k, "字段名")
                 if v is None:
                     conditions.append(f"{_quote_ident(k)} IS NULL")
                 else:
@@ -534,14 +535,17 @@ class SQLiteClient(DatabaseClientBase):
         return rows[0] if rows else None
 
     def update(self, table: str, data: dict[str, Any], where: dict[str, Any]) -> int:
-        """更新行，返回影响行数。"""
+        """更新行，返回影响行数；where 值为 None 时编译为 IS NULL。"""
         if not data or not where:
             raise DatabaseValidationError("update 需要 data 和 where")
         _check_ident(table, "表名")
+        for k in data.keys():
+            _check_ident(k, "字段名")
         set_clause = ", ".join([f"{_quote_ident(k)} = :set_{k}" for k in data.keys()])
         where_conds: list[str] = []
         params: dict[str, Any] = {f"set_{k}": v for k, v in data.items()}
         for k, v in where.items():
+            _check_ident(k, "字段名")
             if v is None:
                 where_conds.append(f"{_quote_ident(k)} IS NULL")
             else:
@@ -551,13 +555,14 @@ class SQLiteClient(DatabaseClientBase):
         return self.execute(sql, params)["rowcount"]
 
     def delete(self, table: str, where: dict[str, Any]) -> int:
-        """删除行，返回影响行数。"""
+        """删除行，返回影响行数；where 值为 None 时编译为 IS NULL。"""
         if not where:
             raise DatabaseValidationError("delete 必须传 where 防止误删全表")
         _check_ident(table, "表名")
         where_conds: list[str] = []
         params: dict[str, Any] = {}
         for k, v in where.items():
+            _check_ident(k, "字段名")
             if v is None:
                 where_conds.append(f"{_quote_ident(k)} IS NULL")
             else:
