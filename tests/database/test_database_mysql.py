@@ -10,15 +10,15 @@
 
 除「真实 MySQL CRUD」外全部离线可跑、不依赖外部 MySQL 服务。
 运行方式（Windows PowerShell，在项目根目录）：
-    pytest test/test_database_mysql.py -v
+    python tests/database/test_database_mysql.py
     或：python test/test_database_mysql.py
 """
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import pytest
+from tests._runner import raises, monkeypatch, Skip
 
 from fast_agents.database import (
     Column,
@@ -89,7 +89,7 @@ def test_module_top_level_import_does_not_require_pymysql():
 def test_constructor_without_pymysql_raises_install_hint(monkeypatch):
     """未装 pymysql 时构造 MySQLClient 直接抛 DatabaseDriverMissingError，且给出安装命令。"""
     ClientCls = _FreshMySQLClient(monkeypatch)
-    with pytest.raises(DatabaseDriverMissingError, match="pip install pymysql"):
+    with raises(DatabaseDriverMissingError, match="pip install pymysql"):
         ClientCls(host="127.0.0.1", database="fast_agents")
 
 
@@ -167,9 +167,11 @@ def test_query_compile_uses_percent_placeholder():
 MYSQL_URL = os.getenv("FAST_AGENTS_TEST_MYSQL_URL")
 
 
-@pytest.mark.skipif(not MYSQL_URL, reason="未设置 FAST_AGENTS_TEST_MYSQL_URL，跳过真实 MySQL 连接测试")
+
 def test_real_mysql_crud_end_to_end():
     """真实 MySQL 下跑一遍建表 / CRUD / 谓词查询 / upsert / 事务回滚（与 SQLite 行为对齐）。"""
+    if not MYSQL_URL:
+        raise Skip("未设置 FAST_AGENTS_TEST_MYSQL_URL，跳过真实 MySQL 连接测试")
     from urllib.parse import urlparse
 
     url = urlparse(MYSQL_URL)
@@ -324,7 +326,7 @@ def test_mysql_uses_same_error_classes_as_sqlite():
 
 
 def test_mysql_error_classes_stay_in_valueerror_lineage():
-    """三类异常仍在 ValueError 谱系下，保证既有 except ValueError / pytest.raises(ValueError) 零破坏。"""
+    """三类异常仍在 ValueError 谱系下，保证既有 except ValueError / raises(ValueError) 零破坏。"""
     for cls in (_mc.DatabaseConnectionError, _mc.DatabaseOperationalError, _mc.DatabaseValidationError):
         assert issubclass(cls, ValueError)
 
@@ -332,19 +334,19 @@ def test_mysql_error_classes_stay_in_valueerror_lineage():
 def test_mysql_compile_validations_raise_validation_error():
     """编译期入参校验抛 DatabaseValidationError（与 SQLite 行为一致）。"""
     from fast_agents.database import DatabaseValidationError
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         MySQLClient._compile_query(Query(table_name="t", limit=-1))
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         MySQLClient._compile_query(Query(table_name="t", sort_by=[]))
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         MySQLClient._compile_query(Query(table_name="t", offset=-1))
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         MySQLClient._compile_filter(Filter(field="a", op=FilterOp.IN, value=[]), 0)
 
 
 def test_mysql_type_errors_stay_native_typeerror():
     """调用方把类型传错仍抛原生 TypeError，不纳入异常体系（与 SQLite 一致）。"""
-    with pytest.raises(TypeError):
+    with raises(TypeError):
         MySQLClient._compile_filter(object(), 0)
 
 
@@ -353,7 +355,7 @@ def test_mysql_connect_failure_maps_to_connection_error(monkeypatch):
     MySQLError, state = _install_fake_pymysql(monkeypatch)
     state["connect_error"] = MySQLError("connection refused")
     from fast_agents.database import DatabaseConnectionError, MySQLClient as _MC
-    with pytest.raises(DatabaseConnectionError) as ei:
+    with raises(DatabaseConnectionError) as ei:
         _MC(host="127.0.0.1", database="x")
     assert isinstance(ei.value.__cause__, MySQLError)
 
@@ -364,11 +366,11 @@ def test_mysql_execute_failure_maps_to_operational_error(monkeypatch):
     from fast_agents.database import DatabaseOperationalError, MySQLClient as _MC
     db = _MC(host="127.0.0.1", database="x")
     state["execute_error"] = MySQLError("syntax error")
-    with pytest.raises(DatabaseOperationalError):
+    with raises(DatabaseOperationalError):
         db.execute("SELECT bad")
-    with pytest.raises(DatabaseOperationalError):
+    with raises(DatabaseOperationalError):
         db.executemany("INSERT INTO t VALUES (%s)", [(1,)])
-    with pytest.raises(DatabaseOperationalError):
+    with raises(DatabaseOperationalError):
         db.query("SELECT bad")
     db.close()
 
@@ -381,5 +383,26 @@ def test_mysql_close_is_safe_without_pending_transaction(monkeypatch):
     db.close()
 
 
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    print("")
+    main_of_new_add()
+    main()

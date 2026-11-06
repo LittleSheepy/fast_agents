@@ -5,8 +5,8 @@
        migrate 补列 / 表存在判断 / 删表 / CRUD / 事务 / 异常 / 标识符注入防护。
 
 运行方式（Windows PowerShell，在项目根目录）:
-    python test\test_database.py
-    或：pytest test/test_database.py -v
+    python tests/database/test_database.py
+    （无需 pytest，纯标准库）
 """
 import sqlite3
 
@@ -14,9 +14,9 @@ import sqlite3
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import pytest
+from tests._runner import raises, importorskip, tmp_path
 
 from fast_agents.database import (
     Column,
@@ -34,10 +34,10 @@ from fast_agents.database import (
     DatabaseConnectionError,
     DatabaseOperationalError,
     DatabaseValidationError,
+    DatabaseIdentifierError,
 )
 
 
-@pytest.fixture
 def db():
     """每个测试用例都用全新的内存数据库。"""
     client = SQLiteClient(":memory:")
@@ -89,7 +89,7 @@ def test_insert_and_lastrowid(db):
 
 def test_insert_empty_raises(db):
     """空数据插入抛 ValueError。"""
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.insert("test_users", {})
 
 
@@ -147,7 +147,7 @@ def test_update(db):
 
 
 def test_update_without_where_raises(db):
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.update("test_users", {"score": 0}, where={})
 
 
@@ -160,7 +160,7 @@ def test_delete(db):
 
 
 def test_delete_without_where_raises(db):
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.delete("test_users", where={})
 
 
@@ -212,7 +212,7 @@ def test_transaction_state_single_source_of_truth(db):
     assert db._in_transaction is False
     assert db._tx_depth == 0
     # 只读 property 不允许外部赋值，从根上杜绝"人为置位"式失同步
-    with pytest.raises(AttributeError):
+    with raises(AttributeError):
         db._in_transaction = True  # type: ignore[misc]
     # 进入事务后两者保持一致
     db.__enter__()
@@ -224,7 +224,7 @@ def test_transaction_state_single_source_of_truth(db):
     assert db._in_transaction is False
     assert db._tx_depth == 0
     # 事务外出错不残留状态，后续 autocommit 正常工作
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.execute("THIS IS NOT VALID SQL")
     assert db._in_transaction is False  # 标志始终派生自 _tx_depth，稳定为 False
     db.insert("test_users", {"name": "ok"})
@@ -234,7 +234,7 @@ def test_transaction_state_single_source_of_truth(db):
 def test_transaction_flag_kept_false_after_error_outside_with(db):
     """问题 C：事务外单条 execute 出错后标志必须保持 False，后续写操作能正常 autocommit。"""
     assert db._in_transaction is False
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.execute("INSERT INTO test_users (name) VALUES (?)", (None,))
     assert db._in_transaction is False
     db.insert("test_users", {"name": "ok"})
@@ -264,7 +264,7 @@ def test_close_with_pending_transaction_rolls_back(tmp_path):
 
 # ==================== 异常 ====================
 def test_invalid_sql_raises(db):
-    with pytest.raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, ValueError)):
         db.execute("THIS IS NOT SQL")
 
 
@@ -278,43 +278,43 @@ def test_exception_hierarchy():
 
 def test_execute_error_maps_to_operational(db):
     """SQL 执行 / 查询失败 -> DatabaseOperationalError（可被上层精确分流）。"""
-    with pytest.raises(DatabaseOperationalError):
+    with raises(DatabaseOperationalError):
         db.execute("THIS IS NOT SQL")
-    with pytest.raises(DatabaseOperationalError):
+    with raises(DatabaseOperationalError):
         db.query("SELECT * FROM never_exist_table")
 
 
 def test_validation_error_maps(db):
     """入参校验失败 -> DatabaseValidationError。"""
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         db.insert("test_users", {})
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         db.delete("test_users", {})
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         db.update("test_users", {}, {"id": 1})
 
 
 def test_illegal_ident_maps_to_validation():
     """非法标识符（schema.check_ident）也归到 DatabaseValidationError。"""
     db = SQLiteClient(":memory:")
-    with pytest.raises(DatabaseValidationError):
+    with raises(DatabaseValidationError):
         db.ensure_table("bad name", {"id": "INTEGER PRIMARY KEY"})
     db.close()
 
 
 def test_connection_error_maps():
     """连不上的路径 -> DatabaseConnectionError（构造时即建连）。"""
-    with pytest.raises(DatabaseConnectionError):
+    with raises(DatabaseConnectionError):
         SQLiteClient("/no/such/dir_xyz_zz/db.sqlite")
 
 
 def test_exception_still_caught_by_valueerror(db):
     """向后兼容：新异常全部继承 ValueError，既有 except ValueError 通吃。"""
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.execute("THIS IS NOT SQL")
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.insert("test_users", {})
-    with pytest.raises(DatabaseError):  # 基类可统一兜底
+    with raises(DatabaseError):  # 基类可统一兜底
         db.execute("THIS IS NOT SQL")
 
 
@@ -365,7 +365,7 @@ def test_create_table_if_not_exists_idempotent():
     db.create_table("t", {"id": "INTEGER PRIMARY KEY"})
     db.create_table("t", {"id": "INTEGER PRIMARY KEY"}, if_not_exists=True)
     # 不带 if_not_exists 重复建表应报错
-    with pytest.raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, ValueError)):
         db.create_table("t", {"id": "INTEGER PRIMARY KEY"}, if_not_exists=False)
     db.close()
 
@@ -405,7 +405,7 @@ def test_create_table_list_columns():
     idx_names = {r["name"] for r in idx}
     assert "idx_users_dept_id" in idx_names
     # UNIQUE 约束生效：重复 email 应报错
-    with pytest.raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, ValueError)):
         db.insert("users", {"name": "B", "email": "a@x.com", "dept_id": 1})
     db.close()
 
@@ -504,7 +504,7 @@ def test_table_exists_and_drop_table():
     assert not db.table_exists("ghost")
     # drop_table(if_exists=True) 对不存在的表不报错
     db.drop_table("ghost", if_exists=True)
-    with pytest.raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, ValueError)):
         db.drop_table("ghost", if_exists=False)
     db.close()
 
@@ -545,37 +545,37 @@ def test_unique_index():
         )
     )
     db.insert("accounts", {"name": "alice"})
-    with pytest.raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, ValueError)):
         db.insert("accounts", {"name": "alice"})
     db.close()
 
 
 # ==================== 标识符注入防护 ====================
-@pytest.mark.parametrize("bad_name", [
-    "users;drop table x;",
-    "users--",
-    "ta b",
-    "1bad",
-    "",
-    "x'y",
-])
-def test_illegal_ident_rejected(bad_name):
+def test_illegal_ident_rejected():
     """非法表名/列名被拦截，防止 SQL 注入。"""
-    db = SQLiteClient(":memory:")
-    with pytest.raises(ValueError):
-        db.ensure_table(bad_name, {"id": "INTEGER PRIMARY KEY"})
-    db.close()
+    for bad_name in [
+        "users;drop table x;",
+        "users--",
+        "ta b",
+        "1bad",
+        "",
+        "x'y",
+    ]:
+        db = SQLiteClient(":memory:")
+        with raises(ValueError):
+            db.ensure_table(bad_name, {"id": "INTEGER PRIMARY KEY"})
+        db.close()
 
 
 def test_columns_type_validation():
     """columns 传错类型应抛 TypeError。"""
     db = SQLiteClient(":memory:")
-    with pytest.raises(TypeError):
+    with raises(TypeError):
         db.create_table("t", "not a dict or list")  # type: ignore[arg-type]
-    with pytest.raises(TypeError):
+    with raises(TypeError):
         db.create_table("t", ["not a column"])  # type: ignore[list-item]
     # Schema 表名不一致应抛 ValueError
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.create_table(
             "other",
             Schema(table_name="orders", columns=[
@@ -588,7 +588,7 @@ def test_columns_type_validation():
 def test_create_table_empty_columns_dict_rejected():
     """空 dict columns 抛 ValueError。"""
     db = SQLiteClient(":memory:")
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.create_table("t", {})
     db.close()
 
@@ -692,10 +692,10 @@ def test_select_where_in(db):
 def test_select_where_in_empty_list_rejected(db):
     """IN 的 value 必须是非空 list/tuple，空值/非列表必须报错。"""
     _seed_users_for_query(db)
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="name", op=FilterOp.IN, value=[])]))
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="name", op=FilterOp.IN, value="Alice")]))  # type: ignore[arg-type]
 
@@ -721,7 +721,7 @@ def test_select_where_is_null_is_not_null(db):
 
 def test_select_where_binary_op_without_value_rejected(db):
     """EQ/NEQ/... 等二元操作符漏传 value 必须报错。"""
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="age", op=FilterOp.EQ)]))
 
@@ -772,19 +772,19 @@ def test_select_where_sort_limit_offset(db):
 
 def test_select_where_limit_offset_negative_rejected(db):
     """limit/offset 为负数必须报错。"""
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="test_users", limit=-1))
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="test_users", offset=-1))
 
 
 def test_select_where_invalid_field_rejected(db):
     """字段名非法（含特殊字符、数字开头）必须被白名单拦截。"""
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="age; DROP TABLE test_users;--",
                                           op=FilterOp.EQ, value=1)]))
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="1bad", op=FilterOp.EQ, value=1)]))
 
@@ -832,9 +832,9 @@ def test_select_where_no_filters_returns_all(db):
 
 def test_select_where_type_check(db):
     """select_where 必须传 Query 实例，其他类型抛 TypeError。"""
-    with pytest.raises(TypeError):
+    with raises(TypeError):
         db.select_where("not a query")  # type: ignore[arg-type]
-    with pytest.raises(TypeError):
+    with raises(TypeError):
         db.select_one_where({"table_name": "test_users"})  # type: ignore[arg-type]
 
 
@@ -858,11 +858,6 @@ def test_select_where_still_works(db):
     _seed_users_for_query(db)
     rows = db.select("test_users", where={"age": 30})
     assert len(rows) == 1 and rows[0]["name"] == "Alice"
-
-
-if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main([__file__, "-v"]))
 
 
 # ---------- count / batch_insert 测试 ----------
@@ -1007,7 +1002,7 @@ def test_upsert_partial_update_columns():
 def test_upsert_conflict_key_missing_in_data():
     """conflict_keys 必须出现在 data 中，否则报 ValueError。"""
     db = _make_kv_db()
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.upsert("kv", {"v": "x", "n": 1}, conflict_keys="k")
     db.close()
 
@@ -1015,7 +1010,7 @@ def test_upsert_conflict_key_missing_in_data():
 def test_upsert_invalid_ident_rejected():
     """非法表名被白名单拦截。"""
     db = _make_kv_db()
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.upsert("kv; DROP TABLE kv--", {"k": "a"}, conflict_keys="k")
     db.close()
 
@@ -1059,7 +1054,7 @@ def test_update_where_expression():
 def test_update_where_requires_filters():
     """空 filters 直接报错，防止误更新全表。"""
     db = _make_kv_db()
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.update_where("kv", {"v": "x"}, Query(table_name="kv"))
     db.close()
 
@@ -1100,7 +1095,7 @@ def test_delete_where_requires_filters():
     """空 filters 直接报错，且不会误删数据。"""
     db = _make_kv_db()
     db.insert("kv", {"k": "a", "v": "1", "n": 1})
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.delete_where("kv", Query(table_name="kv"))
     assert db.count("kv") == 1
     db.close()
@@ -1133,16 +1128,16 @@ def test_sort_by_single_str_still_works():
 def test_sort_by_empty_list_rejected():
     """空 sort_by 列表直接报错。"""
     db = _make_kv_db()
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         db.select_where(Query(table_name="kv", sort_by=[]))
     db.close()
 
 
 def test_sql_expr_empty_rejected():
     """SqlExpr 不接受空表达式。"""
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         SqlExpr("")
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         SqlExpr("   ")
 
 
@@ -1193,7 +1188,7 @@ def test_vector_filter_and_needs_two_subfilters():
     """AND/OR 组合至少 2 个子条件。"""
     from fast_agents.database import VectorFilter, VectorFilterOp
     from fast_agents.database.chroma_client import _compile_vector_filter
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         _compile_vector_filter(VectorFilter(op=VectorFilterOp.AND, filters=[
             VectorFilter(field="a", op=VectorFilterOp.EQ, value=1),
         ]))
@@ -1201,30 +1196,30 @@ def test_vector_filter_and_needs_two_subfilters():
 
 def test_chroma_client_requires_path_or_host():
     """path 和 host 二选一，都不给/都给都报错。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     from fast_agents.database import ChromaClient
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         ChromaClient()
-    with pytest.raises(ValueError):
+    with raises(ValueError):
         ChromaClient(path="/tmp/x", host="127.0.0.1")
 
 
 def test_chroma_client_invalid_collection_name():
     """非法集合名（太短 / 首尾非字母数字 / 含特殊字符 / 过长）直接报错。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     from fast_agents.database import ChromaClient
     import tempfile, os
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     db = ChromaClient(path=tmp)
     for bad in ["ab", "_abc", "a" * 64, "abc!", "a b", "abc_"]:
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.create_collection(bad)
     db.close()
 
 
 def test_chroma_client_lifecycle_local_persistent():
     """本地持久化模式：建集→写→按id取→近邻搜索→按条件删→幂等建集→drop。"""
-    chromadb = pytest.importorskip("chromadb")
+    chromadb = importorskip("chromadb")
     from fast_agents.database import ChromaClient
     from fast_agents.database import VectorFilter, VectorFilterOp
     import tempfile, shutil
@@ -1276,7 +1271,7 @@ def test_chroma_client_lifecycle_local_persistent():
                                   where=VectorFilter(field="kind", op=VectorFilterOp.EQ, value="preference"))
         assert [h["id"] for h in hits_filtered] == ["m3"]
         # delete 空条件拒绝
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.delete("mem_v1")
         # 按 metadata 条件删除：删 score >= 0.9 的 → m1(0.9) 会被保留？不，m1=0.9 >=0.9 删，m3=1.0 删，剩 m2
         removed = db.delete("mem_v1", where=VectorFilter(field="score", op=VectorFilterOp.GTE, value=0.9))
@@ -1297,18 +1292,18 @@ def test_chroma_client_lifecycle_local_persistent():
 
 def test_chroma_client_add_requires_consistent_lengths():
     """embeddings/documents/metadatas 长度必须与 ids 一致。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     from fast_agents.database import ChromaClient
     import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("tt1")
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.add("tt1", ids=["a"], embeddings=[[1.0, 0.0], [0.0, 1.0]])
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.add("tt1", ids=["a"])  # 内容字段全空
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.add("tt1", ids=[])   # ids 空
         db.close()
     finally:
@@ -1317,7 +1312,7 @@ def test_chroma_client_add_requires_consistent_lengths():
 
 def test_chroma_client_search_rejects_bad_query_vector():
     """query_embedding 必须是非空向量。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     from fast_agents.database import ChromaClient
     import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
@@ -1325,9 +1320,9 @@ def test_chroma_client_search_rejects_bad_query_vector():
         db = ChromaClient(path=tmp)
         db.create_collection("tt1")
         db.add("tt1", ids=["a"], embeddings=[[1.0, 0.0]])
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.search("tt1", [])
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.search("tt1", [1.0, 0.0], n_results=0)
         db.close()
     finally:
@@ -1336,7 +1331,7 @@ def test_chroma_client_search_rejects_bad_query_vector():
 
 def test_chroma_client_count_with_where():
     """带 where 的 count 走 get include=[] 计数。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     from fast_agents.database import ChromaClient
     from fast_agents.database import VectorFilter, VectorFilterOp
     import tempfile, shutil
@@ -1356,13 +1351,13 @@ def test_chroma_client_count_with_where():
 
 def test_chroma_client_invalid_metric_rejected():
     """metric 只能是 cosine / ip / l2。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     from fast_agents.database import ChromaClient
     import tempfile, shutil
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     try:
         db = ChromaClient(path=tmp)
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.create_collection("tt1", metric="euclidean")
         db.close()
     finally:
@@ -1385,7 +1380,7 @@ def test_vector_client_base_get_signature_has_include_switches():
 
 def test_chroma_create_collection_persists_dimension_and_rejects_duplicate():
     """建集把 dimension 写进 collection metadata；重复建集抛「已存在」。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
@@ -1394,7 +1389,7 @@ def test_chroma_create_collection_persists_dimension_and_rejects_duplicate():
         db.create_collection("opt1", dimension=4, metric="cosine")
         # 维度写进了 metadata，可跨进程读回
         assert db._client.get_collection("opt1").metadata.get("dimension") == 4
-        with pytest.raises(ValueError, match="已存在"):
+        with raises(ValueError, match="已存在"):
             db.create_collection("opt1")
         db.close()
     finally:
@@ -1403,7 +1398,7 @@ def test_chroma_create_collection_persists_dimension_and_rejects_duplicate():
 
 def test_chroma_get_or_create_is_idempotent_and_keeps_dimension():
     """get_or_create 走原生幂等接口：二次调用不报错，维度仍记录。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
@@ -1419,14 +1414,14 @@ def test_chroma_get_or_create_is_idempotent_and_keeps_dimension():
 
 def test_chroma_add_rejects_duplicate_ids():
     """同一批 ids 重复应提前报错（Chroma 内部会抛 DuplicateIDError）。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt3")
-        with pytest.raises(ValueError, match="重复"):
+        with raises(ValueError, match="重复"):
             db.add("opt3", ids=["a", "a"], embeddings=[[1.0, 0.0], [0.0, 1.0]])
         db.close()
     finally:
@@ -1435,14 +1430,14 @@ def test_chroma_add_rejects_duplicate_ids():
 
 def test_chroma_add_rejects_inconsistent_batch_dimension():
     """同一批 embeddings 维度不一致应报错。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt4")
-        with pytest.raises(ValueError, match="维度不一致"):
+        with raises(ValueError, match="维度不一致"):
             db.add("opt4", ids=["a", "b"], embeddings=[[1.0, 0.0], [0.0, 1.0, 2.0]])
         db.close()
     finally:
@@ -1451,14 +1446,14 @@ def test_chroma_add_rejects_inconsistent_batch_dimension():
 
 def test_chroma_add_rejects_dimension_mismatch_with_declared():
     """写入维度与建集声明的维度不一致应报错（Chroma 空集合不校验，靠客户端补位）。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt5", dimension=3)
-        with pytest.raises(ValueError, match="声明的维度"):
+        with raises(ValueError, match="声明的维度"):
             db.add("opt5", ids=["a"], embeddings=[[1.0, 0.0]])
         db.close()
     finally:
@@ -1467,14 +1462,14 @@ def test_chroma_add_rejects_dimension_mismatch_with_declared():
 
 def test_chroma_search_rejects_dimension_mismatch():
     """检索向量维度与声明维度不一致应报错。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt6", dimension=3)
-        with pytest.raises(ValueError, match="维度"):
+        with raises(ValueError, match="维度"):
             db.search("opt6", [1.0, 0.0])
         db.close()
     finally:
@@ -1483,7 +1478,7 @@ def test_chroma_search_rejects_dimension_mismatch():
 
 def test_chroma_add_chunks_large_batch():
     """add_chunk_size 生效：分块写入仍全部落库、返回总数。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
@@ -1501,7 +1496,7 @@ def test_chroma_add_chunks_large_batch():
 
 def test_chroma_get_limit_validation_and_include_switches():
     """get 校验 limit 为正整数；include_documents / include_metadatas 关闭后不收对应字段。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
@@ -1509,9 +1504,9 @@ def test_chroma_get_limit_validation_and_include_switches():
         db = ChromaClient(path=tmp)
         db.create_collection("opt8", dimension=2)
         db.add("opt8", ids=["a"], embeddings=[[1.0, 0.0]], documents=["doc"], metadatas=[{"v": 1}])
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.get("opt8", limit=0)
-        with pytest.raises(ValueError):
+        with raises(ValueError):
             db.get("opt8", limit=-3)
         rows = db.get("opt8", include_documents=False, include_metadatas=False)
         assert rows[0]["id"] == "a"
@@ -1525,7 +1520,7 @@ def test_chroma_get_limit_validation_and_include_switches():
 
 def test_chroma_delete_ids_take_precedence_and_exact_count():
     """delete 返回精确条数；ids 与 where 同时传时以 ids 为准。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     from fast_agents.database import VectorFilter, VectorFilterOp
@@ -1557,7 +1552,7 @@ def test_chroma_delete_ids_take_precedence_and_exact_count():
 
 def test_chroma_get_or_create_tolerates_existing_collection_without_metadata():
     """对已存在但 metadata 为空的集合调用 get_or_create 不应因 Chroma 0.6.x 的合并缺陷而崩。"""
-    pytest.importorskip("chromadb")
+    importorskip("chromadb")
     import tempfile, shutil
     from fast_agents.database import ChromaClient
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
@@ -1604,7 +1599,7 @@ def test_nested_with_inner_exception_rolls_back_entire_chain(tmp_path):
     db_path = os.path.join(str(tmp_path), "nt2.db")
     db = SQLiteClient(db_path)
     db.ensure_table("nt2", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
-    with pytest.raises(ValueError, match="boom"):
+    with raises(ValueError, match="boom"):
         with db:
             db.insert("nt2", {"v": 1})
             with db:
@@ -1620,7 +1615,7 @@ def test_nested_with_outer_exception_rolls_back_all(tmp_path):
     db_path = os.path.join(str(tmp_path), "nt3.db")
     db = SQLiteClient(db_path)
     db.ensure_table("nt3", {"id": "INTEGER PRIMARY KEY AUTOINCREMENT", "v": "INTEGER"})
-    with pytest.raises(RuntimeError, match="outer"):
+    with raises(RuntimeError, match="outer"):
         with db:
             db.insert("nt3", {"v": 1})
             with db:
@@ -1635,3 +1630,164 @@ def test_connection_isolation_level_is_none():
     db = SQLiteClient(":memory:")
     assert db.conn.isolation_level is None
     db.close()
+
+
+# ---------- P0 回归测试：修复点直接命中 ----------
+
+def test_enter_transaction_failure_raises_operational_error_not_attributeerror():
+    """回归：__enter__ 里 BEGIN IMMEDIATE 失败时应抛 DatabaseOperationalError，
+    而不是因误写 self._sqlite3 导致 AttributeError。
+
+    用继承 sqlite3.Connection 的子类重写 execute 让 BEGIN 抛
+    OperationalError，模拟真实的 database is locked 场景。"""
+    import sqlite3 as _sqlite3
+
+    class _FailingBeginConn(_sqlite3.Connection):
+        def execute(self, sql, params=()):
+            if isinstance(sql, str) and "BEGIN" in sql.upper():
+                raise _sqlite3.OperationalError("database is locked")
+            return super().execute(sql, params)
+
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t_enterr", {"id": "INTEGER PRIMARY KEY", "v": "INTEGER"})
+    # 替换底层连接为会在 BEGIN 上抛错的子类实例（绕过 conn property 的自动重连）
+    db._conn.close()
+    db._conn = _FailingBeginConn(":memory:")
+    try:
+        with raises(DatabaseOperationalError, match="开启事务失败"):
+            with db:
+                pass
+        assert db._tx_depth == 0
+        assert db._in_transaction is False
+    finally:
+        db.close()
+
+
+def test_exit_commit_failure_raises_operational_error_not_attributeerror():
+    """回归：__exit__ 里 commit 失败时应抛 DatabaseOperationalError，
+    而不是 AttributeError。通过 factory 让连接一开始就是抛错子类，
+    再在这个连接上建表、写入，最后在 commit 上抛 OperationalError 模拟磁盘错误。"""
+    import sqlite3 as _sqlite3
+
+    should_fail = {"v": False}
+
+    class _FailingCommitConn(_sqlite3.Connection):
+        def commit(self):
+            if should_fail["v"]:
+                raise _sqlite3.OperationalError("disk I/O error")
+            return super().commit()
+
+    # 先通过子类 factory 建连接、建表、写入，到真正测试点再让 commit 抛错
+    db = SQLiteClient(":memory:")
+    db._conn.close()
+    db._conn = _FailingCommitConn(":memory:")
+    db.ensure_table("t_exitx", {"id": "INTEGER PRIMARY KEY", "v": "INTEGER"})
+    entered = False
+    try:
+        should_fail["v"] = True
+        with raises(DatabaseOperationalError, match="提交事务失败"):
+            with db:
+                db.insert("t_exitx", {"v": 1})
+                entered = True
+        assert entered is True
+        assert db._tx_depth == 0
+        assert db._in_transaction is False
+    finally:
+        db.close()
+
+
+def test_where_none_compiles_to_is_null_and_hits_rows():
+    """回归：select/update/delete/count 传入 where 值为 None 时，
+    都应编译为 IS NULL，跨方法行为一致（与 MySQL 后端对齐）。"""
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t_nil", {"id": "INTEGER PRIMARY KEY", "name": "TEXT", "extra": "TEXT"})
+    db.insert("t_nil", {"id": 1, "name": "a", "extra": None})
+    db.insert("t_nil", {"id": 2, "name": "b", "extra": "x"})
+    db.insert("t_nil", {"id": 3, "name": "c", "extra": None})
+
+    # select: None → IS NULL，应命中 2 行
+    rows = db.select("t_nil", where={"extra": None}, order_by="id")
+    assert [r["id"] for r in rows] == [1, 3]
+
+    # count 与 select 结果一致
+    assert db.count("t_nil", where={"extra": None}) == 2
+
+    # update: None → IS NULL，只更新 extra 为 NULL 的 2 行
+    n = db.update("t_nil", data={"name": "nil"}, where={"extra": None})
+    assert n == 2
+    assert db.count("t_nil", where={"name": "nil"}) == 2
+    assert db.count("t_nil", where={"name": "b"}) == 1
+
+    # delete: None → IS NULL
+    n = db.delete("t_nil", where={"name": "nil", "extra": None})
+    assert n == 2
+    assert db.count("t_nil") == 1
+    db.close()
+
+
+def test_check_ident_raises_database_identifier_error():
+    """回归：schema.check_ident 非法标识符应当抛 DatabaseIdentifierError
+    （它是 DatabaseValidationError 的子类，旧上层的 except ValidationError 不会断）。"""
+    from fast_agents.database.schema import check_ident
+
+    # 非法：以数字开头
+    with raises(DatabaseIdentifierError):
+        check_ident("1bad", "表名")
+    # 非法：含连字符（注入点）
+    with raises(DatabaseIdentifierError):
+        check_ident("ta;ble", "表名")
+    # 同时必须还是 DatabaseValidationError 的子类（向后兼容）
+    with raises(DatabaseValidationError):
+        check_ident("bad name", "表名")
+
+
+def test_select_where_key_must_pass_ident_whitelist():
+    """回归：select 的 where 键必须走标识符白名单，阻挡注入。"""
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t_wk", {"id": "INTEGER PRIMARY KEY"})
+    with raises(DatabaseIdentifierError):
+        db.select("t_wk", where={"id OR 1=1 --": 1})
+    db.close()
+
+
+def test_update_delete_data_and_where_keys_are_ident_checked():
+    """回归：update 的 data 键 / where 键、delete 的 where 键必须走标识符白名单。"""
+    db = SQLiteClient(":memory:")
+    db.ensure_table("t_dk", {"id": "INTEGER PRIMARY KEY", "v": "INTEGER"})
+    db.insert("t_dk", {"id": 1, "v": 10})
+    with raises(DatabaseIdentifierError):
+        db.update("t_dk", data={"v; DROP": 1}, where={"id": 1})
+    with raises(DatabaseIdentifierError):
+        db.update("t_dk", data={"v": 2}, where={"id OR 1=1": 1})
+    with raises(DatabaseIdentifierError):
+        db.delete("t_dk", where={"id--": 1})
+    # 正常写入依然可用，不破坏现有契约
+    assert db.update("t_dk", data={"v": 20}, where={"id": 1}) == 1
+    assert db.select_one("t_dk", where={"id": 1})["v"] == 20
+    db.close()
+
+
+
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
+
+
+if __name__ == "__main__":
+    print("")
+    main_of_new_add()
+    main()

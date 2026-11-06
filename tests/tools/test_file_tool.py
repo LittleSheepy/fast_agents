@@ -24,7 +24,7 @@ import time
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fast_agents.tools.builtin.file_tool import (
     ReadTool, WriteTool, EditTool, MultiEditTool, build_file_tools,
@@ -479,34 +479,26 @@ def test_13_multi_edit_accepts_dict_edits():
     print("✅ 13. MultiEdit 接受 dict 形式 edits 通过")
 
 
-# ─────────────────────────────────────────────────────────
-# 入口
-# ─────────────────────────────────────────────────────────
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
+
 
 if __name__ == "__main__":
-    tests = [
-        test_1_build_file_tools_factory,
-        test_2_read_write_basic,
-        test_3_overwrite_false_rejects_existing,
-        test_4_optimistic_lock_hit_succeeds,
-        test_5_optimistic_lock_miss_fails,
-        test_6_atomic_write_no_tmp_left,
-        test_7_backup_naming_pattern,
-        test_8_multi_edit_rollback_on_failure,
-        test_9_multi_edit_dry_run_no_change,
-        test_10_path_traversal_blocked,
-        test_11_edit_requires_unique_match,
-        test_12_cache_invalidation_after_write,
-        test_13_multi_edit_accepts_dict_edits,
-    ]
-    failed = 0
-    for t in tests:
-        try:
-            t()
-        except Exception as e:
-            failed += 1
-            print(f"❌ {t.__name__} 失败: {e}")
-            import traceback
-            traceback.print_exc()
-    print(f"\n🎉 完成：{len(tests) - failed}/{len(tests)} 通过")
-    sys.exit(0 if failed == 0 else 1)
+    print("")
+    main_of_new_add()
+    main()

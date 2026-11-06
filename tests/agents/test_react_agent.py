@@ -21,7 +21,7 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fast_agents.messages.message import Message, MsgToolCall
 from fast_agents.memory import InMemoryProfileStore, MemoryManager
@@ -449,25 +449,28 @@ def test_return_direct_short_circuits_to_final_answer():
     assert answer == "现在是 2026-11-08 15:30", f"return_direct 未直接返回工具结果: {answer!r}"
     # 关键断言：LLM 只被调用 1 次（不再走第二轮推理）
     assert llm.i == 1, f"return_direct 未短路，LLM 被调用 {llm.i} 次"
-    print("✅ test_return_direct_short_circuits_to_final_answer passed（A18）")
+
+
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
 
 
 if __name__ == "__main__":
-    test_no_tool_path()
-    test_tool_path_and_no_duplicate_system()
-    test_system_prompt_contains_tools()
-    test_add_tool_refreshes_prompt()
-    test_repeated_runs_keep_single_system()
-    test_no_duplicate_history_injection()
-    test_no_duplicate_assistant_answer()
-    test_memory_disabled()
-    test_default_memory_enabled()
-    test_skills_enabled_registers_tools_and_index()
-    test_skills_disabled()
-    test_context_enabled_builds_and_registers_tools()
-    test_context_user_input_not_duplicated()
-    test_profile_noop_when_empty_or_unconfigured()
-    test_profile_injected_into_system_tail_non_context_path()
-    test_profile_injected_via_system_tail_in_context_path()
-    test_return_direct_short_circuits_to_final_answer()
-    print("\n🎉 全部测试通过")
+    print("")
+    main_of_new_add()
+    main()

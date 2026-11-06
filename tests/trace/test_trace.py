@@ -1,6 +1,6 @@
 """trace 模块单元测试。
 
-全部用内存 JsonlStore 或 pytest tmp_path 临时目录，不依赖外部服务、不产生真实 API 请求。
+全部用内存 JsonlStore 或 tests._runner.tmp_path() 临时目录，不依赖外部服务、不产生真实 API 请求。
 覆盖点：
     - 默认关闭（tracer=None 零开销，不传时 LLM/Agent 行为不变）
     - SpanKind / SpanStatus / SpanRecord 字段/finish（含可选 end_time 精确对齐）
@@ -25,7 +25,7 @@
 
 运行方式（Windows PowerShell，在项目根目录）:
     python test\\test_trace.py
-    或：pytest test/test_trace.py -v
+    （无需 pytest，纯标准库）
 """
 from __future__ import annotations
 
@@ -34,9 +34,9 @@ import os
 import sys
 from typing import Any, List, Optional
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import pytest
+from tests._runner import raises, tmp_path
 
 from fast_agents.trace import (
     JsonlStore,
@@ -376,7 +376,7 @@ def test_with_span_records_on_normal_exit():
 def test_with_span_marks_error_on_exception():
     """with span 内抛异常时自动记 status=error，并记录 error 字段，异常继续向上抛。"""
     t = TraceLogger()
-    with pytest.raises(ValueError, match="boom"):
+    with raises(ValueError, match="boom"):
         with t.trace("demo"):
             with t.span("bad", SpanKind.CUSTOM):
                 raise ValueError("boom")
@@ -1328,6 +1328,26 @@ def test_replay_uses_inner_most_active_trace_in_nested_context():
         t.close()
 
 
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
+
+
 if __name__ == "__main__":
-    import sys
-    sys.exit(pytest.main([__file__, "-v"]))
+    print("")
+    main_of_new_add()
+    main()

@@ -17,7 +17,7 @@ import tempfile
 import warnings
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fast_agents.memory import (
     BufferMemory,
@@ -1154,44 +1154,28 @@ def test_b12_no_ttl_behavior_unchanged():
         ch.close()
         sem.close()
         inner.close()
-    print("✅ test_b12_no_ttl_behavior_unchanged 通过（B12 向后兼容 + 两包装器 search 过滤一致）")
+
+
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
 
 
 if __name__ == "__main__":
-    test_buffer_sliding_window()
-    test_buffer_summary()
-    test_sqlite_crud()
-    test_preference_always_recalled()
-    test_revise_keeps_history()
-    test_scope_isolation()
-    test_scope_user_vs_session()
-    test_manager_flow()
-    test_dedup()
-    test_memory_tool()
-    test_tool_schema()
-    test_scoring()
-    test_semantic_synonym_recall()
-    test_semantic_graceful_degrade()
-    test_semantic_revise_and_crud()
-    test_profile_merge_and_override()
-    test_profile_sqlite_persistence()
-    test_profile_manager_integration()
-    test_profile_tool()
-    test_touch_records_access()
-    test_archive_stale()
-    test_merge_similar_semantic()
-    test_manager_compact_and_retrieve_touch()
-    test_chroma_store_pure_lexical_degrade()
-    test_chroma_store_b5_proxy_methods()
-    test_b10_auto_extract_watermark()
-    test_b11_manager_revise_forward()
-    test_chroma_store_with_manager_integration()
-    test_sqlite_upsert_full_column_overwrite()
-    test_touch_scope_isolation_in()
-    test_session_store_persistence()
-    test_b8_time_is_cst()
-    test_b12_ttl_retrieve_filter()
-    test_b12_compact_purge_expired()
-    test_b12_expires_at_sqlite_persistence()
-    test_b12_no_ttl_behavior_unchanged()
-    print("\n🎉 全部测试通过")
+    print("")
+    main_of_new_add()
+    main()

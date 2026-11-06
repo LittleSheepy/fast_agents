@@ -6,7 +6,7 @@
 import sys
 import os
 import json
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fast_agents.tools import (
     ToolBase, StructuredTool, tool,
@@ -1348,7 +1348,7 @@ def test_a23_builtin_lazy_import():
     import subprocess
     from pathlib import Path
 
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = Path(__file__).resolve().parents[2]
     code = (
         "import os, sys, types\n"
         "root = os.environ['FA_ROOT']\n"
@@ -1376,81 +1376,26 @@ def test_a23_builtin_lazy_import():
     print("✅ A23 builtin 延迟导入（隔离验证：不提前拉起 memory/mcp、按需加载、API 兼容）通过")
 
 
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
+
+
 if __name__ == "__main__":
-    from pathlib import Path  # for test_terminal
-    tests = [
-        test_1_class_inheritance,
-        test_2_decorator,
-        test_3_from_function,
-        test_4_register_plain_function,
-        test_validation,
-        test_result_types,
-        test_tool_result_ok_fail,
-        test_schema_multi_provider,
-        test_calculator,
-        test_terminal,
-        test_read_file,
-        test_registry_batch_and_hook,
-        test_plus_operator,
-        test_truncation_preserves_dict_artifact,
-        test_truncation_preserves_non_dict_artifact,
-        test_read_large_file_preserves_hash_for_optimistic_lock,
-        test_nested_model_ref_expansion,
-        test_coerce_dict_to_json,
-        test_coerce_ensure_ascii_false,
-        test_coerce_list_to_json,
-        test_coerce_none_and_str_unchanged,
-        test_coerce_fallback_for_non_serializable,
-        test_truncated_semantics,
-        test_success_is_not_truncated,
-        test_concurrent_runs_in_parallel,
-        test_concurrent_empty_calls_returns_empty,
-        test_concurrent_exception_isolated,
-        test_concurrent_partial_timeout,
-        test_approval_approved,
-        test_approval_rejected,
-        test_approval_modified_args,
-        test_approval_callback_exception,
-        test_approval_skipped_without_callback,
-        test_approval_not_triggered_for_unmarked_tool,
-        test_approval_skip_flag_bypasses_callback,
-        test_timeout_returns_failure,
-        test_timeout_not_triggered_when_fast,
-        test_duration_ms_is_int,
-        test_write_append_preserves_existing_content,
-        test_terminal_platform_guard,
-        test_terminal_truncation_delegated_to_base,
-        test_decorator_metadata_requires_approval,
-        test_from_function_metadata_and_error_flag,
-        test_tool_return_direct_flag_set,
-        test_merge_invalid_json_same_message,
-        test_merge_json_array_rejected,
-        test_merge_non_dict_type_rejected,
-        test_merge_empty_string_is_empty_dict,
-        test_merge_kwargs_override_tool_input,
-        test_merge_ainvoke_consistent,
-        test_concurrent_same_tool_twice_preserves_both_results,
-        test_concurrent_approval_called_per_tool_on_main_thread,
-        test_concurrent_approval_rejected_skips_execution,
-        test_concurrent_timeout_returns_promptly,
-        test_concurrent_no_nested_executor,
-        test_timeout_abandoned_metadata_marker,
-        # ── A22 ToolRegistry 清理与隔离 ──
-        test_register_strict_mode_raises_on_duplicate,
-        test_register_non_strict_mode_warns_and_overwrites,
-        test_clear_resets_approval_callback,
-        test_no_thread_local_dead_code,
-        # ── A23 builtin 延迟导入 ──
-        test_a23_builtin_lazy_import,
-    ]
-    failed = 0
-    for t in tests:
-        try:
-            t()
-        except Exception as e:
-            failed += 1
-            print(f"❌ {t.__name__} 失败: {e}")
-            import traceback
-            traceback.print_exc()
-    print(f"\n🎉 完成：{len(tests) - failed}/{len(tests)} 通过")
-    sys.exit(0 if failed == 0 else 1)
+    print("")
+    main_of_new_add()
+    main()

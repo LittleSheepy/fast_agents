@@ -24,7 +24,7 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fast_agents.context import (
     ContextBuilder,
@@ -504,38 +504,26 @@ def test_file_tools_single_source_no_overlap():
     print("✅ test_file_tools_single_source_no_overlap 通过")
 
 
-# ============================================================
-# 入口
-# ============================================================
+# ==================== 入口 ====================
 
 def main():
-    tests = [
-        test_token_counter,
-        test_token_budget,
-        test_window_layer_order,
-        test_window_validate_tool_pairing,
-        test_offloader_threshold,
-        test_offloader_offload_and_read,
-        test_offloader_read_line_range,
-        test_offloader_max_files_eviction,
-        test_offloader_safety,
-        test_compressor_trim_keeps_tool_pairing,
-        test_compressor_offload_level,
-        test_compressor_summary_level,
-        test_builder_pipeline_and_order,
-        test_builder_budget_trims,
-        test_file_tools_via_builtin,
-        test_read_offloaded_tool_and_factory,
-        test_file_tools_single_source_no_overlap,
-    ]
-    passed = 0
-    for t in tests:
-        t()
-        passed += 1
-    print(f"\n{'=' * 60}")
-    print(f"✅ context 模块测试全部通过：{passed}/{len(tests)} 项")
-    print(f"{'=' * 60}")
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
 
 
 if __name__ == "__main__":
+    print("")
+    main_of_new_add()
     main()

@@ -7,7 +7,7 @@ import sys
 import os
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fast_agents.mcp import (
     MCPRegistry, MCPClient, StdioTransport, MCPToolAdapter, MCPServerTool,
@@ -234,17 +234,26 @@ def test_9_mcp_config_and_schema_export():
         client.close()
 
 
+# ==================== 入口 ====================
+
+def main():
+    from tests._runner import run_all
+    raise SystemExit(run_all(globals()))
+
+
+def main_of_new_add():
+    """新添加的测试在这里跑
+    1.跑新加的测试
+    2.修改bug可以跑针对性测试
+    """
+    # 人工添加测针对测试：AI不要删除覆盖
+    pass
+
+    # AI新添加的测试(AI可以删除覆盖)
+    pass
+
+
 if __name__ == "__main__":
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    passed = 0
-    for fn in tests:
-        try:
-            fn()
-            print(f"✅ {fn.__name__}")
-            passed += 1
-        except Exception as e:
-            import traceback
-            print(f"❌ {fn.__name__}: {e}")
-            traceback.print_exc()
-    print(f"\n共 {len(tests)} 项，通过 {passed} 项")
-    sys.exit(0 if passed == len(tests) else 1)
+    print("")
+    main_of_new_add()
+    main()
