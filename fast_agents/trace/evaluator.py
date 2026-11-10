@@ -671,6 +671,521 @@ class TraceEvaluator:
 
 
 # ---------------------------------------------------------------------------
+# 默认模型价目表（USD / 1M tokens，2026 年公开价目表典型值；用于成本估算）
+# ---------------------------------------------------------------------------
+# 结构：{模型前缀: (input_price, output_price)}，按"最长前缀优先"匹配。
+# 例如 "gpt-4o-mini" 优先于 "gpt-4o"。未命中时走 DEFAULT_PRICE。
+# 单位：美元 / 每百万 tokens。
+DEFAULT_PRICE_TABLE: Dict[str, tuple] = {
+    # OpenAI
+    "gpt-4o-mini":          (0.15,  0.60),
+    "gpt-4o":               (2.50,  10.00),
+    "gpt-4-turbo":          (10.00, 30.00),
+    "gpt-4":                (30.00, 60.00),
+    "gpt-3.5-turbo":        (0.50,  1.50),
+    "o1-mini":              (1.10,  4.40),
+    "o1":                   (15.00, 60.00),
+    "o3-mini":              (1.10,  4.40),
+    # DeepSeek
+    "deepseek-chat":        (0.14,  0.28),
+    "deepseek-reasoner":    (0.55,  2.19),
+    # Anthropic
+    "claude-3-5-sonnet":    (3.00,  15.00),
+    "claude-3-5-haiku":     (0.80,  4.00),
+    "claude-3-opus":        (15.00, 75.00),
+    # 阿里 Qwen
+    "qwen-max":             (2.40,  9.60),
+    "qwen-plus":            (0.80,  2.00),
+    "qwen-turbo":           (0.30,  0.60),
+    # 智谱 GLM
+    "glm-4":                (12.00, 12.00),
+    "glm-4-flash":          (0.10,  0.10),
+    # 字节豆包
+    "doubao-pro":           (0.80,  2.00),
+    "doubao-lite":          (0.30,  0.60),
+    # 百度 ERNIE
+    "ernie-4.0":            (12.00, 12.00),
+    "ernie-3.5":            (1.20,  1.20),
+}
+DEFAULT_PRICE: tuple = (0.50, 1.50)  # 未命中模型时的兜底价（与 gpt-3.5 同档）
+
+
+# ---------------------------------------------------------------------------
+# 单日成本指标
+# ---------------------------------------------------------------------------
+@dataclass
+class DayCostMetrics:
+    """单自然日的成本 / Token / 调用量聚合。
+
+    所有字段均有合理零值；数据不足时返回 0/空，绝不抛异常。
+    """
+    date: str = ""                                       # YYYY-MM-DD（按指定时区）
+    trace_count: int = 0
+    successful_traces: int = 0
+    failed_traces: int = 0
+    success_rate: Optional[float] = None
+
+    llm_calls: int = 0
+    tool_calls: int = 0
+    total_duration_ms: float = 0.0
+    avg_duration_ms: Optional[float] = None
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    input_cost_usd: float = 0.0      # 输入成本（美元）
+    output_cost_usd: float = 0.0     # 输出成本（美元）
+    total_cost_usd: float = 0.0      # 总成本（美元）
+    avg_cost_per_trace_usd: Optional[float] = None
+
+    error_count: int = 0
+    llm_error_count: int = 0
+    tool_error_count: int = 0
+
+    # per-model 当日明细：{model: {"calls":, "prompt":, "completion":, "cost":}}
+    model_breakdown: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    tool_distribution: Dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        for k in ("success_rate", "total_duration_ms", "avg_duration_ms",
+                  "input_cost_usd", "output_cost_usd", "total_cost_usd",
+                  "avg_cost_per_trace_usd"):
+            v = d.get(k)
+            if isinstance(v, float):
+                d[k] = round(v, 4)
+        # 模型明细里的浮点也 round 一下
+        for m, md in d.get("model_breakdown", {}).items():
+            for kk, vv in md.items():
+                if isinstance(vv, float):
+                    md[kk] = round(vv, 4)
+        return d
+
+
+# ---------------------------------------------------------------------------
+# 成本日报导出列（顺序稳定，与 DayCostMetrics 字段对齐）
+# ---------------------------------------------------------------------------
+DAILY_CSV_COLUMNS: List[str] = [
+    "date",
+    "trace_count",
+    "successful_traces",
+    "failed_traces",
+    "success_rate",
+    "llm_calls",
+    "tool_calls",
+    "total_duration_ms",
+    "avg_duration_ms",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_cost_usd",
+    "output_cost_usd",
+    "total_cost_usd",
+    "avg_cost_per_trace_usd",
+    "error_count",
+    "llm_error_count",
+    "tool_error_count",
+    "model_breakdown",
+    "tool_distribution",
+]
+
+
+# ---------------------------------------------------------------------------
+# 成本日报（跨多天聚合）
+# ---------------------------------------------------------------------------
+@dataclass
+class CostDailyReport:
+    """按自然日聚合的成本报告。"""
+
+    days: List[DayCostMetrics] = field(default_factory=list)
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    timezone_offset_hours: int = 8
+
+    # 整段周期合计
+    total_traces: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    total_input_cost_usd: float = 0.0
+    total_output_cost_usd: float = 0.0
+    total_cost_usd: float = 0.0
+    total_llm_calls: int = 0
+    total_tool_calls: int = 0
+    total_errors: int = 0
+    overall_success_rate: Optional[float] = None
+
+    price_table_used: Dict[str, list] = field(default_factory=dict)
+    price_default: Optional[list] = None
+    generated_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        d = asdict(self)
+        d["days"] = [day.to_dict() for day in self.days]
+        for k in ("total_input_cost_usd", "total_output_cost_usd", "total_cost_usd",
+                  "overall_success_rate"):
+            v = d.get(k)
+            if isinstance(v, float):
+                d[k] = round(v, 4)
+        return d
+
+    def to_json(self, indent: int = 2, ensure_ascii: bool = False) -> str:
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=ensure_ascii, default=str)
+
+    def to_text(self, currency: str = "$") -> str:
+        """生成人类可读的成本日报文本。"""
+        lines: List[str] = []
+        lines.append("=" * 68)
+        lines.append("Trace Token 成本日报（K3）")
+        lines.append("=" * 68)
+        rng = (f"{self.start_date} ~ {self.end_date}"
+               if self.start_date and self.end_date else "全部数据")
+        tz_label = f"UTC{'+' if self.timezone_offset_hours >= 0 else ''}{self.timezone_offset_hours}"
+        lines.append(f"统计区间           : {rng}  ({tz_label})")
+        if self.generated_at:
+            lines.append(f"生成时间           : {self.generated_at}")
+        lines.append(f"总 Trace 数        : {self.total_traces}")
+        if self.overall_success_rate is not None:
+            lines.append(f"整体成功率         : {self.overall_success_rate*100:.1f}%")
+        lines.append(f"总 LLM / 工具调用  : {self.total_llm_calls} / {self.total_tool_calls}")
+        lines.append(
+            f"总 Token 消耗      : {self.total_tokens:,} "
+            f"(prompt {self.total_prompt_tokens:,} / completion {self.total_completion_tokens:,})"
+        )
+        lines.append(
+            f"总成本估算         : {currency}{self.total_cost_usd:.4f} "
+            f"(输入 {currency}{self.total_input_cost_usd:.4f} / "
+            f"输出 {currency}{self.total_output_cost_usd:.4f})"
+        )
+        lines.append(f"总错误 Span 数     : {self.total_errors}")
+        lines.append("-" * 68)
+        if not self.days:
+            lines.append("（区间内无 trace 数据）")
+        else:
+            lines.append("【每日明细】")
+            header = (f"  {'日期':<12s} {'traces':>6s} {'成功率':>7s} "
+                      f"{'tokens':>10s} {'cost($)':>10s} {'errors':>6s}")
+            lines.append(header)
+            lines.append("  " + "-" * 60)
+            for d in self.days:
+                sr = f"{d.success_rate*100:.0f}%" if d.success_rate is not None else "N/A"
+                lines.append(
+                    f"  {d.date:<12s} {d.trace_count:>6d} {sr:>7s} "
+                    f"{d.total_tokens:>10,d} {d.total_cost_usd:>10.4f} {d.error_count:>6d}"
+                )
+            # 模型成本 Top5
+            model_costs: Dict[str, float] = {}
+            for d in self.days:
+                for m, info in d.model_breakdown.items():
+                    model_costs[m] = model_costs.get(m, 0.0) + float(info.get("cost", 0.0) or 0.0)
+            if model_costs:
+                lines.append("-" * 68)
+                lines.append("【模型成本 Top5】")
+                for m, c in sorted(model_costs.items(), key=lambda x: -x[1])[:5]:
+                    lines.append(f"  {m:<25s} {currency}{c:.4f}")
+        lines.append("=" * 68)
+        return "\n".join(lines)
+
+    def to_csv(self, path: Optional[str] = None, *, encoding: str = "utf-8-sig") -> str:
+        """按"每天一行"导出 CSV，列固定为 :data:`DAILY_CSV_COLUMNS`。"""
+        buf = io.StringIO()
+        try:
+            writer = csv.writer(buf)
+            writer.writerow(DAILY_CSV_COLUMNS)
+            for d in self.days:
+                try:
+                    row = [_csv_cell(getattr(d, col, None)) for col in DAILY_CSV_COLUMNS]
+                except Exception:
+                    row = ["" for _ in DAILY_CSV_COLUMNS]
+                writer.writerow(row)
+        except Exception:
+            pass
+        text = buf.getvalue()
+        if path:
+            try:
+                with open(path, "w", encoding=encoding, newline="") as f:
+                    f.write(text)
+            except Exception:
+                pass
+        return text
+
+
+# ---------------------------------------------------------------------------
+# 内部工具函数（价格匹配）
+# ---------------------------------------------------------------------------
+def _match_price(
+    model: Optional[str],
+    price_table: Dict[str, tuple],
+    default: tuple,
+) -> tuple:
+    """按"最长前缀优先"匹配模型价目；任何异常都返回 default。"""
+    try:
+        if not model:
+            return default
+        m = str(model).strip().lower()
+        # 收集所有命中前缀，取最长
+        matched: Optional[tuple] = None
+        matched_len = -1
+        for prefix, price in price_table.items():
+            pl = prefix.lower()
+            if m.startswith(pl) and len(pl) > matched_len:
+                matched = price
+                matched_len = len(pl)
+        return matched if matched is not None else default
+    except Exception:
+        return default
+
+
+def _to_date_key(ts: Optional[float], tz_offset_hours: int) -> Optional[str]:
+    """把秒级时间戳按指定时区偏移转为 'YYYY-MM-DD'；异常返回 None。"""
+    try:
+        if ts is None:
+            return None
+        from datetime import datetime, timezone, timedelta
+        tz = timezone(timedelta(hours=tz_offset_hours))
+        return datetime.fromtimestamp(float(ts), tz=tz).strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# 在 TraceEvaluator 上追加 daily_cost_report 方法
+# ---------------------------------------------------------------------------
+def _daily_cost_report(
+    self,
+    *,
+    price_table: Optional[Dict[str, tuple]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    timezone_offset_hours: int = 8,
+    session_id: Optional[str] = None,
+) -> CostDailyReport:
+    """生成按自然日聚合的 Token 成本日报（K3 高阶扩展）。
+
+    每条 trace 归属到其 **root Span 的 start_time 所在自然日**（按指定时区，默认
+    北京时间 UTC+8）。LLM Span 的 token / 模型从 ``metadata.usage`` 与
+    ``metadata.model`` 取；成本按 ``price_table`` 估算：键为模型名前缀、值为
+    ``(input_price_per_1M, output_price_per_1M)``（美元 / 百万 tokens），**最长
+    前缀优先**匹配，未命中时走默认兜底价。
+
+    Args:
+        price_table: 自定义价目表；不传则用模块内置 :data:`DEFAULT_PRICE_TABLE`
+            （覆盖 gpt-4o / deepseek-chat / claude-3-5-sonnet / qwen / glm-4 /
+            doubao / ernie 等常见模型）。传入后会与默认表**合并**（传入值优先），
+            完全覆盖单条模型单价请直接传入完整 dict。
+        start_date: 可选，起始日期字符串 ``"YYYY-MM-DD"``（含当天）。
+        end_date: 可选，结束日期字符串 ``"YYYY-MM-DD"``（含当天）。
+        timezone_offset_hours: 时区偏移（小时），默认 8 即北京时间（CST）。
+        session_id: 可选，按会话过滤。
+
+    Returns:
+        :class:`CostDailyReport`——所有字段都有零值兜底；任何数据异常都不抛异常。
+    """
+    from datetime import datetime, timezone, timedelta
+    report = CostDailyReport()
+    try:
+        tz = timezone(timedelta(hours=timezone_offset_hours))
+        report.timezone_offset_hours = timezone_offset_hours
+        report.generated_at = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S CST"
+                                                       if timezone_offset_hours == 8 else "%Y-%m-%d %H:%M:%S %z")
+    except Exception:
+        report.generated_at = None
+
+    # 合并价目表
+    try:
+        merged: Dict[str, tuple] = dict(DEFAULT_PRICE_TABLE)
+        if price_table:
+            for k, v in price_table.items():
+                if isinstance(v, (tuple, list)) and len(v) >= 2:
+                    merged[str(k)] = (float(v[0]), float(v[1]))
+        report.price_table_used = {k: [float(a), float(b)] for k, (a, b) in merged.items()}
+        report.price_default = [float(DEFAULT_PRICE[0]), float(DEFAULT_PRICE[1])]
+    except Exception:
+        merged = dict(DEFAULT_PRICE_TABLE)
+
+    # 过滤 spans
+    spans = list(self._spans or [])
+    try:
+        if session_id is not None:
+            spans = [s for s in spans if s.session_id == session_id]
+    except Exception:
+        pass
+
+    # 按 trace 分组
+    groups: Dict[str, List[SpanRecord]] = {}
+    for s in spans:
+        try:
+            groups.setdefault(s.trace_id, []).append(s)
+        except Exception:
+            continue
+
+    # 按天聚合
+    day_map: Dict[str, DayCostMetrics] = {}
+    for tid, t_spans in groups.items():
+        try:
+            # 排序找 root
+            try:
+                t_spans.sort(key=lambda s: (getattr(s, "_create_seq", 0), s.start_time, s.span_id))
+            except Exception:
+                pass
+            roots = [x for x in t_spans if x.parent_id is None]
+            root = min(roots, key=lambda s: getattr(s, "_create_seq", 0) or s.start_time) if roots else None
+            # 用 root.start_time 归日；没 root 就用最早的 start
+            anchor_ts: Optional[float] = None
+            if root is not None:
+                anchor_ts = root.start_time
+            else:
+                try:
+                    anchor_ts = min((x.start_time for x in t_spans if x.start_time), default=None)
+                except Exception:
+                    anchor_ts = None
+            day_key = _to_date_key(anchor_ts, timezone_offset_hours)
+            if day_key is None:
+                continue
+
+            # 日期范围过滤
+            if start_date and day_key < start_date:
+                continue
+            if end_date and day_key > end_date:
+                continue
+
+            dm = day_map.setdefault(day_key, DayCostMetrics(date=day_key))
+            dm.trace_count += 1
+            trace_success = True
+            trace_duration_max_end: Optional[float] = None
+            trace_duration_min_start: Optional[float] = None
+            for s in t_spans:
+                try:
+                    st = s.start_time
+                    et = s.end_time if s.end_time is not None else st
+                    if trace_duration_min_start is None or st < trace_duration_min_start:
+                        trace_duration_min_start = st
+                    if trace_duration_max_end is None or et > trace_duration_max_end:
+                        trace_duration_max_end = et
+                except Exception:
+                    pass
+                try:
+                    kind_str = s.kind.value if isinstance(s.kind, SpanKind) else str(s.kind)
+                    dur = s.duration_ms if s.duration_ms is not None else 0.0
+                    if kind_str == SpanKind.LLM.value:
+                        dm.llm_calls += 1
+                        # token & cost
+                        pt = ct = tt = 0
+                        meta = s.metadata if isinstance(s.metadata, dict) else {}
+                        usage = meta.get("usage") if isinstance(meta, dict) else None
+                        model = meta.get("model") if isinstance(meta, dict) else None
+                        if isinstance(usage, dict):
+                            pt = _safe_int(usage.get("prompt_tokens"))
+                            ct = _safe_int(usage.get("completion_tokens"))
+                            tt = _safe_int(usage.get("total_tokens")) or (pt + ct)
+                        dm.prompt_tokens += pt
+                        dm.completion_tokens += ct
+                        dm.total_tokens += tt
+                        in_p, out_p = _match_price(model, merged, DEFAULT_PRICE)
+                        in_cost = pt * in_p / 1_000_000.0
+                        out_cost = ct * out_p / 1_000_000.0
+                        dm.input_cost_usd += in_cost
+                        dm.output_cost_usd += out_cost
+                        dm.total_cost_usd += (in_cost + out_cost)
+                        if model:
+                            mk = str(model)
+                            mb = dm.model_breakdown.setdefault(
+                                mk, {"calls": 0, "prompt_tokens": 0,
+                                     "completion_tokens": 0, "total_tokens": 0,
+                                     "input_cost": 0.0, "output_cost": 0.0,
+                                     "cost": 0.0})
+                            mb["calls"] += 1
+                            mb["prompt_tokens"] += pt
+                            mb["completion_tokens"] += ct
+                            mb["total_tokens"] += tt
+                            mb["input_cost"] += in_cost
+                            mb["output_cost"] += out_cost
+                            mb["cost"] += (in_cost + out_cost)
+                        if s.status == SpanStatus.ERROR:
+                            dm.llm_error_count += 1
+                    elif kind_str == SpanKind.TOOL.value:
+                        dm.tool_calls += 1
+                        tname = None
+                        if isinstance(s.metadata, dict):
+                            tname = s.metadata.get("tool_name")
+                        if not tname and isinstance(s.name, str) and s.name.startswith("tool."):
+                            tname = s.name[len("tool."):]
+                        if not tname:
+                            tname = s.name or "unknown"
+                        dm.tool_distribution[str(tname)] = dm.tool_distribution.get(str(tname), 0) + 1
+                        if s.status == SpanStatus.ERROR:
+                            dm.tool_error_count += 1
+                    if s.status == SpanStatus.ERROR:
+                        dm.error_count += 1
+                        if root is None or s is not root:
+                            trace_success = False
+                except Exception:
+                    pass
+            # 判定 trace 成功与否（参考 _compute_trace_metrics 口径）
+            try:
+                if root is not None:
+                    trace_success = (root.status == SpanStatus.SUCCESS
+                                     and not root.error and trace_success)
+                else:
+                    trace_success = trace_success  # 已在扫描中置 False
+                if trace_success:
+                    dm.successful_traces += 1
+                else:
+                    dm.failed_traces += 1
+            except Exception:
+                dm.successful_traces += 1
+            # 端到端耗时累加
+            try:
+                if (trace_duration_min_start is not None
+                        and trace_duration_max_end is not None
+                        and trace_duration_max_end >= trace_duration_min_start):
+                    dm.total_duration_ms += (trace_duration_max_end - trace_duration_min_start) * 1000.0
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    # 排序（按日期升序）并补平均值
+    try:
+        days_sorted = sorted(day_map.values(), key=lambda d: d.date)
+        for d in days_sorted:
+            if d.trace_count > 0:
+                d.success_rate = d.successful_traces / d.trace_count
+                d.avg_duration_ms = d.total_duration_ms / d.trace_count
+                d.avg_cost_per_trace_usd = d.total_cost_usd / d.trace_count
+        report.days = days_sorted
+        if days_sorted:
+            report.start_date = start_date or days_sorted[0].date
+            report.end_date = end_date or days_sorted[-1].date
+    except Exception:
+        pass
+
+    # 整段周期合计
+    try:
+        report.total_traces = sum(d.trace_count for d in report.days)
+        report.total_prompt_tokens = sum(d.prompt_tokens for d in report.days)
+        report.total_completion_tokens = sum(d.completion_tokens for d in report.days)
+        report.total_tokens = sum(d.total_tokens for d in report.days)
+        report.total_input_cost_usd = sum(d.input_cost_usd for d in report.days)
+        report.total_output_cost_usd = sum(d.output_cost_usd for d in report.days)
+        report.total_cost_usd = sum(d.total_cost_usd for d in report.days)
+        report.total_llm_calls = sum(d.llm_calls for d in report.days)
+        report.total_tool_calls = sum(d.tool_calls for d in report.days)
+        report.total_errors = sum(d.error_count for d in report.days)
+        succ = sum(d.successful_traces for d in report.days)
+        if report.total_traces > 0:
+            report.overall_success_rate = succ / report.total_traces
+    except Exception:
+        pass
+
+    return report
+
+
+# 把方法挂到 TraceEvaluator 上
+TraceEvaluator.daily_cost_report = _daily_cost_report
+
+
+# ---------------------------------------------------------------------------
 # 内部工具函数
 # ---------------------------------------------------------------------------
 def _safe_int(v: Any) -> int:
@@ -709,11 +1224,23 @@ def _percentile(values: List[float], pct: float) -> float:
 
 
 def _csv_scalar(v: Any) -> str:
-    """把单个标量转成 CSV 单元格字符串（内部换行折成空格，绝不抛异常）。"""
+    """把单个标量转成 CSV 单元格字符串（内部换行折成空格，绝不抛异常）。
+
+    - ``None`` → 空串；
+    - ``bool`` → ``"true" / "false"``；
+    - ``float`` → 保留 4 位小数（避免 0.0004199999... 浮点噪声）；
+    - 其它 → str() 后替换换行。
+    """
     if v is None:
         return ""
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, float):
+        try:
+            # round 到 4 位，再去掉无意义尾零
+            return f"{round(v, 4):.4f}".rstrip("0").rstrip(".") or "0"
+        except Exception:
+            return str(v)
     try:
         s = str(v)
     except Exception:
@@ -725,10 +1252,27 @@ def _csv_cell(v: Any) -> str:
     """把任意指标值转成 CSV 单元格字符串（dict / list 折叠为可读文本，绝不抛异常）。
 
     - ``bool`` → ``"true"`` / ``"false"``（Excel / pandas 可识别为布尔）；
+    - ``float`` → round 到 4 位小数（杜绝 0.0004199999... 浮点噪声）；
     - ``dict`` → ``"key=val;key2=val2"``，按值降序（如工具分布从高到低）；
     - ``list`` / ``tuple`` / ``set`` → ``" | "`` 连接；
     - ``None`` → 空串。
     """
+    def _fmt(x: Any) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, bool):
+            return "true" if x else "false"
+        if isinstance(x, float):
+            try:
+                return f"{round(x, 4):.4f}".rstrip("0").rstrip(".") or "0"
+            except Exception:
+                return str(x)
+        try:
+            s = str(x)
+        except Exception:
+            return ""
+        return s.replace("\r", " ").replace("\n", " ")
+
     try:
         if isinstance(v, dict):
             def _sort_key(kv: Any) -> Any:
@@ -736,12 +1280,23 @@ def _csv_cell(v: Any) -> str:
                 if isinstance(val, (int, float)) and not isinstance(val, bool):
                     return -val
                 return 0
-
             items = sorted(v.items(), key=_sort_key)
-            return ";".join(f"{_csv_scalar(k)}={_csv_scalar(val)}" for k, val in items)
+            parts = []
+            for k, val in items:
+                if isinstance(val, dict):
+                    # 嵌套 dict（如 model_breakdown）：递归格式化为 "key=val,..." 字符串
+                    sub = ",".join(
+                        f"{sk}:{_fmt(sv)}" for sk, sv in val.items()
+                    )
+                    parts.append(f"{_fmt(k)}={{{sub}}}")
+                elif isinstance(val, (list, tuple, set)):
+                    parts.append(f"{_fmt(k)}=[{'|'.join(_fmt(x) for x in val)}]")
+                else:
+                    parts.append(f"{_fmt(k)}={_fmt(val)}")
+            return ";".join(parts)
         if isinstance(v, (list, tuple, set)):
-            return " | ".join(_csv_scalar(x) for x in v)
-        return _csv_scalar(v)
+            return " | ".join(_fmt(x) for x in v)
+        return _fmt(v)
     except Exception:
         try:
             return str(v)
@@ -753,4 +1308,8 @@ __all__ = [
     "TraceMetrics",
     "EvaluationReport",
     "TraceEvaluator",
+    "DayCostMetrics",
+    "CostDailyReport",
+    "DEFAULT_PRICE_TABLE",
+    "DAILY_CSV_COLUMNS",
 ]

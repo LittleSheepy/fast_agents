@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents **Trace（全链路可观测性）**系统，参考 **OpenTelemetry Trace/Span 模型**、**LangChain Callbacks/Tracer**、**OpenAI Agents SDK Tracing** 的核心概念（trace / span / 父子关系 / 钩子），给出本模块的完整说明、源码解析与自定义教程。同时对齐 fast_agents 已交付的 tools / memory / mcp / skills / context / database 模块文档骨架，做到「翻开任何一份模块说明，都知道在哪一节能找到什么」。
 
-> **版本**：v1.0.0 · 2026-11-10 · 初版（路线图 K1 最小闭环 + K3 评估工具）：Trace/Span 数据模型 + TraceLogger 记录器 + JsonlStore（默认）+ SQLiteStore（结构化后端）+ ToolRegistry 钩子打点 + LLM/Agent 可选接入 + LLM token/model 元数据 + tool 真实耗时 + 查询/回放 + 后端自动后缀识别 + **TraceEvaluator 离线评估器**（成本/效率/质量三类指标聚合、dict/JSON/文本/CSV 四格式输出）
+> **版本**：v1.0.0 · 2026-11-10 · 初版（路线图 K1 最小闭环 + K3 评估工具/成本日报）：Trace/Span 数据模型 + TraceLogger 记录器 + JsonlStore（默认）+ SQLiteStore（结构化后端）+ ToolRegistry 钩子打点 + LLM/Agent 可选接入 + LLM token/model 元数据 + tool 真实耗时 + 查询/回放 + 后端自动后缀识别 + **TraceEvaluator 离线评估器**（成本/效率/质量三类指标聚合、dict/JSON/文本/CSV 四格式输出）+ **Token 成本日报**（按自然日聚合、模型价目表自动匹配、JSON/文本/CSV 三格式导出）
 > **适用版本**：`fast_agents.trace`
-> **配套代码**：`fast_agents/trace/`（**7 个**源码文件）+ `tests/trace/test_trace.py`（**67 项**用例）+ `tests/trace/test_trace_eval.py`（**27 项** K3 评估器用例，共 **94 项**全绿）+ `examples/trace/`（**5 个**可运行示例）
+> **配套代码**：`fast_agents/trace/`（**7 个**源码文件）+ `tests/trace/test_trace.py`（**67 项** K1 用例）+ `tests/trace/test_trace_eval.py`（**27 项** K3 评估器用例）+ `tests/trace/test_trace_cost.py`（**16 项** K3 成本日报用例，共 **110 项**全绿）+ `examples/trace/`（**6 个**可运行示例）
 > **运行环境**：Python 3.10+（仓库 `.python-version` = 3.10），**Windows 平台**（仓库当前唯一目标平台，见 `AGENTS.md` R11）
 > **依赖**：**零新增依赖**，仅标准库（`json / os / threading / uuid / time / contextvars / pathlib / contextlib / enum / abc / itertools / sqlite3 / statistics / dataclasses / datetime`）+ 全框架已有的 `pydantic>=2.14.1` + 框架自带 `database.SQLiteClient`；不引入 OpenTelemetry / LangChain / loguru / pandas / numpy 任何外部库
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分放在第十二章，并与 `docs/演进路线图.md` 的 K 模块编号对齐。
@@ -37,6 +37,7 @@
 | **1.0.0** | 2026-11-06 | **初版（路线图 K1 最小闭环）**：`fast_agents/trace/` 作为独立子包交付（`__init__.py` / `models.py` / `store_base.py` / `jsonl_store.py` / `sqlite_store.py` / `trace_logger.py` 共 6 个文件）。一次性交付：**SpanRecord** 数据模型（trace_id/span_id/parent_id/session_id/name/kind/start_time/end_time/duration_ms/input/output/status/error/metadata）+ **SpanKind** 枚举（llm/tool/decision/agent/custom）+ **SpanStatus** 枚举（success/error）+ **TraceLogger** 门面（手动 span / with 上下文 / trace() 开新根 / 失败安全 / 幂等 end_span / `read_spans` 多条件过滤 / `replay` 缩进回放 / 后端自动识别）+ **TraceStoreBase** 抽象基类 + **JsonlStore**（默认后端，支持 `":memory:"` 内存模式与 jsonl 逐行 append 落盘、坏行跳过）+ **SQLiteStore**（结构化后端，复用框架自带 `database.SQLiteClient`，一条 Span 一行、三索引谓词下推、WAL 并发写、幂等迁移）。**接入**：LLM 门面 `invoke / stream_invoke / embed_query / embed_documents` 仅新增可选 `tracer=None` 打点（stream 走包装生成器），LLM span 写入 `model` + `usage` / `prompt_tokens` / `completion_tokens` / `total_tokens`；ReActAgent 新增可选 `tracer=None`，run 内开 `agent.<name>.run` trace + `agent.run` Span + 每步 `decision.stepN` Span；工具打点走 `ToolRegistry.add_hook` 钩子，读 `ToolResult.metadata["duration_ms"]` 回推真实耗时。**零新增依赖**、**零破坏性改动**：`tests/trace/test_trace.py` **67/67** 全绿；`examples/trace/` 下 4 个离线可跑示例；顶层 `fast_agents/__init__.py` 同步重导出 trace 全部公开符号。 | — |
 | **1.0.0** | 2026-11-10 | **K3 评估工具交付**：新增 `fast_agents/trace/evaluator.py`，交付 **TraceEvaluator** / **TraceMetrics** / **EvaluationReport** 三个公开类。**能力**：离线消费已落盘 trace 数据（支持 TraceLogger / Store / 文件路径三种构造方式，JsonlStore 与 SQLiteStore 通用），按 trace 聚合计算成本（prompt/completion/total tokens、LLM 调用次数、tokens/LLM 均摊）、效率（端到端耗时、P95/标准差、分类耗时、tool 耗时占比、平均 span/llm/tool 数）、质量（成功率、错误数、tool/LLM 错误率、去重错误信息、工具错误分布）三类指标；跨 trace 自动聚合，支持 `session_id` / `trace_id` / `limit` / `top_n_traces` 过滤；提供 `to_dict()` / `to_json()` / `to_text()` 三种输出。**新增测试**：`tests/trace/test_trace_eval.py` **21 项**（构造/空数据/单 trace 计数/耗时/Token/错误/跨 trace 聚合/过滤/输出/路径后端识别/脏数据鲁棒性/默认关闭原则），全部全绿；新增示例 `examples/trace/eval_demo.py`；顶层 `__init__.py` 同步重导出 K3 三个新类。**零新增默认依赖**（只用标准库 `statistics / dataclasses / datetime / json`）、**零破坏性改动**（不构造 TraceEvaluator 时评估代码零开销；打点链路代码一字未改）。原 67 项测试继续全绿，trace 模块合计 **88/88** 全绿。 | — |
 | **1.0.0** | 2026-11-10 | **K3 CSV 明细导出（`to_csv`）**：`EvaluationReport` 新增 `to_csv(path=None, *, encoding="utf-8-sig")` 方法——把「每条 trace 一行」的明细导出为固定 25 列（`fast_agents.trace.evaluator.CSV_COLUMNS`）的 CSV，`success` 输出 `true`/`false`、`tool_distribution` 折叠为 `name=count;...`（按次数降序）、`error_messages` 以竖线连接并去掉换行、缺失字段输出空串；给 `path` 时同时落盘（默认带 BOM，Windows Excel 双击打开中文不乱码），不传只返回字符串。**新增测试**：`tests/trace/test_trace_eval.py` 新增 6 项（表头与行数/空报告仅表头/落盘 roundtrip/工具分布序列化/错误信息转义/success 与空单元格），并把测试入口补齐为规范的 `main()` + `main_of_new_add()` 双入口；K3 用例 21 → **27 项**，trace 模块合计 88 → **94/94** 全绿；示例 `examples/trace/eval_demo.py` 同步追加 CSV 导出。**零新增默认依赖**（仅用标准库 `csv / io`）、**零破坏性改动**（既有 `to_dict`/`to_json`/`to_text` 与打点链路一字未改）。 | — |
+| **1.0.0** | 2026-11-10 | **K3 Token 成本日报（`daily_cost_report`）**：在 `TraceEvaluator` 上新增 `daily_cost_report(*, price_table=None, start_date=None, end_date=None, timezone_offset_hours=8, session_id=None)` 方法，离线按自然日聚合 Token 成本。每条 trace 归属到其 **root Span 的 start_time 所在自然日**（默认北京时间 UTC+8，可切时区）；内置 **22 个常见模型**默认价目表（OpenAI / DeepSeek / Anthropic / 通义 / 智谱 / 豆包 / ERNIE，USD/1M tokens，按**最长前缀优先**匹配），未命中模型走默认兜底价；支持自定义价目表合并覆盖、按 `start_date`/`end_date`/`session_id` 过滤。新增 `DayCostMetrics` / `CostDailyReport` 两个公开类，每天给出 trace 数、成功率、LLM/tool 调用数、token 拆分（prompt/completion/total）、成本拆分（输入/输出/合计）、平均单 trace 耗时/成本、错误计数、per-model 明细（调用数/token/成本）、工具分布；提供 `to_dict()` / `to_json()` / `to_text(currency="$")` / `to_csv()` 四种输出；CSV 默认 `utf-8-sig` 落盘，每天一行、21 列。**新增测试**：`tests/trace/test_trace_cost.py` **16 项**（空数据/单天单 trace 成本/最长前缀匹配/未知模型兜底/跨天聚合/日期范围/session 过滤/自定义价目表/错误计数/脏数据鲁棒性/JSON/CSV roundtrip/时区切换/默认价目表覆盖），全部全绿；新增示例 `examples/trace/cost_daily_demo.py`（模拟 3 天 6 次运行 + 打印日报 + JSON/CSV 双导出 + 自定义价目表演示）。**零新增默认依赖**（仅用标准库 `datetime/timezone`，无 pandas/numpy）、**零破坏性改动**（既有 `evaluate()` 与打点链路一字未改）。K1+K3 合计 94 → **110/110** 全绿。 | — |
 
 > **版本号约定**：本模块自初版交付起即处于 **v1.0.0**。后续对 trace 的改动无论是 bug 修复还是功能性能力叠加（K2/K3/K4/K5），均按用户约定**统一保持 v1.0.0**，不递增版本号；仅在更新历史表中追加一行描述本次变更。
 
@@ -121,7 +122,8 @@ examples/trace/
 ├── jsonl_demo.py                       # 证明「文件模式不把全量数据留在内存」的内存占用示例（离线）
 ├── jsonl_replay.py                     # Jsonl 落盘 + 跨实例回放示例（离线、无需 API Key）
 ├── sqlite_usage.py                     # SQLiteStore 落盘 + 谓词过滤 + 流式遍历示例（离线、无需 API Key）
-└── eval_demo.py                        # K3：模拟 3 次 Agent 运行 + 离线评估 + 文本/JSON 双格式输出示例（离线）
+└── eval_demo.py                        # K3：模拟 3 次 Agent 运行 + 离线评估 + 文本/JSON/CSV 三格式输出示例（离线）
+└── cost_daily_demo.py                  # K3：模拟 3 天 Agent 运行 + Token 成本日报 + JSON/CSV 导出示例（离线）
 ```
 
 （其余 LLM / Agent / ToolRegistry / database 目录在各自模块文档里展开，Trace 侧只通过既有扩展点接入，不改动这些目录的源码。）
@@ -514,8 +516,9 @@ __all__ = ["TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
 7. **四种输出**：`to_dict()`（程序分析）、`to_json()`（接 dashboard / 前端）、`to_text()`（控制台可读报告）、`to_csv(path=None)`（每条 trace 一行，丢进 Excel / pandas 做二次透视；默认 `utf-8-sig` 落盘防中文乱码，`tool_distribution` 折叠为 `name=count;...`、`error_messages` 折叠为 ` | ` 连接并去掉换行）；
 8. **异常吞噬**：任何字段缺失 / 类型异常都不抛，缺字段返回 None 或 0，脏数据整条跳过，评估脚本不会因为一条烂 trace 而崩；
 9. **默认关闭**：不构造 `TraceEvaluator` 时零开销，import 不触发任何计算。
+10. **Token 成本日报**（`daily_cost_report`）：在 `TraceEvaluator` 上额外提供按自然日聚合 Token 成本的能力——每条 trace 归属到其 root Span `start_time` 所在自然日（默认北京时间 UTC+8），内置 **22 个常见模型**默认价目表（USD/1M tokens，最长前缀优先匹配），未命中走默认兜底；支持 `start_date/end_date/session_id/timezone_offset_hours` 过滤、自定义价目表合并覆盖；输出 `DayCostMetrics`（单日）+ `CostDailyReport`（整报告）两种结构，提供 `to_dict/to_json/to_text/to_csv` 四格式，CSV 每天一行共 21 列，默认 utf-8-sig 落盘 Excel 直读；成本计算公式：`cost = prompt_tokens * input_price / 1e6 + completion_tokens * output_price / 1e6`，全量异常吞噬、脏数据不崩。
 
-**为什么这么写**：评估是「事后分析」而非「在线链路」，所以刻意做成纯离线、只读 store；同时坚守零新增依赖——所有统计量都用 `statistics` + 手写百分位实现，不引 pandas / numpy，保证在离线 / 无网环境也能跑。
+**为什么这么写**：评估是「事后分析」而非「在线链路」，所以刻意做成纯离线、只读 store；同时坚守零新增依赖——所有统计量都用 `statistics` + 手写百分位实现，不引 pandas / numpy，保证在离线 / 无网环境也能跑。成本日报是对「每条 trace 一个分数」的进一步汇总，让"今天整体花了多少钱/成功率多少/哪个模型最贵"能一眼看到，而不用每次把 CSV 明细拉进 Excel 透视。
 
 ---
 
@@ -526,12 +529,14 @@ __all__ = ["TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
 ```powershell
 cd D:\path\to\fast_agents
 python tests\trace\test_trace.py          # K1：67/67 全过才算装好
-python tests\trace\test_trace_eval.py     # K3：27/27 评估器全过
+python tests\trace\test_trace_eval.py     # K3 评估器：27/27 全过
+python tests\trace\test_trace_cost.py     # K3 成本日报：16/16 全过
 python examples\trace\basic_usage.py      # 最小手动打点示例
 python examples\trace\jsonl_demo.py       # 文件模式不占内存的证明示例
 python examples\trace\jsonl_replay.py     # Jsonl 落盘 + 回放示例
 python examples\trace\sqlite_usage.py     # SQLite 落盘 + 查询示例
-python examples\trace\eval_demo.py        # K3：3 次模拟运行 + 离线评估 + JSON 导出示例
+python examples\trace\eval_demo.py        # K3：3 次模拟运行 + 离线评估 + JSON/CSV 三格式导出示例
+python examples\trace\cost_daily_demo.py  # K3：模拟 3 天运行 + Token 成本日报 + JSON/CSV 双导出示例
 ```
 
 说明：本仓库测试用**自带的零依赖运行器**（`tests/_runner.py`），**不要用 pytest**；直接用 `python tests\trace\test_trace.py` 执行即可（脚本内置 runner，会打印逐项 PASS/FAIL 与「完成：N 通过」汇总）。K3 评估器测试同理，`python tests\trace\test_trace_eval.py` 独立运行。
@@ -643,7 +648,7 @@ python tests\trace\test_trace.py          # K1 打点链路：67 通过
 python tests\trace\test_trace_eval.py     # K3 评估器：27 通过
 ```
 
-预期：两个脚本都打印「完成：N 通过，0 跳过，0 失败」；trace 模块合计 **94/94 全绿**。
+预期：三个脚本都打印「完成：N 通过，0 跳过，0 失败」；trace 模块合计 **110/110 全绿**。
 
 ### 8.7 K3 离线评估最小示例
 
@@ -674,6 +679,52 @@ report.to_csv("eval_report.csv")  # CSV 明细（每条 trace 一行，Excel / p
 - **明细层**：`traces` 列表，每条 `TraceMetrics` 含成本/效率/质量/工具分布/数据质量五类指标。
 
 更完整的演示见 `examples/trace/eval_demo.py`（模拟 3 次运行 + 打印报告 + 导出 JSON 与 CSV 明细）。
+
+### 8.8 K3 Token 成本日报最小示例
+
+在评估器基础上，再出一份**按天聚合**的成本日报：
+
+```python
+from fast_agents.trace import TraceEvaluator
+
+evaluator = TraceEvaluator.from_path("traces/runs.db")
+
+# 默认：按北京时间（UTC+8）自然日聚合，全部 trace
+daily = evaluator.daily_cost_report()
+
+# 可选过滤：
+# daily = evaluator.daily_cost_report(
+#     start_date="2026-11-01",           # 起始日期（含当天）
+#     end_date="2026-11-10",             # 结束日期（含当天）
+#     session_id="sess_prod",            # 只统计某个会话
+#     timezone_offset_hours=8,           # 默认北京时间；设 0 即 UTC
+#     price_table={"my-private-model": (0.05, 0.10)},  # 自定义价目表覆盖默认
+# )
+
+print(daily.to_text())                  # 控制台可读日报（含合计/每日明细/模型 Top5）
+with open("cost_daily.json", "w", encoding="utf-8") as f:
+    f.write(daily.to_json())            # JSON 导出（程序化消费）
+daily.to_csv("cost_daily.csv")          # CSV 导出（每天一行，Excel 直读）
+
+# 汇总层字段
+print(f"总 token：{daily.total_tokens:,}，总成本 ${daily.total_cost_usd:.4f}")
+print(f"整体成功率：{daily.overall_success_rate*100:.1f}%")
+# 每日迭代
+for d in daily.days:
+    print(f"  {d.date}  traces={d.trace_count}  tokens={d.total_tokens:,}  "
+          f"cost=${d.total_cost_usd:.4f}  success={d.success_rate*100:.0f}%")
+    for m, info in d.model_breakdown.items():
+        print(f"    - {m}: {info['total_tokens']:,} tokens  ${info['cost']:.4f}")
+```
+
+报告包含：
+- **整段周期合计**：`total_traces` / `overall_success_rate` / `total_prompt_tokens` / `total_completion_tokens` / `total_tokens` / `total_input_cost_usd` / `total_output_cost_usd` / `total_cost_usd` / `total_llm_calls` / `total_tool_calls` / `total_errors`；
+- **每日明细**（`DayCostMetrics`）：日期、trace 数 / 成功率 / LLM & tool 调用数、token 拆分、成本拆分（输入/输出/合计）、平均单 trace 耗时与成本、错误数、`model_breakdown`（每模型调用数/token/成本）、`tool_distribution`；
+- **价目表**：`price_table_used` 记录实际使用的价目表（默认 22 个模型 + 自定义覆盖），`price_default` 记录未命中模型的兜底价（默认 $0.50 / $1.50 per 1M）。
+
+**默认价目表覆盖的模型前缀**：`gpt-4o-mini`、`gpt-4o`、`gpt-4-turbo`、`gpt-4`、`gpt-3.5-turbo`、`o1-mini`、`o1`、`o3-mini`、`deepseek-chat`、`deepseek-reasoner`、`claude-3-5-sonnet`、`claude-3-5-haiku`、`claude-3-opus`、`qwen-max`、`qwen-plus`、`qwen-turbo`、`glm-4`、`glm-4-flash`、`doubao-pro`、`doubao-lite`、`ernie-4.0`、`ernie-3.5`——匹配规则是**最长前缀优先**（如 `gpt-4o-mini-2024-07-18` 会匹配到 `gpt-4o-mini` 而非 `gpt-4o`）。想换币种或单价，传 `price_table` 即可覆盖；未命中的模型走 `DEFAULT_PRICE` 兜底，不会漏掉 token 统计。
+
+更完整的演示见 `examples/trace/cost_daily_demo.py`（模拟 3 天 6 次运行 + 文本/JSON/CSV 三格式输出 + 自定义价目表演示）。
 
 ---
 
@@ -821,6 +872,49 @@ report.to_csv(path=None)             # → str（每条 trace 一行 CSV；给 p
 `TraceMetrics` 字段分组：基本（`span_count` / `llm_calls` / `tool_calls` / `decision_calls` / `agent_calls`）、时间（`total_duration_ms` / `llm_total_ms` / `tool_total_ms` / `decision_total_ms` / `tool_time_ratio`）、Token（`prompt_tokens` / `completion_tokens` / `total_tokens` / `tokens_per_llm_call`）、错误（`error_count` / `llm_error_count` / `tool_error_count` / `tool_error_rate` / `success` / `error_messages`）、工具分布（`tool_distribution` / `tool_durations`）、数据质量（`missing_duration_spans` / `spans_without_metadata`）。
 
 **CSV 列**：`to_csv` 输出固定 25 列，列顺序见 `fast_agents.trace.evaluator.CSV_COLUMNS`；`success` 输出 `true` / `false`，`tool_distribution` 形如 `web_search=2;calculator=1`（按次数降序），缺失字段输出空串（不是 `"None"`）。
+
+### 9.8 CostDailyReport / DayCostMetrics（K3 成本日报）
+
+`TraceEvaluator.daily_cost_report(...)` 的返回对象：
+
+```python
+daily = TraceEvaluator.from_path("traces/runs.db").daily_cost_report(
+    start_date=None, end_date=None,            # 日期范围（YYYY-MM-DD，含两端）
+    timezone_offset_hours=8,                   # 默认北京时间；0 = UTC
+    session_id=None,                           # 可选会话过滤
+    price_table=None,                          # 自定义价目表（与默认表合并覆盖）
+)
+
+# 整段周期合计
+daily.total_traces / total_llm_calls / total_tool_calls / total_errors
+daily.total_prompt_tokens / total_completion_tokens / total_tokens
+daily.total_input_cost_usd / total_output_cost_usd / total_cost_usd
+daily.overall_success_rate
+daily.start_date / end_date / days           # List[DayCostMetrics]，按日期升序
+daily.price_table_used / price_default / generated_at
+
+# 单日（DayCostMetrics）
+d.date / trace_count / successful_traces / failed_traces / success_rate
+d.llm_calls / tool_calls / error_count / llm_error_count / tool_error_count
+d.total_duration_ms / avg_duration_ms
+d.prompt_tokens / completion_tokens / total_tokens
+d.input_cost_usd / output_cost_usd / total_cost_usd / avg_cost_per_trace_usd
+d.model_breakdown          # {model: {"calls","prompt_tokens","completion_tokens",
+                           #          "total_tokens","input_cost","output_cost","cost"}}
+d.tool_distribution        # {tool_name: 调用次数}
+
+# 输出
+daily.to_dict()                   # → dict
+daily.to_json(indent=2)           # → str（JSON）
+daily.to_text(currency="$")       # → str（控制台可读，含每日明细 + 模型成本 Top5）
+daily.to_csv(path=None)           # → str（每天一行 CSV；给 path 落盘，默认 utf-8-sig）
+```
+
+**成本计算公式**：对每条 LLM Span，`cost = prompt_tokens * input_price / 1_000_000 + completion_tokens * output_price / 1_000_000`（USD）。模型价目按「模型名小写后最长前缀匹配」原则：`gpt-4o-mini-2024-07-18` 命中 `gpt-4o-mini`（长度 11）而非 `gpt-4o`（长度 6）；未命中任何前缀时走 `DEFAULT_PRICE = (0.50, 1.50)`（USD/1M，与 gpt-3.5 同档兜底，保证 token 不会被漏算）。
+
+**日期归属**：每条 trace 归到其**root Span 的 `start_time`** 所在自然日；若该 trace 没有 root，则取其最早的 span `start_time`；若完全没有有效时间戳则跳过（异常吞掉，不影响其它 trace）。时区由 `timezone_offset_hours` 指定，默认 8（北京时间 CST）。
+
+**CSV 列**：`to_csv` 输出固定 21 列，列顺序见 `fast_agents.trace.evaluator.DAILY_CSV_COLUMNS`；`model_breakdown` 形如 `gpt-4o-mini={calls:2,prompt_tokens:3000,cost:0.0009};deepseek-chat={...}`（按 cost 降序），`tool_distribution` 形如 `web_search=3;calculator=1`。
 
 ---
 
@@ -1008,7 +1102,7 @@ $ python examples/trace/sqlite_usage.py
 
 1. **K1 收尾（补丁级）**——输入输出截断长度可配置（现在接入层硬编码，如 agent 输出预览 300 字符）、`replay` 补 `build_tree()` 树形聚合辅助、统一 `error_type` 分类字段、duration 改用 perf_counter 差值抗墙钟跳变——纯 K1 收尾，零依赖、零破坏；
 2. **K2 异步并发支持**——async 工具/LLM 打点接入、多进程文件锁或文档化「每 worker 独立文件」、Sampler 采样器（按比例/错误率）、SpanEvent 时间点事件（首 token 到达、解析开始）、流式 token 统计（开 `stream_options={"include_usage": True}`）；状态栈已是实例级 ContextVar，跨协程传播已就位，无需返工；依赖 A26 Agent 多工具并发 与 I2 LLM ainvoke 前置落地；
-3. **K3 评估工具（已交付基础统计 + CSV 导出，继续扩展）**——✅ 基础统计聚合（成本/效率/质量三类指标、跨 trace avg/p95/std、工具/模型分布、dict/JSON/文本/CSV 四输出）已交付；✅ CSV 明细导出（`to_csv`）已随本次交付。后续增强：工具选择准确率、LLM-as-Judge 打分、双 Agent Win Rate、A/B 对比、Token 成本日报、按问题集批量回归评估；
+3. **K3 评估工具（已交付基础统计 + CSV 导出 + 成本日报，继续扩展）**——✅ 基础统计聚合（成本/效率/质量三类指标、跨 trace avg/p95/std、工具/模型分布、dict/JSON/文本/CSV 四输出）已交付；✅ CSV 明细导出（`to_csv`，每条 trace 一行 25 列）已交付；✅ **Token 成本日报**（`daily_cost_report`，按自然日聚合、内置 22 个常见模型价目表、最长前缀匹配、dict/JSON/文本/CSV 四输出、可按时区/日期/会话过滤、支持自定义价目表覆盖）已交付。后续增强：工具选择准确率、LLM-as-Judge 打分、双 Agent Win Rate、A/B 对比、按问题集批量回归评估、按问题维度的成本归因；
 4. **K4 Web UI / 外部上报**——瀑布图看板（独立 HTML/SVG 或轻量前端）、可选 OTLP/Langfuse exporter——与"零依赖/离线可跑"红线隔离，做成独立可选 exporter，默认不装。
 
 ---
