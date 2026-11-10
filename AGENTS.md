@@ -125,10 +125,10 @@ python examples\trace\basic_usage.py
 - 文件首行用**三引号 docstring**说明模块作用与设计要点，**列参考的主流框架**（参考 `tools/tool_base.py`、`memory/memory_store_base.py` 的写法）。
 - 普遍使用 `from __future__ import annotations`（本仓库所有新模块默认加）。
 - 用现代类型注解；**仅用于类型注解、运行时不用的 import** 放进 `if TYPE_CHECKING:` 块，避免循环导入。
-- 数据模型（pydantic v2 `BaseModel`）统一放在模块下的 `models.py` 或 `schema.py`（参考 `trace/models.py`、`memory/schema.py`、`mcp/models.py`）。
+- 数据模型（pydantic v2 `BaseModel`）统一放在模块下的 `models.py`（参考 `trace/models.py`、`memory/models.py`、`mcp/models.py`；注：`database/schema.py` 是表结构 DDL 声明，不属此类）。
 - 异常统一放模块自己的 `errors.py` 或 `tool_exception.py`，按"基类 + 具体子类"组织（参考 `mcp/errors.py`、`tools/tool_exception.py`）；**不要把底层库原生异常直接抛给上层**。
 - 日志用标准 `logging`：`logger = logging.getLogger(__name__)`，不引 loguru/structlog。
-- id 生成：`uuid.uuid4().hex`（短 hex，参考 `trace/models.py:_new_id`、`memory/schema.py`）。
+- id 生成：`uuid.uuid4().hex`（短 hex，参考 `trace/models.py:_new_id`、`memory/models.py`）。
 
 ### 5.2 目录与命名
 - **目录**：单数、小写、单个单词（`memory` / `tools` / `mcp` / `trace` / `database` / `context` / `messages` / `agents` / `skills` / `llm` / `utils`）。
