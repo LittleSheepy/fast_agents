@@ -39,10 +39,7 @@ class Message(BaseModel):
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式（OpenAI API格式）"""
-        return {
-            "role": self.role,
-            "content": self.content
-        }
+        return {"role": self.role, "content": self.content}
 
     def to_openai_message(self) -> List[Dict[str, Any]]:
         """转换为字典格式（OpenAI API格式）"""
