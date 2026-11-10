@@ -55,7 +55,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | [`docs/Skill模块编写说明.md`](./docs/Skill模块编写说明.md) | `SKILL.md` 标准、三级渐进式加载、`@skill` / `BaseSkill` 两种写法、与 LangChain / Anthropic 的对比 |
 | [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md) | 零依赖 JSON-RPC 实现、**细粒度 vs 粗粒度展开**、`MCPConfig` 声明式配置、Windows 专项 |
 | [`docs/context模块编写说明.md`](./docs/context模块编写说明.md) | Token 预算与三级降级计数、五层拼装顺序、三级压缩策略、工具结果卸载与按需回读、与主流框架的取舍 |
-| [`docs/LLM模块编写说明.md`](./docs/LLM模块编写说明.md) | OpenAI 客户端轻封装、`invoke` / `stream_invoke`、embedding 分片并发与 query/document 语义区分、chat / embedding 模型独立配置 |
+| [`docs/LLM模块编写说明.md`](./docs/LLM模块编写说明.md) | OpenAI 客户端轻封装、`invoke` / `stream_invoke`、embedding 分片并发与 query/document 语义区分、chat / embedding 模型独立配置、可选 `tracer` 打点与 token 用量元数据 |
 | [`docs/database模块编写说明.md`](./docs/database模块编写说明.md) | 关系型双后端（`SQLiteClient` 零依赖 + `MySQLClient` 可选，接口 100% 对齐）、三种声明式建表、谓词下推（9 种 FilterOp）、统一异常体系、向量后端（Chroma） |
 | [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md) | Span/Trace 模型、`TraceLogger` 门面、`JsonlStore` 与 `SQLiteStore`、`ToolRegistry` 钩子打点、查询与回放 |
 | [`docs/演进路线图.md`](./docs/演进路线图.md) | 按模块（A~G）组织的后续规划，含优先级、依赖、验收标准 |
@@ -72,7 +72,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 💬 **消息系统** | `Message` / `Messages` 双层结构，原生支持 function calling（`tool_calls` / `tool_call_id`），可一键转 OpenAI 格式 |
 | 🔧 **工具系统** | `ToolBase` 抽象基类 + `StructuredTool` / `@tool` 装饰器 + `ToolRegistry` 注册表，四种定义方式，schema 自动生成 |
 | 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关 |
-| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5）+ **统一北京时间 CST（UTC+8）时间基准**（B8），支持 Agent 主动读写 |
+| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5）+ **记忆 TTL 到期回收**（B12，`remember(ttl=...)` 到期自动退出检索并回收）+ **增量抽取**（B10，只抽新增消息段、无新消息不调 LLM）+ **统一北京时间 CST（UTC+8）时间基准**（B8），支持 Agent 主动读写 |
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
@@ -237,7 +237,7 @@ fast_agents/
 │   ├── memory/                   # ④ 记忆系统
 │   │   ├── __init__.py
 │   │   │                          # （时间基准统一在 fast_agents/utils/time_utils.py，B8 起本模块不再自维护时钟）
-│   │   ├── schema.py             #    MemoryRecord / ContextPacket / MemoryKind / UserProfile
+│   │   ├── models.py             #    MemoryRecord / ContextPacket / MemoryKind / UserProfile
 │   │   ├── memory_store_base.py               #    MemoryStoreBase 抽象接口
 │   │   ├── scoring.py            #    词法打分 + 时间衰减
 │   │   ├── buffer.py             #    BufferMemory：短期窗口 + 滚动摘要
@@ -245,6 +245,7 @@ fast_agents/
 │   │   ├── in_memory_store.py    #    InMemoryStore：纯内存长期记忆
 │   │   ├── sqlite_store.py       #    SQLiteMemoryStore：持久化长期记忆
 │   │   ├── semantic_store.py     #    SemanticMemoryStore：语义检索包装器（B2，可选）
+│   │   ├── chroma_store.py       #    ChromaMemoryStore：Chroma 向量库包装器（v1.8.0 阶段 1，可选）
 │   │   ├── profile_store.py      #    ProfileStore：结构化用户画像（B3，可选，SQLite / 内存两版）
 │   │   └── manager.py            #    MemoryManager：短期 + 长期 + 画像的门面
 │   ├── skills/                   # ⑤ 技能系统
@@ -336,10 +337,12 @@ fast_agents/
 
 | 方法 | 签名 | 说明 |
 |------|------|------|
-| `invoke` | `(messages, tools=None, **kwargs) -> Message` | 一次性调用，返回 `Message`（可直接取 `tool_calls`） |
-| `stream_invoke` | `(messages, tools=None, **kwargs) -> str` | 流式调用，逐块产出文本 |
-| `embed_query` | `(text, **kwargs) -> list[float]` | 单条文本转向量（查询侧）；语义检索前置能力（I1） |
-| `embed_documents` | `(texts, **kwargs) -> list[list[float]]` | 批量文本转向量（文档侧），自动 2048 分片并发、按 `index` 对齐顺序 |
+| `invoke` | `(messages, tools=None, tracer=None, **kwargs) -> Message` | 一次性调用，返回 `Message`（可直接取 `tool_calls`）；传 `tracer` 时记 `llm.invoke` span |
+| `stream_invoke` | `(messages, tools=None, tracer=None, **kwargs) -> str` | 流式调用，逐块产出文本 |
+| `embed_query` | `(text, tracer=None, **kwargs) -> list[float]` | 单条文本转向量（查询侧）；语义检索前置能力（I1） |
+| `embed_documents` | `(texts, tracer=None, **kwargs) -> list[list[float]]` | 批量文本转向量（文档侧），自动 2048 分片并发、按 `index` 对齐顺序 |
+
+> 四个方法均可选传 `tracer`（`TraceLogger`）：非 `None` 时各记一条 LLM span，`metadata` 写 `model` + token 用量；默认 `None` 时不打点、行为与旧版一致。
 
 ```python
 from fast_agents import LLM
@@ -645,6 +648,8 @@ buf = BufferMemory(
 buf.append_user("你好")
 buf.append_ai("你好")
 buf.get_messages() / buf.get_summary() / buf.to_openai_messages() / buf.clear()
+buf.get_total_appended()      # 累计 append 过的条数（只增不减，B10：抽取水位线的坐标系）
+buf.get_messages_since(n)     # 累计序号 ≥ n 且仍在窗口内的消息（B10：窗口裁剪不影响取增量）
 ```
 
 > 超窗时溢出的消息会**滚动压成一句摘要**（摘要 = 旧摘要 + 溢出消息 一起压）。没有 `llm` 时降级为直接截断。
@@ -701,7 +706,8 @@ store.close()
 | `supersedes` | 被本条取代的旧记忆 id（修订链 / 合并目标） |
 | `access_count` | **B5 新增**：累计被 `retrieve()` 命中的次数（由 `touch()` 维护） |
 | `last_accessed_at` | **B5 新增**：最近一次被命中的时间（归档以"距该时间的天数"判断久未命中，None 时退用 `updated_at`） |
-| `metadata` | 自定义扩展（合并时写 `merged_into`、归档时写 `archived_at`） |
+| `expires_at` | **B12 新增**：可选有效期，`None`（默认）= 永不过期；到期后退出检索、由 `compact()` 软删为 `retracted` |
+| `metadata` | 自定义扩展（合并时写 `merged_into`、归档时写 `archived_at`、到期时写 `expired_at`） |
 
 #### 门面：`MemoryManager`
 
@@ -726,11 +732,13 @@ memory.render_context("查询", limit=5)                # → str
 
 memory.record(user_input, assistant_output)           # 写短期
 memory.remember("内容", kind="fact", importance=0.8)  # 手动写长期
-memory.extract_and_store()                            # 从 buffer 抽取长期记忆
+memory.remember("明早 9 点前提交 PR", kind="episode", ttl=timedelta(hours=12))  # B12：12 小时后到期
+memory.revise(memory_id, "修订后的内容")               # B11：修订（旧的转 superseded，历史保留）
+memory.extract_and_store()                            # 从 buffer 抽取长期记忆（B10：只抽水位线之后的新增消息段）
 
 memory.forget(memory_id) / memory.forget_session() / memory.close()
 
-memory.compact(max_importance=0.3, stale_days=90, similarity_threshold=0.85)   # B5：归档 + 合并 → {"archived": N, "merged": M}
+memory.compact(max_importance=0.3, stale_days=90, similarity_threshold=0.85)   # B5+B12：归档 + 合并 + 到期清理 → {"archived": N, "merged": M, "expired": K}
 
 memory.get_profile()                                     # → UserProfile（未配 profile_store 时是空档案，不报错）
 memory.update_profile({"name": "张三", "location": "上海"})  # 按 patch 覆盖式合并
@@ -786,8 +794,18 @@ for t in build_memory_tools(memory, include_profile=True):   # 多一个 update_
 
 ```python
 # 空闲时跑一次即可
-report = memory.compact()          # {"archived": 3, "merged": 2}
+report = memory.compact()          # {"archived": 3, "merged": 2, "expired": 1}
 ```
+
+**记忆到期回收（B12）**：
+
+- **显式有效期**：`remember(..., ttl=timedelta(...))` 给单条记忆一个到期时刻（`expires_at`），用于「明早 9 点开会」这类天然有有效期的信息；不传 `ttl` 时 `expires_at=None`，行为与之前**字节级一致**；
+- **两道防线**：`retrieve()` / `search()` 在排序前就过滤掉已到期项（两次 `compact()` 之间也不会把过期记忆注入 prompt）；`compact()` 再把它软删为 `retracted` 并写 `metadata["expired_at"]`（保留审计、不物理删除），返回值新增 `expired` 计数；
+- **幂等**：重复 `compact()` 不会重复清理；`SemanticMemoryStore` / `ChromaMemoryStore` 两个语义后端同样在 `search()` 里过滤。
+
+**增量抽取（B10）**：
+
+- `auto_extract=True` 时，`record()` 每轮只把「上次水位线之后新增的消息段」送给 LLM 抽取，没有新消息直接跳过、不调 LLM；水位线锚在 `BufferMemory` 的**累计 append 计数**（`get_total_appended()` / `get_messages_since()`）上，所以滑动窗口写满并持续裁剪后仍能持续抽取、构造时回填的历史也不会被重复抽取。详见 `docs/记忆模块编写说明.md` §7.4 / §7.8 / §10.3。
 
 **时间基准（B8）**：
 
@@ -1191,7 +1209,8 @@ registry.register_tool(builtin.SearchTool(provider="tavily"))
 | 窗口大小 | `BufferMemory(max_messages=...)` | 默认 20 |
 | 摘要开关 | `enable_summary=True/False` | 关了就只截断不摘要 |
 | 注入条数 | `ReActAgent(memory_limit=5)` | 每轮注入的长期记忆上限 |
-| 自动抽取 | `MemoryManager(auto_extract=...)` | 打开后每轮多一次 LLM 调用 |
+| 自动抽取 | `MemoryManager(auto_extract=...)` | 打开后每轮多一次 LLM 调用（B10：只抽新增消息段，无新消息则不调用） |
+| 记忆有效期 | `MemoryManager.remember(ttl=...)` | B12：可选 TTL，到期自动退出检索并在 `compact()` 时回收 |
 
 ### 技能相关
 
@@ -1208,18 +1227,18 @@ registry.register_tool(builtin.SearchTool(provider="tavily"))
 ### 怎么跑
 
 ```powershell
-# ⚠️ 项目里的 test/ 与标准库同名，必须用「直接执行」而不是 -m
-python test\test_react_agent.py
-python test\test_tools.py
-python test\test_memory.py
-python test\test_file_tool.py
-python test\test_context.py
-python test\test_mcp.py
-python test\test_database.py
-python test\test_trace.py
+# 测试已迁到 tests/<模块>/ 子目录，直接执行即可
+python tests\agents\test_react_agent.py
+python tests\tools\test_tools.py
+python tests\tools\test_file_tool.py
+python tests\memory\test_memory.py
+python tests\context\test_context.py
+python tests\mcp\test_mcp.py
+python tests\database\test_database.py
+python tests\trace\test_trace.py
 ```
 
-> **不要**用 `python -m test.test_xxx`——`test` 是 Python 标准库模块名，会冲突。
+> 也可以直接 `pytest tests/memory/test_memory.py` 等；因 `tests/` 下没有 `__init__.py`，请按脚本「直接执行」（或交给 pytest），不要用 `python -m tests.xxx`。
 
 ### 当前状态
 
@@ -1227,14 +1246,14 @@ python test\test_trace.py
 |---------|------|------|
 | `tests/agents/test_react_agent.py` | ✅ 17/17 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
 | `tests/tools/test_tools.py` | ✅ 61/61 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
-| `tests/memory/test_memory.py` | ✅ 36/36 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B12 TTL 与到期回收 |
+| `tests/memory/test_memory.py` | ✅ 37/37 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B10 增量抽取水位线（含窗口写满后仍持续抽取的回归）、B12 TTL 与到期回收 |
 | `tests/tools/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
 | `tests/context/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
 | `tests/mcp/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
 | `tests/database/test_database.py` | ✅ 122 项（105 通过 + 17 跳过） | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系、向量后端；17 项向量端到端用例在未装 `chromadb` 时自动跳过（`tests/database/test_database_mysql.py` 另有 18 项 MySQL 用例，需本地 MySQL） |
 | `tests/trace/test_trace.py` | ✅ 59/59 | Span 模型、TraceLogger、JsonlStore / SQLiteStore（写入读回 / 谓词过滤 / 跨 reopen 持久化 / 幂等迁移 / 流式遍历 / upsert 幂等）、LLM/Agent 打点、token 元数据、tool 真实耗时、查询与回放 |
 
-`test/demo.py` / `test/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
+`examples/demo.py` / `examples/memory/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
 
 > **平台差异**：`test_tools.py::test_terminal` 走的是 Windows 命令白名单（`dir` / `type` / `echo` …），在 Windows 上执行真实断言，在 Linux / macOS 上会打印「跳过」并继续；其余用例跨平台一致。
 
@@ -1274,13 +1293,13 @@ python test\test_trace.py
 | 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A20 计算器 AST 迁移） | **P0：A15 补 A8/A9/A10 测试护栏（并发 / 审批 / 超时 / `append` / `duration_ms` 当前零覆盖）**；**P1**：A16 并发与超时语义加固、A17 装饰器透出 `metadata`、A18 `return_direct` 落地、RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：异步 `arun`、跨平台 Shell、`ToolRegistry` 清理、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
 | 🧩 **skill** | ✅ 已实现 | 脚本沙箱（C6）、默认扫描路径统一（C7）、技能依赖 / 版本管理（C8）、技能市场（C9）、`allowed_tools` 生效（C10） |
 | 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输（D6）、`resources` / `prompts`（D7）、图片透传（D8）、断线自动重连（D9）、stderr 消费（D10） |
-| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；下一阶段「**记忆 v2**」：B8 时间统一为北京时间 CST 已落地、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解 |
+| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；「**记忆 v2**」：B8 时间统一为北京时间 CST、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线（v1.8.2 修复窗口写满停摆）、B11 `revise()` 转发、B12 记忆 TTL 与到期回收均已落地，仅余 B13 冲突检测与消解 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
 | 🪟 **context** | ✅ 已实现（v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、embedding 召回扩展位 |
 | 🗄 **database** | ✅ v1.1.0（关系型双后端 + 统一异常体系 + 向量后端） | 连接池 / 线程安全（J2）、Postgres 后端（J4 续）、多租户；memory / trace 后端已迁入（J3） |
 | 🛠 **infra / trace** | ✅ G1 已实现（TraceLogger v1.1.0，含 SQLiteStore）；其余 ⏳ 规划中 | 评估工具（G3）、异步并发（G2）、Web UI / 上报（G4）、打包发布（G5）、CI（G6） |
 
-**当前 P0 已清零**（A15 测试护栏、A16 并发语义加固均已归档）。**当前 P1 重点**：RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）；记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8、B9 已落地，B10–B13 待推进）。
+**当前 P0 已清零**（A15 测试护栏、A16 并发语义加固均已归档）。**当前 P1 重点**：RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）；记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8 / B9 / B10 / B11 / B12 已落地，仅 B13 冲突检测与消解待推进）。
 
 ---
 
