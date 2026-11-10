@@ -265,11 +265,25 @@ class MySQLClient(DatabaseClientBase):
 
     @property
     def conn(self) -> Any:
-        """获取底层连接（如果关闭则自动重连）。"""
+        """获取底层连接。
+
+        非事务态（autocommit 单条语句）下保持原有行为：未连接则连、断开则
+        ping(reconnect=True) 自动重连；长期空闲连接可无缝复用。
+
+        事务态（已 __enter__ 进入 with 块、_tx_depth>0）下不做 ping/自动重连：
+        否则一旦网络抖动触发隐式重连，旧连接上已经 BEGIN 的事务会随连接消失，
+        新连接以 autocommit 落在空事务上，最后的 commit() 会静默丢失前面写入。
+        事务中断连时由后续 execute/query/cursor() 自然抛 MySQLError，被
+        execute/query 的 except MySQLError → DatabaseOperationalError 捕获，
+        让上层明确感知失败并自行重试。
+        """
         if self._conn is None:
             self._connect()
         assert self._conn is not None
-        # 检查连接是否存活，断开则重连
+        if self._tx_depth > 0:
+            # 事务中不 ping/不重连，避免隐式丢失事务边界
+            return self._conn
+        # 非事务态：检查连接存活，断开则重连
         try:
             self._conn.ping(reconnect=True)
         except self._pymysql.MySQLError:

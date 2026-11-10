@@ -254,13 +254,15 @@ def _install_fake_pymysql(monkeypatch):
     返回 (MySQLError, state)：
     - state["connect_error"]：设置后 connect() 抛该异常（模拟连接失败）
     - state["execute_error"]：设置后 cursor.execute() 抛该异常（模拟 SQL 执行失败）
+    - state["ping_error"]：设置后 conn.ping() 抛该异常（模拟网络抖动/断开）
+    - state["ping_called"]：记录 ping 的调用次数，用于断言事务中不 ping
     """
     import types
 
     class MySQLError(Exception):
         pass
 
-    state = {"connect_error": None, "execute_error": None}
+    state = {"connect_error": None, "execute_error": None, "ping_error": None, "ping_called": 0}
 
     class _FakeCursor:
         lastrowid = 1
@@ -287,6 +289,9 @@ def _install_fake_pymysql(monkeypatch):
         def cursor(self):
             return _FakeCursor()
 
+        def begin(self):
+            pass
+
         def commit(self):
             pass
 
@@ -297,6 +302,9 @@ def _install_fake_pymysql(monkeypatch):
             pass
 
         def ping(self, reconnect=True):
+            state["ping_called"] += 1
+            if state["ping_error"] is not None:
+                raise state["ping_error"]
             return None
 
     fake = types.ModuleType("pymysql")
@@ -380,6 +388,57 @@ def test_mysql_close_is_safe_without_pending_transaction(monkeypatch):
     _install_fake_pymysql(monkeypatch)
     from fast_agents.database import MySQLClient as _MC
     db = _MC(host="127.0.0.1", database="x")
+    db.close()
+
+
+def test_mysql_conn_ping_skipped_in_transaction(monkeypatch):
+    """事务态（with db: 块内）不 ping/不重连，避免隐式丢失事务边界。
+
+    非事务态访问 conn 会触发 ping；进入事务后对 conn 的访问不再触发 ping，
+    即使底层连接断开也由 execute 自然抛错，不静默重连；退出事务后恢复 ping。
+    """
+    _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    ping_count = {"n": 0}
+    def _counting_ping(reconnect=True):
+        ping_count["n"] += 1
+    db._conn.ping = _counting_ping
+    # 非事务态访问 conn 应触发 ping
+    ping_count["n"] = 0
+    _ = db.conn
+    assert ping_count["n"] == 1, f"非事务态访问 conn 应 ping 一次，实际 {ping_count['n']}"
+    # 进入事务
+    with db:
+        ping_count["n"] = 0
+        # 事务内访问 conn 与 execute 都不应触发 ping
+        _ = db.conn
+        db.execute("SELECT 1")
+        assert ping_count["n"] == 0, f"事务态访问 conn/execute 不应 ping，实际 {ping_count['n']}"
+    # 退出事务后访问 conn 应恢复 ping
+    ping_count["n"] = 0
+    _ = db.conn
+    assert ping_count["n"] == 1, f"退出事务后访问 conn 应恢复 ping，实际 {ping_count['n']}"
+    db.close()
+
+
+def test_mysql_conn_ping_error_outside_transaction_reconnects(monkeypatch):
+    """非事务态 ping 失败会自动重连，长期空闲连接保持无缝复用体验。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC
+    connect_calls = {"n": 0}
+    original_connect = _MC._connect
+    def _counting_connect(self):
+        connect_calls["n"] += 1
+        return original_connect(self)
+    monkeypatch.setattr(_MC, "_connect", _counting_connect)
+    db = _MC(host="127.0.0.1", database="x")
+    # 首次连接已触发 _connect 一次
+    first_connects = connect_calls["n"]
+    # 非事务态，模拟 ping 失败（如连接被服务端断开）
+    state["ping_error"] = MySQLError("lost connection")
+    _ = db.conn  # 应走到 except 分支触发 _connect 重连
+    assert connect_calls["n"] == first_connects + 1, "ping 失败后应触发一次重连"
     db.close()
 
 
