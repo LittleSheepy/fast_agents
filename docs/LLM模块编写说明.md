@@ -2,10 +2,10 @@
 
 本文档面向 fast_agents LLM（大语言模型）系统，参考 **LangChain BaseLanguageModel / Embeddings**、**LlamaIndex LLM 抽象**、**LiteLLM 多 provider 适配**、**OpenAI 官方 Python SDK** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.0 · 2026-10-29 · 首版交付：补齐 `embed_query` / `embed_documents`，语义检索链路打通
+> 版本：v1.1.0 · 2026-11-09 · 对齐 trace 模块 K1 接入：新增可选 `tracer` 打点 + LLM span token 用量元数据（默认 `None` 零开销，行为不变）
 > 适用版本：`fast_agents.llm`
 > 配套代码：`fast_agents/llm/`（3 个文件：`__init__.py` / `llm.py` / `openai_client.py`）+ 本文档
-> 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：`openai>=1.0`（项目主依赖，零新增依赖）
+> 运行环境：Python 3.10+，**Windows 平台**（仓库当前唯一目标平台，见 `AGENTS.md` R11）；依赖：`openai>=1.0`（项目主依赖，零新增依赖）
 
 ## 目录
 
@@ -28,7 +28,12 @@
 
 ## 一、更新历史
 
-> **v1.0 更新摘要**（本次同步）
+> **v1.1.0 更新摘要**（本次同步）
+> 1. **新增可选 `tracer` 打点** —— `LLM` 门面新增 `tracer: Optional[TraceLogger] = None` 构造参数，`invoke` / `stream_invoke` / `embed_query` / `embed_documents` 四个方法各新增可选 `tracer` 形参；非 `None` 时分别记录 `llm.invoke` / `llm.stream_invoke` / `llm.embed_query` / `llm.embed_documents` 四条 Span（`SpanKind.LLM`），默认 `None` 时行为与 v1.0.0 逐字节一致；
+> 2. **LLM span 写入 token / model 元数据** —— 底层 `OpenAIClient` 新增可选关键字 `usage_sink`（不改返回值语义），门面经 `_merge_usage_metadata()` 把 `usage` 明细与 `prompt_tokens` / `completion_tokens` / `total_tokens` 平铺写入 span 的 `metadata`（`stream_invoke` 无 token）；配套 `_dump_usage()` / `_merge_usage()`，`embed_documents` 多批次累加；
+> 3. **口径修正** —— 运行环境收敛为 Windows 平台（对齐 `AGENTS.md` R11）；补记底层默认 `temperature=0.2` / `max_tokens=1024` 与 `extra_body={"enable_thinking": False}`。
+
+> **v1.0.0 更新摘要**（历史首版）
 > 1. **新增 `embed_query` / `embed_documents`** —— 补齐语义检索前置能力，命名对齐 LangChain；所有新代码通过 `LLM` 实例直接调用，`import` 路径不变（仍然是 `from fast_agents.llm import LLM`），无破坏性变更；
 > 2. **新增 `embedding_model` 配置** —— chat 模型与 embedding 模型独立，通过构造参数 `embedding_model=` 或环境变量 `LLM_EMBED_MODEL` 指定，默认 `text-embedding-3-small`；
 > 3. **`embed_documents` 自动按 2048 分片并发** —— 调用方无需关心 OpenAI API 单批上限，返回顺序与输入严格一致。
@@ -72,7 +77,7 @@ LLM 模块是整个 fast_agents 的「大脑底座」——上层所有模块（
 | LlamaIndex | `LLM` / `BaseEmbedding` 独立抽象，和索引/检索耦合 | 中 | RAG 场景深度优化、embedding 抽象细 | 对话侧偏弱、和 RAG 强绑定、做通用 Agent 不直观 |
 | LiteLLM | 统一所有 provider 到 OpenAI 格式，`completion()` / `embedding()` 一个函数走天下 | 中（litellm 单包） | provider 最全、自动兜底重试/限流 | 黑盒过重、把 openai SDK 再包一层、出问题不好查 |
 | OpenAI 官方 SDK | 直接 `client.chat.completions.create` / `client.embeddings.create` | 轻（仅 openai） | 最薄、官方维护、错误信息最原始 | chat 和 embeddings 两套独立 API、无门面、无分片/重试 |
-| **fast_agents（本模块）** | 门面 `LLM` + `OpenAIClient`（继承 SDK `OpenAI` 类），方法 `invoke` / `stream_invoke` / `embed_query` / `embed_documents` | **轻（仅 openai）** | 门面薄、零额外依赖、query/document 显式区分、自动分片并发、环境变量开箱即用 | 目前只原生支持 OpenAI 兼容协议、无重试/熔断/异步、无本地 embedding |
+| **fast_agents（本模块）** | 门面 `LLM` + `OpenAIClient`（继承 SDK `OpenAI` 类），方法 `invoke` / `stream_invoke` / `embed_query` / `embed_documents` | **轻（仅 openai）** | 门面薄、零额外依赖、query/document 显式区分、自动分片并发、环境变量开箱即用、可选 `tracer` 打点 + token 用量元数据 | 目前只原生支持 OpenAI 兼容协议、无重试/熔断/异步、无本地 embedding |
 
 ### 3.2 关键差异
 
@@ -81,7 +86,7 @@ LLM 模块是整个 fast_agents 的「大脑底座」——上层所有模块（
 | 对话方法命名 | `invoke` 返回完整响应 | 不做 `ainvoke` / `batch` / `stream` 的 SSE 对象抽象，流式直接 yield str | 异步、结构化输出（response_format）、工具调用严格模式 |
 | Embedding 命名 | `embed_query` / `embed_documents`（取 LangChain） | 不抽象 `Embeddings` 基类、不做本地模型适配器 | 异步 `aembed_*`、本地 embedding（sentence-transformers）、缓存 |
 | Provider 支持 | OpenAI 协议全兼容（任意 base_url 中转） | 不做 Anthropic / Gemini 原生 SDK 适配 | Anthropic 原生、Gemini 原生、多 provider 自动降级 |
-| 工程能力 | 超时可配、异常可 catch | 不做自动重试/熔断/限流/全链路 trace | 指数退避重试、熔断、Token 用量统计、TraceLogger 打点 |
+| 工程能力 | 超时可配、异常可 catch、**可选 `tracer` 打点 + token 用量元数据** | 不做自动重试/熔断/限流 | 指数退避重试、熔断 |
 
 **一句话收口**：本实现 = **OpenAI 官方 SDK 的原生调用** + **LangChain 的命名约定（`embed_query` / `embed_documents`）** + **门面薄封装（环境变量 + provider 分发 + 分片并发）**，刻意不引入重型抽象。
 
@@ -158,7 +163,7 @@ MemoryManager / RAGTool → LLM.embed_documents(texts)
 
 - **接入方式**：`ReActAgent.__init__` 接收 `llm: LLM` 参数并保存为成员；所有对模型的调用（包括思考、tool_calls 解析、滚动摘要、未来的 embedding）都走 `self.llm`，不允许直接 new 一个 OpenAI client；
 - **单一数据源约定**：对话历史由 `memory.BufferMemory` 维护，LLM 不持有任何会话状态——它是纯函数式的「输入消息 → 输出消息/向量」，保证可替换、可 mock、可测试；
-- **边界清晰**：LLM 不做 token 计数（归 context 模块）、不做重试熔断（归 infra 模块）、不做向量存储（归 memory / RAG 工具）——它只负责「把东西发出去、把结果拿回来」。
+- **边界清晰**：LLM 自身不做 token 计数（归 context 模块）、不做重试熔断（归 infra 模块）、不做向量存储（归 memory / RAG 工具）——它只负责「把东西发出去、把结果拿回来」；唯一新增的横切能力是**可选** `tracer`：默认 `None` 时零开销、行为与改动前逐字节一致，传入后才记录 span 与 token 元数据（见 §7.2 / §9.1 / §10.1）。
 
 ---
 
@@ -200,23 +205,25 @@ LLM 模块本身没有 pydantic 模型（输入输出都是原生 Python 类型 
 | `provider` | `str` | `"openai"` | 预留 provider 分发位；目前所有值都走 OpenAI 兼容协议 | 否 |
 | `timeout` | `Optional[int]` | `180`（client 层默认） | 请求超时秒数 | 否 |
 | `embedding_model` | `Optional[str]` | `$LLM_EMBED_MODEL`，否则 `"text-embedding-3-small"` | Embedding 模型名，与 chat 模型独立 | 否 |
+| `tracer` | `Optional[TraceLogger]` | `None` | **v1.1.0 新增**：可选打点器；非 `None` 时四个方法各记一条 LLM span，默认 `None` 零开销 | 否 |
 
 ### 6.2 方法签名（核心契约）
 
 ```python
 class LLM:
     # ---- Chat ----
-    def invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Message: ...
-    def stream_invoke(self, messages: list[dict[str, str]], tools=None, **kwargs) -> Iterator[str]: ...
+    def invoke(self, messages: list[dict[str, str]], tools=None, tracer=None, **kwargs) -> Message: ...
+    def stream_invoke(self, messages: list[dict[str, str]], tools=None, tracer=None, **kwargs) -> Iterator[str]: ...
     # ---- Embeddings ----
-    def embed_query(self, text: str, **kwargs) -> list[float]: ...
-    def embed_documents(self, texts: list[str], **kwargs) -> list[list[float]]: ...
+    def embed_query(self, text: str, tracer=None, **kwargs) -> list[float]: ...
+    def embed_documents(self, texts: list[str], tracer=None, **kwargs) -> list[list[float]]: ...
 ```
 
 **命名约定锁死**：
 - 对话方法用 `invoke` / `stream_invoke`——对齐工具模块的 `ToolBase.invoke()` 命名风格（动词 `invoke` 是本框架「一次调用」的统一动词）；
 - Embedding 方法用 `embed_query` / `embed_documents`——对齐 LangChain，**不使用** `embed` / `encode` / `get_embedding` 等模糊命名；
-- 返回原生 `list[float]`——不引入 numpy / torch 依赖，下游要算余弦相似度自己用标准库 `math` 即可（参考 `memory/scoring.py` 全标准库实现的风格）。
+- 返回原生 `list[float]`——不引入 numpy / torch 依赖，下游要算余弦相似度自己用标准库 `math` 即可（参考 `memory/scoring.py` 全标准库实现的风格）；
+- 四个方法统一多一个**可选** `tracer: Optional[TraceLogger] = None`（v1.1.0）——默认 `None` 时零开销、行为不变；传入后记一条 `llm.*` span 并在 `metadata` 写 token 用量。
 
 ---
 
@@ -240,25 +247,34 @@ __all__ = [
 ```python
 class LLM:
     def __init__(self, model=None, api_key=None, base_url=None,
-                 provider="openai", timeout=None, embedding_model=None):
+                 provider="openai", timeout=None, embedding_model=None,
+                 tracer=None):                       # v1.1.0：可选打点，默认 None 零开销
         self.model = model or os.getenv("LLM_MODEL_ID")
         self.api_key = api_key or os.getenv("LLM_API_KEY")
         self.base_url = base_url or os.getenv("LLM_BASE_URL")
         self.embedding_model = embedding_model or os.getenv("LLM_EMBED_MODEL")
+        self.tracer = tracer                         # None 时行为与改动前逐字节一致
         ...
         self._client = self._create_client()
 
-    def embed_query(self, text: str, **kwargs) -> list[float]:
-        return self._client.embed_query(text, **kwargs)
+    def embed_query(self, text: str, tracer=None, **kwargs) -> list[float]:
+        effective = tracer or self.tracer
+        if effective is None:                        # 零开销路径：直接透传
+            return self._client.embed_query(text, **kwargs)
+        ...                                          # 否则记 llm.embed_query span
 
-    def embed_documents(self, texts: list[str], **kwargs) -> list[list[float]]:
-        return self._client.embed_documents(texts, **kwargs)
+    def embed_documents(self, texts: list[str], tracer=None, **kwargs) -> list[list[float]]:
+        effective = tracer or self.tracer
+        if effective is None:
+            return self._client.embed_documents(texts, **kwargs)
+        ...                                          # 否则记 llm.embed_documents span
 ```
 
 **关键实现要点**：
 - **环境变量 vs 构造参数**：用 `or` 实现「构造参数优先，环境变量兜底」。注意 `or` 对空字符串同样 fallback，这是刻意的——如果用户显式传 `model=""`，视为没传、走环境变量；
 - **provider 分发位**：`_create_client()` 虽然目前所有分支都返回 `OpenAIClient`，但 `if self.provider == "openai"` / `else` 的分支结构先搭好，将来加 Anthropic client 时只需加一个 `elif self.provider == "anthropic"` 分支，门面类的构造签名和方法签名都不动；
-- **方法透传**：所有对外方法都是「薄代理」——拿到 kwargs 直接透给 client，不在门面做业务逻辑。这样的好处是：门面永远不需要因为底层参数调整而改。
+- **方法透传**：所有对外方法都是「薄代理」——拿到 kwargs 直接透给 client，不在门面做业务逻辑。这样的好处是：门面永远不需要因为底层参数调整而改；
+- **可选打点（tracer）**：用 `tracer or self.tracer` 取有效值，都为 `None` 时**直接把请求透传给 client、不构造任何 span**（零开销）；只有传入后才用 `with effective_tracer.span(...)`（或 `stream_invoke` 的 `start_span` / `end_span`）记录 LLM span，并在正常/异常分支回填 `output` 与 token 元数据。默认 `None` 保证对既有链路零侵入。
 
 **要自己改时最该看的地方**：想加超时重试、响应缓存、trace 打点，都应该在这一层做（装饰器或包裹 client 调用），不要改 `openai_client.py`——因为 client 将来可能有多个（Anthropic、本地），横切能力应该加在门面或更外层。
 
@@ -281,14 +297,26 @@ self.embedding_model = (
 
 #### 7.3.2 chat 方法
 
-`invoke` / `stream_invoke` 是已有代码，本次改动只加了一行：
+`invoke` / `stream_invoke` 的底层调用（含 `usage_sink` 回填与 `enable_thinking` 关闭）：
 
 ```python
 chat_model = kwargs.pop("model", self.model)
-response = self.chat.completions.create(model=chat_model, ...)
+response = self.chat.completions.create(
+    model=chat_model, messages=messages, tools=tools,
+    temperature=kwargs.get('temperature', self.temperature),   # 默认 0.2
+    max_tokens=kwargs.get('max_tokens', self.max_tokens),       # 默认 1024
+    stream=False,
+    extra_body={"enable_thinking": False},                     # 关闭思考模式
+)
+if usage_sink is not None:                                     # 打点用，可选
+    usage_sink.update(_dump_usage(response.usage))
 ```
 
 **为什么允许通过 kwargs 覆盖 model**：上层偶尔需要对单次调用切换模型（比如摘要用小模型、复杂推理用大模型），不应该为此 new 一个新 LLM 实例。`kwargs.pop` 保证这个参数不会被重复传给底层 SDK（SDK 签名里 `model` 是位置/关键字参数，重复传会报错）。
+
+**为什么默认 `temperature=0.2` / `max_tokens=1024`**：`OpenAIClient.__init__` 从构造 kwargs 读取这两个默认值，偏向「确定性 + 短回复」，适合 Agent 的工具挑选与摘要；需要更长或更发散时，`invoke` 可按次传 `temperature=` / `max_tokens=` 覆盖（`stream_invoke` 仅 `temperature` 可覆盖、`max_tokens` 固定取实例值）。
+
+**为什么加 `extra_body={"enable_thinking": False}`**：部分国内推理模型（Qwen3 等）默认开启思考模式，会在正文前吐 `reasoning_content`、拖慢首字延迟；Agent 场景统一关闭。`stream_invoke` 仍兼容处理 `reasoning_content`（打印到控制台但不进入 yield），防止端点忽略该开关时正文流被思考片段污染。
 
 #### 7.3.3 embed_query
 
@@ -312,10 +340,11 @@ def embed_query(self, text: str, **kwargs) -> list[float]:
 ```python
 _EMBED_BATCH_SIZE = 2048
 
-def _one_batch(batch: list[str]) -> list[list[float]]:
+def _one_batch(batch: list[str]):
     resp = self.embeddings.create(model=embed_model, input=batch, **kwargs)
     ordered = sorted(resp.data, key=lambda d: d.index)
-    return [list(d.embedding) for d in ordered]
+    vectors = [list(d.embedding) for d in ordered]
+    return vectors, _dump_usage(getattr(resp, "usage", None))   # 打点用 usage（可选）
 
 batches = [cleaned[i : i + _EMBED_BATCH_SIZE]
            for i in range(0, len(cleaned), _EMBED_BATCH_SIZE)]
@@ -332,7 +361,7 @@ with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:
 
 **为什么要 `sorted(resp.data, key=lambda d: d.index)`**：OpenAI API 文档**不保证**返回的 `data` 顺序与输入顺序一致（实际实现通常一致，但契约上不保证）；按 `index` 排序是官方推荐的对齐方式，能避免极端情况下向量错位这种极难排查的 bug。
 
-**空串处理**：空串替换为 `" "`（单空格）而不是丢弃——因为 RAG/记忆入库时，输入 texts 通常和一批 chunk 对象一一对应，如果中间丢弃空串会导致返回向量数量和输入不一致，上层索引错位；单空格的 embedding 是一个合法向量，且和任何语义文本的相似度都极低，不会污染检索结果。
+**空串 / 非法项处理**：清洗规则是 `cleaned = [t if (isinstance(t, str) and t.strip()) else " " for t in texts]`——**空串、纯空白串、非字符串项一律替换为 `" "`（单空格）而不是丢弃**——因为 RAG/记忆入库时，输入 texts 通常和一批 chunk 对象一一对应，如果中间丢弃会导致返回向量数量和输入不一致，上层索引错位；单空格的 embedding 是一个合法向量，且和任何语义文本的相似度都极低，不会污染检索结果。
 
 **要自己改时最该看的地方**：接 BGE / E5 / DashScope v3 等非对称模型时，就在 `embed_query` 和 `embed_documents` 内部分别加前缀或 `input_type` 参数，对外签名不变。加重试（指数退避）、加缓存（按 text hash 缓存向量）也在这个文件里做。
 
@@ -441,6 +470,28 @@ msg = llm.invoke(messages, model="gpt-4o")
 python fast_agents\llm\openai_client.py
 ```
 
+### 8.6 接入 TraceLogger（可选，v1.1.0+）
+
+不传 `tracer` 时行为与旧版完全一致；传入后每次调用记录一条 LLM span（含 token 用量），可直接接上 trace 模块的落盘 / 回放：
+
+```python
+from fast_agents.llm import LLM
+from fast_agents.trace import TraceLogger
+
+tracer = TraceLogger(path="logs/llm_run.jsonl", session_id="chat-001")
+llm = LLM(tracer=tracer)                      # ①实例级：所有调用自动打点
+msg = llm.invoke([{"role": "user", "content": "你好"}])
+
+# ②单次覆盖（不传则回退实例级 tracer）：
+llm.embed_query("今天天气怎么样", tracer=tracer)
+
+# 查回放
+for row in tracer.replay(tracer.read_spans(kind="llm")[0].trace_id):
+    print(row)
+```
+
+> `tracer=None`（默认）时**不构造任何 span**，对既有链路零开销——这是本模块「新增能力默认非侵入」的硬承诺（对齐 `AGENTS.md` §9）。
+
 ---
 
 ## 九、API 速查
@@ -458,19 +509,20 @@ llm = LLM(
     provider="openai",          # 预留，目前都走 OpenAI 兼容
     timeout=None,               # 默认 180 秒（client 层）
     embedding_model=None,       # embedding 模型，默认读 $LLM_EMBED_MODEL，否则 text-embedding-3-small
+    tracer=None,                # 可选打点器；非 None 时四个方法各记一条 llm.* span
 )
 ```
 
 | 方法 | 参数 | 返回 | 说明 |
 |---|---|---|---|
-| `invoke(messages, tools=None, **kwargs)` | `messages: list[dict]`（OpenAI message 格式），`tools`（OpenAI tools schema 列表） | `Message`（含 `role`/`content`/`tool_calls`） | 非流式对话，kwargs 可覆盖 `model`/`temperature`/`max_tokens` |
-| `stream_invoke(messages, tools=None, **kwargs)` | 同上 | `Iterator[str]` | 流式对话，逐段 yield 正文（思考片段打印到控制台但不进入 yield） |
-| `embed_query(text, **kwargs)` | `text: str` | `list[float]` | 单条查询向量；kwargs 可覆盖 `model`（embedding 模型名） |
-| `embed_documents(texts, **kwargs)` | `texts: list[str]` | `list[list[float]]` | 批量文档向量；内部按 2048 分片并发；顺序与输入严格一致；kwargs 可覆盖 `model` |
+| `invoke(messages, tools=None, tracer=None, **kwargs)` | `messages: list[dict]`（OpenAI message 格式），`tools`（OpenAI tools schema 列表），`tracer`（可选 `TraceLogger`） | `Message`（含 `role`/`content`/`tool_calls`） | 非流式对话，kwargs 可覆盖 `model`/`temperature`/`max_tokens`；传 `tracer` 时记 `llm.invoke` span |
+| `stream_invoke(messages, tools=None, tracer=None, **kwargs)` | 同上 | `Iterator[str]` | 流式对话，逐段 yield 正文（`reasoning_content` 打印到控制台但不进入 yield）；kwargs 可覆盖 `model`/`temperature`（`max_tokens` 固定取实例默认值、不支持单次覆盖）；传 `tracer` 时记 `llm.stream_invoke` span |
+| `embed_query(text, tracer=None, **kwargs)` | `text: str`，`tracer`（可选 `TraceLogger`） | `list[float]` | 单条查询向量；kwargs 可覆盖 `model`（embedding 模型名）；传 `tracer` 时记 `llm.embed_query` span |
+| `embed_documents(texts, tracer=None, **kwargs)` | `texts: list[str]`，`tracer`（可选 `TraceLogger`） | `list[list[float]]` | 批量文档向量；内部按 2048 分片并发；顺序与输入严格一致；kwargs 可覆盖 `model`；传 `tracer` 时记 `llm.embed_documents` span |
 
 ### 9.2 OpenAIClient（底层，一般不直接使用）
 
-继承官方 `openai.OpenAI`，拥有 SDK 全部能力（`chat.completions` / `embeddings` / `files` / 等）。在本模块自定义的公开方法上，签名与 `LLM` 完全一致——`LLM` 只是代理。
+继承官方 `openai.OpenAI`，拥有 SDK 全部能力（`chat.completions` / `embeddings` / `files` / 等）。本模块自定义的公开方法（`invoke` / `stream_invoke` / `embed_query` / `embed_documents`）整体签名与 `LLM` 对齐，但比门面多一个**关键字专用**的 `usage_sink: Optional[dict] = None`（供打点回填 token 用量，默认 `None` 时不产生任何副作用）；门面层则在四个方法外多一层可选 `tracer` 打点。
 
 ### 9.3 已废弃/预留
 
@@ -490,13 +542,16 @@ llm = LLM(
    方法名里的 `query` 是单数——查询就是「用户的一个问题」，不是一批问题。批量查询在工程上非常罕见（RAG 是一次 query 对一批 doc）；批量能力放在 `embed_documents`。如果上层真的需要批量 query，用 `embed_documents` 即可——底层实现完全能跑，只是语义上要知道「query 前缀/input_type」不会被自动加上（将来加非对称模型时这里要注意）。
 
 3. **为什么不默认做重试/熔断？**
-   重试策略（退避基数、最大次数、对哪些状态码重试）和熔断阈值是强场景相关的：批处理入库可以激进重试、实时对话要快速失败。过早内置一个「万能重试」反而会让上层想自定义时绕不开。重试属于 infra 层横切能力，留给 G1 `TraceLogger` + G2 异步并发一起做。
+   重试策略（退避基数、最大次数、对哪些状态码重试）和熔断阈值是强场景相关的：批处理入库可以激进重试、实时对话要快速失败。过早内置一个「万能重试」反而会让上层想自定义时绕不开。重试属于 infra 层横切能力，留给 infra（G 系列）+ trace（K 系列）一起做；目前 `tracer` 打点（K1）已落地，重试 / 熔断仍未内置。
 
 4. **为什么不在 LLM 里做 embedding 缓存？**
    缓存的 key 是 `(model, text_hash)`，但缓存存储位置（内存/磁盘/redis）和失效策略是上层场景决定的（短期会话可以内存缓存、跨进程需要磁盘、多租户需要 redis）。LLM 层做缓存意味着强绑一种策略，反而阻碍上层。将来可以加一个可选的 `cache:` 构造参数，传入一个有 `get/set` 方法的对象即可，默认 None。
 
 5. **为什么 chat 模型没有硬编码默认值，embedding 模型有？**
    chat 模型的选择直接决定回复质量、价格、速度，差异极大（几元到几百元每百万 token），硬选默认会让没配环境变量的用户在跑完才发现用错模型、产生意料外费用；embedding 模型相对稳定（`text-embedding-3-small` 便宜、足够快、维度统一），且嵌入质量稍差只会影响检索召回率，不会产生安全/费用风险，所以给一个开箱即用的默认是合适的。
+
+6. **为什么打点用「可选 `tracer` 参数」而不是内置一个 Logger？**
+   内置 Logger 会把 LLM 和具体观测后端（jsonl / sqlite / 云上报）绑死，且违背「新增能力默认非侵入」；改成可选 `tracer=None` 后，默认路径零开销、零依赖，需要观测时再传入 trace 模块的 `TraceLogger` 实例即可。token 用量走同一套机制——底层只把 `response.usage` 回填进一个调用方提供的 dict（`usage_sink`），不改变任何既有返回值语义，`tracer=None` 时这段代码根本不执行。
 
 ### 10.2 常见坑与排查
 
@@ -521,7 +576,7 @@ llm = LLM(
 
 ## 十一、测试与验证
 
-本模块当前没有独立的 `test/test_llm.py`（仓库基线无此文件），自测通过以下方式：
+本模块当前**没有独立的 `tests/llm/test_llm.py`**（仓库基线 `tests/` 下无 `llm/` 目录；`AGENTS.md` §7.2 约定的单元测试目录结构尚未补齐），当前自测通过以下方式：
 
 | 验证项 | 方式 | 预期结果 |
 |---|---|---|
@@ -533,6 +588,8 @@ llm = LLM(
 | 类型防御 | 传入 `embed_query(123)` / `embed_documents("not a list")` | 抛出 `TypeError` |
 | 分片并发 | `embed_documents` 传 3000 条短文本（需 key） | 返回 3000 个向量，顺序与输入一一对应 |
 | 下游接入 | ReActAgent 构造时传 `llm=LLM()` | 既有对话/工具调用流程不受影响 |
+| 打点零侵入 | `LLM()`（不传 `tracer`）调用四个方法 | 不构造任何 span、行为与旧版逐字节一致 |
+| 打点落盘 | `LLM(tracer=TraceLogger(path=..., enabled=True))` 调 `invoke` | `read_spans(kind="llm")` 能读到 `llm.invoke` span，`metadata` 含 `total_tokens`（端点回填 usage 时） |
 
 **关键回归断言（如果后续补 `test_llm.py`，这几条必须锁住）**：
 
@@ -540,7 +597,10 @@ llm = LLM(
 2. `embed_documents([])` 返回 `[]`，不报错；
 3. `embed_documents(["a", "", "b"])` 返回长度为 3 的列表（空串不被丢弃，防止顺序错位）；
 4. 传入 `model=` kwarg 能正确覆盖默认模型（通过 monkeypatch `embeddings.create` 断言入参）；
-5. `LLM` 门面的四个方法都把 kwargs 透传给 client，不在中间吃掉参数。
+5. `LLM` 门面的四个方法都把 kwargs 透传给 client，不在中间吃掉参数；
+6. `LLM()`（`tracer=None`）对四个方法的调用次数 = 底层 client 调用次数，不产生额外 span（零开销承诺）；
+7. 传入 `tracer=` 时，`invoke` 落一条 `llm.invoke` span、`metadata` 含 `model` 与（端点回填时）`total_tokens`；
+8. `stream_invoke` 传 `tracer=` 时，span 在生成器耗尽后 `end`，`output.chunks` 等于实际 yield 次数。
 
 ---
 
@@ -548,12 +608,12 @@ llm = LLM(
 
 按优先级排（对齐《演进路线图.md》）：
 
-1. **[G2 异步] `aembed_query` / `aembed_documents` / `ainvoke`** —— 现状：所有方法是同步的，靠线程池拿到有限并发；原因：上游 memory/tools/agents 也都是同步的，先打通语义检索闭环比异步优先级高；待 infra G2 异步并发启动时一起做；
+0. **[可观测] Token 用量统计 + TraceLogger 打点** —— ✅ **已完成（v1.1.0）**：`LLM` 与四个方法新增可选 `tracer`，记录 `llm.invoke` / `llm.stream_invoke` / `llm.embed_query` / `llm.embed_documents` 四条 Span，span `metadata` 写入 `model` + token 用量（见 §7.2 / §9.1 / §10.1）；
+1. **[异步] `aembed_query` / `aembed_documents` / `ainvoke`** —— 现状：所有方法是同步的，靠线程池拿到有限并发；原因：上游 memory/tools/agents 也都是同步的，先打通语义检索闭环比异步优先级高；待 trace K2 异步并发启动时一起做；
 2. **[provider 扩展] Anthropic / Gemini 原生适配** —— 现状：所有 provider 都靠 OpenAI 兼容协议；原因：国内端点基本都兼容 OpenAI 协议，原生适配需求不强；待有明确不兼容的端点需求时再加；
 3. **[本地模型] LocalEmbeddingClient（sentence-transformers）** —— 现状：只能调云端 API；原因：sentence-transformers 依赖 torch（~2GB），违反「零重型依赖」原则；可以作为可选 extra（`pip install fast-agents[local]`），不做默认依赖；
-4. **[G1 可观测] Token 用量统计 + TraceLogger 打点** —— 现状：调用后不统计 token 用量、不打 trace；原因：需要 infra G1 先落 `TraceLogger`；届时在 `invoke` / `embed_*` 三个方法入口加装饰器，记录入参、耗时、token、响应状态，落 jsonl；
-5. **[健壮性] 指数退避重试 + 熔断** —— 现状：无重试，网络抖动直接抛错；原因：和 infra G2/G1 一起做更合适，需要全局的重试策略配置位；
-6. **[缓存] 可选 embedding 缓存** —— 现状：相同文本重复调用会重复请求、重复计费；原因：缓存后端选择（内存/磁盘/redis）依赖场景，先不内置；可以通过「LLM 接受可选 cache 参数」实现可插拔。
+4. **[健壮性] 指数退避重试 + 熔断** —— 现状：无重试，网络抖动直接抛错；原因：需要全局的重试策略配置位，和基础设施一起做更合适；
+5. **[缓存] 可选 embedding 缓存** —— 现状：相同文本重复调用会重复请求、重复计费；原因：缓存后端选择（内存/磁盘/redis）依赖场景，先不内置；可以通过「LLM 接受可选 cache 参数」实现可插拔。
 
 ---
 
@@ -572,18 +632,18 @@ llm = LLM(
 
 - [x] 文档名 `LLM模块编写说明.md`，落位 `docs/`；
 - [x] 开篇写清了定位、配套代码路径、版本、平台与依赖，且有可跳转目录；
-- [x] 有更新历史，且破坏性变更都给了迁移办法（本次是纯新增，无破坏）；
+- [x] 有更新历史，且破坏性变更都给了迁移办法（v1.1.0 为纯新增可选参数，无破坏）；
 - [x] 第二章讲清了四类能力分层与 6 条设计原则；
 - [x] 第三章包含对比总表 5 家 + 异同表（含「缺少什么」）；
 - [x] 第四章有目录结构（单数目录 + 逐文件职责）、分层图、两张调用链路图、与 Agent 接入边界；
 - [x] 第五章（弹性节）讲清了「为什么 Chat/Embedding 在同一个门面」+「为什么分 query/documents 两个方法」；
 - [x] 第六章数据模型字段命名与仓库既有约定一致（`invoke` 动词、门面类单名 `LLM`）；
-- [x] 源码导读三个文件都有「负责什么 / 关键实现 / 为什么」；
-- [x] 快速上手命令是 Windows PowerShell，且提醒了 `test/` 与标准库同名问题（虽然本模块暂无 test 文件）；
-- [x] API 速查完整列出构造参数与四个方法；
-- [x] 第十章三块齐全：5 条设计决策、7 条常见坑、5 条 Windows 专项；
-- [x] 测试章节列出 8 项验证点 + 5 条关键回归断言，如实说明当前没有独立 test_llm.py；
-- [x] 演进路线列出 6 条待办，与《演进路线图.md》G 系列编号对齐；
-- [x] **章节数量、顺序、编号与其余四份文档完全一致**（开篇→一～十三→附录）；
+- [x] 源码导读三个文件都有「负责什么 / 关键实现 / 为什么」，并覆盖 v1.1.0 新增的 `tracer` 与 `usage_sink`；
+- [x] 快速上手命令是 Windows PowerShell，且如实说明 `tests/` 目录结构现状；
+- [x] API 速查完整列出构造参数（含 `tracer`）与四个方法（含 `tracer` 形参）；
+- [x] 第十章三块齐全：6 条设计决策、7 条常见坑、5 条 Windows 专项；
+- [x] 测试章节列出 10 项验证点 + 8 条关键回归断言，如实说明当前没有独立 `tests/llm/test_llm.py`；
+- [x] 演进路线列出 5 条待办（K1 打点已归档为已完成），与《演进路线图.md》编号对齐；
+- [x] **章节数量、顺序、编号与其余模块文档完全一致**（开篇→一～十三→附录）；
 - [x] 全文无「待补充 / TBD」残留；
-- [x] 所有 `.py` 文件已转换为 CRLF 换行符。
+- [x] 交付的 `.md` 文件为 CRLF 换行符（`.gitattributes` 约定）。
