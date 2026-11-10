@@ -14,7 +14,7 @@
 from typing import List, Optional
 
 from ..messages import Message, Messages
-from .schema import ContextPacket
+from .models import ContextPacket
 from .session_store import SessionStore
 
 
@@ -71,9 +71,13 @@ class BufferMemory:
         self.persist_store = persist_store
         self._messages: Messages = Messages()
         self._summary: str = ""
+        # 累计 append 过的消息条数（B10 增量抽取水位线用）：只增不减，窗口裁剪不会让它回退
+        self._total_appended: int = 0
         # 启动时先从持久化层回填（没有 persist_store 时保持空）
         if persist_store is not None:
-            self._messages.extend(persist_store.load())
+            loaded = persist_store.load()
+            self._messages.extend(loaded)
+            self._total_appended = len(loaded)
             self._summary: str = persist_store.load_summary() or ""
             # 回填后如果超过窗口，立刻裁剪保摘要（溢出消息可能已被摘要过，不重新摘要）
             if len(self._messages) > self.max_messages:
@@ -85,6 +89,7 @@ class BufferMemory:
     def append(self, message: Message) -> None:
         """追加一条消息，必要时触发压缩；若开启了持久化则同步落库"""
         self._messages.append(message)
+        self._total_appended += 1
         if self.persist_store is not None:
             # 持久化失败不能拖垮主流程（和摘要失败同样的容错策略）
             try:
@@ -140,8 +145,28 @@ class BufferMemory:
         """返回窗口内的消息副本"""
         return self._messages.get_messages()
 
+    # Buffer里加这个方法，完全内部处理裁剪偏移
+    def get_messages_since(self, global_offset: int) -> List[Message]:
+        """返回全局累计序号 >= global_offset 的、当前窗口内仍留存的消息
+        global_offset 是 _total_appended 坐标系下的序号，和窗口裁剪无关
+        """
+        if global_offset >= self._total_appended:
+            return []
+        # 全局序号转窗口内下标：窗口里最老的消息对应的全局序号 = 总累计 - 当前窗口长度
+        window_start_global_seq = self._total_appended - len(self._messages)
+        start_idx_in_window = max(0, global_offset - window_start_global_seq)
+        return self.get_messages()[start_idx_in_window:]
+
     def get_summary(self) -> str:
         return self._summary
+
+    def get_total_appended(self) -> int:
+        """自创建（或上次 clear 之后）以来累计 append 过的消息条数
+
+        与 len(self) 不同：滑动窗口裁剪最老消息时它只增不减、不会回退。
+        MemoryManager 用它作为增量抽取水位线，从而窗口写满后仍能持续抽取新消息。
+        """
+        return self._total_appended
 
     def to_openai_messages(self) -> List[dict]:
         """转成 OpenAI messages 列表（供 Agent 直接喂给 LLM）
@@ -183,6 +208,7 @@ class BufferMemory:
     def clear(self) -> None:
         self._messages.clear()
         self._summary = ""
+        self._total_appended = 0
         if self.persist_store is not None:
             try:
                 self.persist_store.clear()

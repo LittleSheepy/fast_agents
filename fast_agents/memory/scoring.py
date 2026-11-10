@@ -1,12 +1,20 @@
 """记忆相关性打分工具
 
-为什么不直接上向量检索？
-- 你现在的框架还依赖 OpenAI 原生 API，没有 embedding 链路；
-- 能不能先跑通记忆闭环，比检索精度更重要。
+v1.3.0 及以前：纯词法（无 embedding 依赖闭环先行）
+v1.4.0（B2）：叠加语义通道，新增 cosine_similarity 纯 Python 实现，
+    score_record / rank_records 通过 semantic_getter 注入语义分，
+    hybrid_weight 默认 0.7（偏语义，用户确认过）。
+v1.7.0（B5）：新增 merge_similarity 用于记忆合并（语义 0.7 + 词法 0.3，
+    语义缺失时退化为纯词法，不把 None 当 0 代入）。
+v1.8.3（向量通道完善）：打分公式本身不变，只在调用侧（store 层）优化
+    向量批量加载，避免逐条懒加载导致 N 次 embed 调用。
 
-所以这里先用「词法重叠 + 重要性 + 时间衰减」这套无依赖打分，
-接口留好，后续换成向量检索时只替换 search() 的实现即可。
-（HelloAgents 的做法也是这样：先用 SQLite 打底，语义检索作为可选增强层。）
+设计取舍：
+- 纯标准库 re + math 实现，零 numpy/faiss 依赖；
+- 中文按「英文词 + 单字」混合切分 + 常用停用字过滤；
+- 偏好类（preference）走保底角色权重，非偏好类有语义门槛过滤假阳性；
+- 向量能力在 store 层（SemanticMemoryStore / ChromaMemoryStore）提供，
+  本模块只负责打分与排序，和具体 embedding 后端解耦。
 """
 
 import re
@@ -15,7 +23,7 @@ from datetime import datetime
 from typing import Iterable, List, Optional
 
 from fast_agents.utils.time_utils import to_cst, cstnow
-from .schema import MemoryRecord
+from .models import MemoryRecord
 
 # 中文按字也算词，所以用「英文词 + 单字」混合切分
 _WORD_RE = re.compile(r"[a-zA-Z0-9_]+|[\u4e00-\u9fff]")
@@ -137,7 +145,7 @@ def score_record(query: str, record: "MemoryRecord", semantic: Optional[float] =
       默认 hybrid_weight=0.7，即偏语义（用户确认）；
     - 偏好类仍走「relevance 保底 _PREF_RELEVANCE_FLOOR」的角色权重逻辑。
     """
-    from .schema import MemoryRecord  # 局部导入避免循环
+    from .models import MemoryRecord  # 局部导入避免循环
     _PREF_RELEVANCE_FLOOR = 0.3
     lex = lexical_score(query, record.content)
     if semantic is None:
@@ -161,7 +169,7 @@ def rank_records(query, records, limit, *, include_preferences=True,
         既没词法命中也没语义相近的不进候选。
     其余参数与 v1.3.0 一致。
     """
-    from .schema import MemoryRecord
+    from .models import MemoryRecord
     if not isinstance(query, str):
         raise TypeError("query 必须是字符串")
     if not isinstance(limit, int) or limit <= 0:

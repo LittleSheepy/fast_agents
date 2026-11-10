@@ -45,7 +45,7 @@ from ..database import (
 )
 from fast_agents.utils.time_utils import to_cst, to_cst_iso, cstnow
 from .memory_store_base import MemoryStoreBase
-from .schema import MemoryRecord
+from .models import MemoryRecord
 
 
 class SQLiteMemoryStore(MemoryStoreBase):

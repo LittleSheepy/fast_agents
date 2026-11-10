@@ -5,7 +5,7 @@
 """
 
 from datetime import datetime
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal, Optional, List
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -83,6 +83,27 @@ class MemoryRecord(BaseModel):
     def __str__(self) -> str:
         return f"MemoryRecord(id={self.memory_id[:8]}, kind={self.kind}, content={self.content!r})"
 
+class MemoryVector(BaseModel):
+    """内存 + SQLite 通道共享的单条向量记录，字段与 memory_embeddings 表 / Chroma metadata 三端对齐"""
+    memory_id: str
+    embedding: List[float]
+    user_id: str = ""
+    session_id: str = ""
+    dim: int = 0
+    model: str = ""
+    kind: str = ""
+    importance: float = 0.0
+    status: str = "active"
+    updated_at: float = 0.0
+
+    @property
+    def meta(self) -> Dict[str, Any]:
+        """返回与 Chroma _meta_for() 同口径的 meta 子集（kind / importance / status）"""
+        return {
+            "kind": self.kind or "",
+            "importance": float(self.importance or 0.0),
+            "status": self.status or "active",
+        }
 
 class ContextPacket(BaseModel):
     """注入上下文的一小块内容

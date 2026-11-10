@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 
 from ..database import SQLiteClient
 from fast_agents.utils.time_utils import cstnow
-from .schema import UserProfile
+from .models import UserProfile
 
 # 允许直接写到 UserProfile 顶层的字段白名单
 _TOP_LEVEL_FIELDS = ("name", "role", "location", "language")

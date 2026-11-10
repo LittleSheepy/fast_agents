@@ -25,7 +25,7 @@ from .memory_store_base import MemoryStoreBase
 from .buffer import BufferMemory, DEFAULT_SUMMARY_PROMPT
 from .in_memory_store import InMemoryStore
 from .profile_store import ProfileStore
-from .schema import ContextPacket, MemoryKind, MemoryRecord, UserProfile
+from .models import ContextPacket, MemoryKind, MemoryRecord, UserProfile
 from .session_store import SessionStore
 
 
@@ -88,8 +88,6 @@ class MemoryManager:
         self.llm = llm
         self.auto_extract = auto_extract
         self.extract_prompt = extract_prompt or DEFAULT_EXTRACT_PROMPT
-        # B10 增量抽取水位线：记录上次抽取到的消息条数，只抽新增部分，省token、避免重复入库
-        self._extract_watermark: int = 0
 
         self.long_term: MemoryStoreBase = long_term_store or InMemoryStore()
         self.profile_store = profile_store
@@ -99,6 +97,10 @@ class MemoryManager:
             llm=llm,
             persist_store=session_store,
         )
+        # B10 增量抽取水位线：记录累计已处理的消息条数，只抽新增部分，省 token、避免重复入库。
+        # 用 BufferMemory 的累计 append 计数当水位线（不随窗口裁剪回退），不能用 len(buffer)，
+        # 否则滑动窗口写满后 len 恒等于 max_messages，会让抽取永久停摆（B10 缺陷修复）。
+        self._extract_watermark: int = self.buffer.get_total_appended()
 
     # ---------- 1. 检索 ----------
 
@@ -181,6 +183,7 @@ class MemoryManager:
         self, content: str, *, kind: MemoryKind = "fact",
         source: str = "user_stated", importance: float = 0.5,
         ttl: Optional[timedelta] = None,
+        conflict_threshold: float = 0.85,
     ) -> MemoryRecord:
         """手动写入一条长期记忆
 
@@ -192,12 +195,23 @@ class MemoryManager:
             ttl: 可选有效期（相对当前时间）；到期后该条记忆会被 compact() 清理（status→retracted），
                 且在清理之前就不会被检索返回。None 表示永不过期（默认，向后兼容）。
                 典型用法：`ttl=timedelta(hours=24)` 表示「这条只在 24 小时内有效」。
+            conflict_threshold: B13 向量冲突阈值；写入前用 Chroma ANN（优先）/ 语义批量
+                兜底检测相似记忆，相似度 ≥ 该阈值时视为「重复写入」，直接返回已有
+                记忆（newest_wins：不重复插入、不新建 superseded 版本，避免冗余）。
+                Chroma 不可用 / embed 失败时自动退化为词法 Jaccard，绝不阻塞写入。
         """
         if not content or not content.strip():
             raise ValueError("content 不能为空")
+        text = content.strip()
+
+        # B13：写入前先做冲突检测——以 Chroma 向量近邻为主，失败回退词法。
+        existing = self._find_conflict(text, threshold=conflict_threshold)
+        if existing is not None:
+            return existing
+
         expires_at = (cstnow() + ttl) if ttl is not None else None
         record = MemoryRecord(
-            user_id=self.user_id, session_id=self.session_id, content=content.strip(),
+            user_id=self.user_id, session_id=self.session_id, content=text,
             source=source, kind=kind, importance=float(importance),
             expires_at=to_cst(expires_at) if expires_at else None,
         )
@@ -208,17 +222,22 @@ class MemoryManager:
 
         不再每轮把整段历史重新送给 LLM，只抽取未处理过的新增消息段，大幅节省 token、
         避免同一段事实被反复抽取重复入库。
+
+        水位线基于 BufferMemory 的「累计 append 计数」而非窗口长度：滑动窗口裁剪最老消息
+        时计数不回退，因此窗口写满后仍能持续抽取（修复窗口写满后抽取静默停摆的问题）。
         """
         if not self.llm:
             return []
-        history = self.buffer.get_messages()
-        total = len(history)
-        if total <= self._extract_watermark:
+        # 用「累计 append 计数」当水位线：窗口裁剪不影响它，窗口写满后仍能持续抽取
+        total = self.buffer.get_total_appended()
+        new_count = total - self._extract_watermark
+        if new_count <= 0:
             # 没有新消息，无需重复抽取
             return []
-        # 只取上次水位线之后的新增部分
-        new_messages = history[self._extract_watermark:]
+        # 新增消息一定在窗口尾部；新增条数超过窗口容量时，切片自然取到窗口全部消息
+        new_messages = self.buffer.get_messages_since(self._extract_watermark)
         if not new_messages:
+            self._extract_watermark = total
             return []
         conversation = "\n".join(
             f"{m.role}: {m.content}" for m in new_messages if m.content
@@ -235,8 +254,9 @@ class MemoryManager:
             kind = item.get("kind", "fact")
             if not content or kind not in ("preference", "fact", "procedure", "episode"):
                 continue
-            if self._is_duplicate(content):
-                continue
+            # B13 bug 修复：不必在这里先检测一次重复——remember() 内部已经走
+            # _find_conflict（向量优先 + 词法兜底）。若此处再检测一次，每条候选会触发
+            # 两次近邻/词法扫描，token 和延迟白白翻倍。统一只在 remember 里检测一次。
             try:
                 importance = float(item.get("importance", 0.5))
             except (TypeError, ValueError):
@@ -279,21 +299,66 @@ class MemoryManager:
             return []
         return [d for d in data if isinstance(d, dict)]
 
-    def _is_duplicate(self, content: str, threshold: float = 0.85) -> bool:
-        """用词项 Jaccard 相似度做轻量去重，避免同一偏好反复入库"""
+    def _find_conflict(self, content: str, threshold: float = 0.85) -> Optional[MemoryRecord]:
+        """写入前冲突检测（B13，以向量相似度为主）。
+
+        检测优先级：
+        1. 若 long_term_store 提供 ``find_similar``（ChromaMemoryStore / SemanticMemoryStore
+           均已实现），走向量近邻：Chroma 走 ANN 索引 O(log n)，语义兜底走批量 cosine；
+        2. 向量通道不可用（无 find_similar、embed 失败、Chroma 未连接）时，回退到词法
+           Jaccard（保留原 _is_duplicate 行为作为最后防线）；
+        3. 两条路径都不阻塞写入——任何异常都打 warning 后放行，不因为检测失败丢失记忆。
+
+        返回命中的重复记忆（MemoryRecord），未命中返回 None。阈值越高越严格（更不会误杀），
+        默认 0.85 与 merge_similar 对齐。
+        """
+        if not content:
+            return None
+        text = content.strip()
+        if not text:
+            return None
+
+        # 路径 1：向量通道（以 Chroma ANN 为主；SemanticMemoryStore 提供兜底）
+        find_similar = getattr(self.long_term, "find_similar", None)
+        if callable(find_similar):
+            try:
+                hits = find_similar(text, limit=1, threshold=threshold)
+                if hits:
+                    # hits: [(record, similarity), ...]
+                    return hits[0][0]
+            except Exception as exc:  # noqa: BLE001
+                # 向量检测失败不阻塞写入，降级到词法
+                print(f"⚠️ 向量冲突检测失败，降级为词法（{exc}）")
+
+        # 路径 2：词法 Jaccard 兜底（原 _is_duplicate 逻辑）
+        return self._lexical_duplicate(text, threshold=threshold)
+
+    def _lexical_duplicate(self, content: str, threshold: float = 0.85) -> Optional[MemoryRecord]:
+        """词法 Jaccard 去重（v1.4.0 原 _is_duplicate 行为保留为兜底）"""
         from ..memory.scoring import lexical_terms
 
         new_terms = set(lexical_terms(content))
         if not new_terms:
-            return True
+            # 切不出有效词项，视为空内容、不写入（由 remember 的空校验挡住，这里返回 None 放行）
+            return None
         for existing in self.long_term.all():
+            # if existing.is_expired():   # 判断记忆是否已过期
+            #     continue
             old_terms = set(lexical_terms(existing.content))
             if not old_terms:
                 continue
             union = new_terms | old_terms
             if union and len(new_terms & old_terms) / len(union) >= threshold:
-                return True
-        return False
+                return existing
+        return None
+
+    def _is_duplicate(self, content: str, threshold: float = 0.85) -> bool:
+        """v1.4.0 兼容别名：返回是否与已有记忆重复（True 表示重复）。
+
+        内部已统一走 ``_find_conflict``（向量优先 + 词法兜底），保留这个名字
+        是为了让老测试/老代码不改一行继续能用。
+        """
+        return self._find_conflict(content, threshold=threshold) is not None
 
     # ---------- 3. 维护 ----------
 

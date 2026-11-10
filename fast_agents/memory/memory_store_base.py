@@ -23,7 +23,7 @@ from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
 
 from fast_agents.utils.time_utils import to_cst, cstnow
-from .schema import MemoryRecord
+from .models import MemoryRecord
 from .scoring import (
     cosine_similarity, lexical_terms, merge_similarity, rank_records,
 )
@@ -116,6 +116,70 @@ class MemoryStoreBase(ABC):
         """
         return None
 
+    def semantic_batch_get(self, records: List["MemoryRecord"]) -> List[Optional[List[float]]]:
+        """批量读取已缓存的向量，顺序与 records 一一对应
+
+        - 默认返回全 None（无缓存能力），由调用方走语义 fallback；
+        - 有本地向量缓存的后端（SemanticMemoryStore / ChromaMemoryStore）
+          覆盖本方法，直接从 SQLite 表 / 内存 dict / Chroma 里批量读出已缓存的向量，
+          避免 search / merge_similar 逐条懒加载触发 N 次 embed；
+        - 返回值长度必须与 records 相等；读不到的位置填 None（由上层决定是否批量补算）。
+        """
+        return [None] * len(records)
+
+    def embedding_stats(self) -> dict:
+        """向量能力健康统计钩子（默认：无向量能力）。
+
+        返回至少包含 ``{"available": bool}``；可用时由子类补充
+        backend / dimension / model / cached_total / total_records 等字段。
+        上层（例如打健康日志、调试面板）可按需读取，不存在调用方强依赖，
+        缺字段也不会阻断主流程。
+        """
+        return {"available": False}
+
+    def find_similar(self, content: str, *, limit: int = 5,
+                     threshold: float = 0.85) -> List[tuple]:
+        """写入前向量冲突检测钩子（B13）。
+
+        - 默认返回空列表，表示"后端无向量能力，请调用方回退词法"；
+        - ChromaMemoryStore 直接走 ANN 近邻（O(log n)）；SemanticMemoryStore
+          提供基于本地向量缓存的批量 cosine 兜底实现；
+        - 返回 ``[(MemoryRecord, similarity), ...]``，按相似度降序、已按 threshold 过滤。
+        """
+        return []
+
+    def semantic_batch_get_and_save(self, records: List["MemoryRecord"]) -> List[Optional[List[float]]]:
+        """批量读取已缓存的向量,并对缺失的条目批量补算，顺序与 records 一一对应,
+
+        1) 优先批量取本地缓存
+        2) 只对缺失的条目批量补算 embedding（一次 LLM 调用）
+        3) 补算出来的新向量立即写回本地缓存，后续 search / merge_similar 直接命中
+        """
+        # 1) 优先批量取本地缓存
+        vecs = list(self.semantic_batch_get(records) or [None] * len(records))
+        if len(vecs) < len(records):
+            vecs.extend([None] * (len(records) - len(vecs)))
+
+        missing_indices: List[int] = [i for i, v in enumerate(vecs) if v is None]
+
+        # 2) 只对缺失的条目批量补算 embedding（一次 LLM 调用）
+        if missing_indices:
+            missing_records = [records[i] for i in missing_indices]
+            missing_texts = [r.content for r in missing_records]
+            missing_vecs = self.semantic_vectors(missing_texts)
+            if missing_vecs and len(missing_vecs) == len(missing_texts):
+                for idx, rec, v in zip(missing_indices, missing_records, missing_vecs):
+                    if v:
+                        vec = list(v)
+                        vecs[idx] = vec
+                        # 3) 补算后立即落盘缓存（把刚算好的 vec 一起传下去，避免二次 embed），下次直接命中
+                        try:
+                            self._save_vec(rec, vec)
+                        except Exception:  # noqa: BLE001
+                            # 存不进缓存不影响本次检索
+                            pass
+        return vecs
+
     def archive_stale(
         self, *, max_importance: float = 0.3, stale_days: int = 90,
         now: Optional[datetime] = None,
@@ -183,6 +247,8 @@ class MemoryStoreBase(ABC):
         B5 新增，是「记忆合并」的落地方式：
         - 相似度 = 语义 × 0.7 + 词法 × 0.3（scoring.merge_similarity），
           后端无向量能力时自动退化为纯词法；
+        - 语义向量先批量命中本地缓存（semantic_batch_get_and_save），只对缺失项
+          补算一次 embedding 并落盘，避免每次合并都全量重算向量；
         - 先按 (重要性降序, 创建时间升序) 排序，让「更重要 / 更早」的那条当主记录，
           两条相似记忆永远保留重要的、舍弃冗余的；
         - 被合并的记录 status → superseded，并在 metadata["merged_into"]
@@ -199,7 +265,8 @@ class MemoryStoreBase(ABC):
             all_records = sorted(all_records, key=lambda r: to_cst(r.updated_at), reverse=True)[:max_records]
         records = sorted(all_records, key=lambda r: (-r.importance, to_cst(r.created_at)))
 
-        vecs = self.semantic_vectors([r.content for r in records])
+        # 先批量读本地缓存，仅对缺失项补算并落盘（不再每次全量重算向量）
+        vecs = self.semantic_batch_get_and_save(records)
         vec_by_id = {}
         if vecs and len(vecs) == len(records):
             vec_by_id = {r.memory_id: v for r, v in zip(records, vecs) if v}
