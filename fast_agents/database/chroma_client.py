@@ -25,7 +25,8 @@
    不向外部发送使用统计。
 6. **远端参数更完整**：``ssl`` / ``headers`` / ``tenant`` / ``database`` 均可透传给 HttpClient。
 7. **健壮性**：``add`` 校验 ids 去重与批内维度一致、``get`` 校验 ``limit`` 为正整数、
-   ``connect`` 加锁避免多线程重复建连接、清理结果摊平函数里的死参数。
+   ``connect`` 加锁避免多线程重复建连接、清理结果摊平函数里的死参数、
+   ``drop_collection`` 仅对「集合不存在」静默（其它错误照抛）。
 
 使用示例见 ``examples/database/chroma_usage.py``。
 
@@ -36,6 +37,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from collections import Counter
 from typing import Any, Sequence
 
 from .errors import (
@@ -71,7 +73,7 @@ def _check_collection_name(name: str, label: str = "集合名") -> None:
         raise TypeError(f"{label}必须是字符串，收到 {type(name)}")
     if not _COLLECTION_NAME_RE.match(name):
         raise DatabaseIdentifierError(
-            f"非法{label}: {name!r}；需 3-63 字符、字母开头，只允许字母/数字/下划线/连字符"
+            f"非法{label}: {name!r}；需 3-63 字符、字母或数字开头结尾，只允许字母/数字/下划线/连字符"
         )
 
 
@@ -108,7 +110,10 @@ def _compile_vector_filter(f: VectorFilter | dict[str, Any]) -> dict[str, Any]:
     # 叶子条件
     if not f.field:
         raise DatabaseValidationError(f"叶子条件 {f.op.value} 需要 field")
-    if f.value is None and f.op not in (VectorFilterOp.EQ, VectorFilterOp.NE):
+    if f.value is None:
+        if f.op in (VectorFilterOp.EQ, VectorFilterOp.NE):
+            # Chroma 的 where 不接受 null 操作数，客户端侧显式拦截，避免把 None 透传触发原生 ValueError
+            raise DatabaseValidationError(f"{f.op.value} 条件的 value 不能为 None")
         raise DatabaseValidationError(f"{f.op.value} 条件需要 value")
     return {f.field: {f.op.value: f.value}}
 
@@ -350,9 +355,14 @@ class ChromaClient(VectorClientBase):
         self.connect()
         try:
             self._client.delete_collection(name)
-        except Exception:
-            # 不存在就静默，对齐 SQLiteClient.drop_table 的行为
-            pass
+        except Exception as e:
+            # 仅「集合不存在」静默，对齐 SQLiteClient.drop_table 的 IF EXISTS 语义；
+            # 0.6.x 删不存在的集合抛原生 ValueError('... does not exist')，部分版本抛
+            # NotFoundError / InvalidCollectionException，故类型名与文案双判；
+            # 其它错误（I/O、权限等）必须继续抛出，不能被静默吞掉。
+            text = f"{type(e).__name__} {e}".lower()
+            if not ("does not exist" in text or "not found" in text or "invalidcollection" in text):
+                raise DatabaseQueryError(f"删除集合 {name!r} 失败：{e}") from e
         self._collections.pop(name, None)
         self._dimensions.pop(name, None)
 
@@ -371,7 +381,7 @@ class ChromaClient(VectorClientBase):
             raise DatabaseValidationError("add 的 embeddings / documents / metadatas 至少要有一个")
         if len(set(ids)) != len(ids):
             # Chroma 内部会抛 DuplicateIDError，这里提前拦下并给一致的中文错误
-            dup = sorted({i for i in ids if ids.count(i) > 1})
+            dup = sorted(k for k, c in Counter(ids).items() if c > 1)
             raise DatabaseValidationError(f"add 的 ids 存在重复：{dup}")
         n = len(ids)
         for field, lst in (
@@ -435,11 +445,8 @@ class ChromaClient(VectorClientBase):
                 metadatas=payload_metas,
             )
         except Exception as e:
-            # 兜底把维度类错误翻译成 clearer 的中文提示（Chroma 空集合不校验维度，
-            # 但集合内已有向量时维度不符会抛 InvalidDimensionException）
-            if "dimension" in str(e).lower():
-                raise DatabaseQueryError(f"写入集合 {collection!r} 失败：{e}") from e
-            raise
+            # 统一收口：不把 Chroma SDK 原生异常抛给上层（维度不符、唯一约束、metadata 非法等都归此）
+            raise DatabaseQueryError(f"写入集合 {collection!r} 失败：{e}") from e
 
     # ---------- 删除 ----------
     def delete(
@@ -456,14 +463,20 @@ class ChromaClient(VectorClientBase):
         # 语义固定：传了 ids 就按 id 删；否则按 where 删（不依赖 Chroma 未文档化的混用行为）
         if ids:
             targets = list(dict.fromkeys(ids))  # 去重且保持顺序
-            found = col.get(ids=targets, include=[]) or {}
-            removed = len(found.get("ids") or [])
-            col.delete(ids=targets)
+            try:
+                found = col.get(ids=targets, include=[]) or {}
+                removed = len(found.get("ids") or [])
+                col.delete(ids=targets)
+            except Exception as e:
+                raise DatabaseQueryError(f"删除集合 {collection!r} 中的向量失败：{e}") from e
             return removed
         where_dict = _compile_where(where)
-        found = col.get(where=where_dict, include=[]) or {}
-        removed = len(found.get("ids") or [])
-        col.delete(where=where_dict)
+        try:
+            found = col.get(where=where_dict, include=[]) or {}
+            removed = len(found.get("ids") or [])
+            col.delete(where=where_dict)
+        except Exception as e:
+            raise DatabaseQueryError(f"删除集合 {collection!r} 中的向量失败：{e}") from e
         return removed
 
     # ---------- 取 ----------
@@ -495,7 +508,10 @@ class ChromaClient(VectorClientBase):
             kwargs["where"] = where_dict
         if limit is not None:
             kwargs["limit"] = limit
-        res = col.get(**kwargs)
+        try:
+            res = col.get(**kwargs)
+        except Exception as e:
+            raise DatabaseQueryError(f"读取集合 {collection!r} 失败：{e}") from e
         return self._flatten_get_result(
             res,
             include_embeddings=include_embeddings,
@@ -528,12 +544,15 @@ class ChromaClient(VectorClientBase):
         includes = ["metadatas", "documents", "distances"]
         if include_embeddings:
             includes.append("embeddings")
-        res = col.query(
-            query_embeddings=[query_embedding],
-            n_results=n_results,
-            where=where_dict,
-            include=includes,
-        )
+        try:
+            res = col.query(
+                query_embeddings=[query_embedding],
+                n_results=n_results,
+                where=where_dict,
+                include=includes,
+            )
+        except Exception as e:
+            raise DatabaseQueryError(f"检索集合 {collection!r} 失败：{e}") from e
         # query 返回的是「按 query 分组」的 dict-of-lists；本方法只支持单向量查询，取第一组
         return self._flatten_query_result(res, include_embeddings=include_embeddings)
 
@@ -541,9 +560,16 @@ class ChromaClient(VectorClientBase):
     def count(self, collection: str, where: VectorWhere = None) -> int:
         col = self._get_collection(collection)
         if where is None:
-            return col.count()
+            try:
+                return col.count()
+            except Exception as e:
+                raise DatabaseQueryError(f"统计集合 {collection!r} 失败：{e}") from e
         # Chroma 没有带 where 的 count，走 get include=[] 取 ids 计数（结果不在内存展开向量）
-        res = col.get(where=_compile_where(where), include=[])
+        where_dict = _compile_where(where)
+        try:
+            res = col.get(where=where_dict, include=[])
+        except Exception as e:
+            raise DatabaseQueryError(f"统计集合 {collection!r} 失败：{e}") from e
         return len(res.get("ids") or [])
 
     # ---------- 结果格式化（统一摊平为 list[dict]，不向外泄露 Chroma 原始结构） ----------

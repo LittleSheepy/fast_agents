@@ -452,6 +452,201 @@ def test_chroma_get_or_create_tolerates_existing_collection_without_metadata():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ===========================================================================
+# 向量后端：异常统一收口（v1.0.0 收口）
+# ===========================================================================
+
+def test_chroma_all_public_methods_wrap_chroma_errors():
+    """get/search/delete/count 在集合不存在时应抛 DatabaseQueryError（而非原生 InvalidCollectionException）。"""
+    importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient, DatabaseError, DatabaseQueryError
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        for method, args, kwargs in [
+            ("get", (), {"ids": ["x"]}),
+            ("search", ([1.0, 0.0],), {"n_results": 1}),
+            ("delete", (), {"ids": ["x"]}),
+            ("count", (), {}),
+        ]:
+            try:
+                getattr(db, method)("no_such_coll", *args, **kwargs)
+                assert False, f"{method} 应抛异常"
+            except DatabaseQueryError:
+                pass  # 期望路径
+            except DatabaseError as e:
+                # 其它 DatabaseError 子类也算收口成功（不再是原生 Chroma 异常）
+                assert type(e).__module__.startswith("fast_agents.database"), (
+                    f"{method} 应抛本模块异常，实际 {type(e).__module__}.{type(e).__name__}"
+                )
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_leaf_filter_rejects_none_value():
+    """叶子条件 value=None 应在客户端侧被显式拦截，不把 None 透传给 Chroma 触发原生 ValueError。"""
+    from fast_agents.database import VectorFilter, VectorFilterOp
+    from fast_agents.database import DatabaseValidationError
+    from fast_agents.database.chroma_client import _compile_vector_filter
+    for op in (VectorFilterOp.EQ, VectorFilterOp.NE):
+        try:
+            _compile_vector_filter(VectorFilter(field="k", op=op, value=None))
+            assert False, "应抛 DatabaseValidationError"
+        except DatabaseValidationError as e:
+            assert "不能为 None" in str(e)
+
+
+def test_chroma_invalid_metadata_value_wrapped():
+    """metadata 非法值（例如 object 实例）应被包装为 DatabaseError 子类，不向外泄露原生 ValueError/TypeError。"""
+    importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient, DatabaseError
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("wrap_md", dimension=3)
+        try:
+            db.add("wrap_md", ids=["x"], embeddings=[[0.1, 0.2, 0.3]],
+                   metadatas=[{"k": object()}])
+            assert False, "应抛异常"
+        except DatabaseError as e:
+            assert type(e).__module__.startswith("fast_agents.database"), (
+                f"metadata 非法值应抛本模块异常，实际 {type(e)}"
+            )
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_invalid_in_filter_wrapped():
+    """$in 传非列表（标量值）应被包装为 DatabaseError 子类，不向外泄露原生 ValueError。"""
+    importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient, DatabaseError, VectorFilter, VectorFilterOp
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("wrap_in", dimension=2)
+        db.add("wrap_in", ids=["a"], embeddings=[[1.0, 0.0]])
+        try:
+            db.get("wrap_in", where=VectorFilter(field="v", op=VectorFilterOp.IN, value=123))
+            assert False, "应抛异常"
+        except DatabaseError as e:
+            assert type(e).__module__.startswith("fast_agents.database"), (
+                f"$in 非法入参应抛本模块异常，实际 {type(e)}"
+            )
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_drop_collection_only_swallows_missing():
+    """drop_collection 只在「集合不存在」时静默，其它错误必须继续抛出。
+
+    这里通过向 Chroma 注入「集合名非法但经过 _check_collection_name 之前不存在的路径」
+    难以构造；我们主要验证：不存在集合静默 + 存在集合真的被删除。
+    非"不存在"类错误（如 SDK 内部 I/O）路径由代码审计保证：除 missing 外一律 raise。
+    """
+    importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("drop_test", dimension=2)
+        # 第一次 drop：删除存在的集合
+        db.drop_collection("drop_test")
+        assert not db.collection_exists("drop_test")
+        # 第二次 drop：不存在静默
+        db.drop_collection("drop_test")
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_collection_name_error_message_mentions_digit():
+    """集合名校验文案应反映正则真实规则（首尾允许数字）。"""
+    importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient, DatabaseIdentifierError
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        try:
+            db.create_collection("ab")
+        except DatabaseIdentifierError as e:
+            assert "字母或数字开头结尾" in str(e), f"文案应包含「字母或数字开头结尾」，实际：{e}"
+        # 数字开头的 3 字符合法名应通过（不应抛错）
+        db.get_or_create_collection("1ab", dimension=2)
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_drop_collection_raises_non_missing_errors():
+    """drop_collection 对「非集合不存在」的错误必须抛出，不能静默吞掉。
+
+    通过给底层 client 的 delete_collection 打桩，分别注入「I/O 错误」与
+    「集合不存在」两类异常，验证前者被包成 DatabaseQueryError 抛出、后者静默。
+    """
+    importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient, DatabaseQueryError
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("drop_io")
+        original = db._client.delete_collection
+
+        # 1) 非「不存在」类错误：应被包成 DatabaseQueryError 抛出
+        def boom(name):
+            raise RuntimeError("disk I/O error")
+
+        db._client.delete_collection = boom
+        try:
+            with raises(DatabaseQueryError, match="删除集合"):
+                db.drop_collection("drop_io")
+        finally:
+            db._client.delete_collection = original
+
+        # 2) 「集合不存在」错误：应静默通过
+        def missing(name):
+            raise ValueError(f"Collection {name} does not exist.")
+
+        db._client.delete_collection = missing
+        try:
+            db.drop_collection("drop_io")
+        finally:
+            db._client.delete_collection = original
+
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_chroma_add_reports_all_duplicated_ids_sorted():
+    """多个不同的重复 id 应一次性、去重、升序列出（Counter 判重路径）。"""
+    importorskip("chromadb")
+    import tempfile, shutil
+    from fast_agents.database import ChromaClient
+    tmp = tempfile.mkdtemp(prefix="chroma_test_")
+    try:
+        db = ChromaClient(path=tmp)
+        db.create_collection("dup_scan")
+        ids = ["c", "a", "b", "a", "c", "c", "d"]
+        try:
+            db.add("dup_scan", ids=ids, embeddings=[[1.0, 0.0]] * len(ids))
+            assert False, "重复 ids 应当报错"
+        except ValueError as e:
+            msg = str(e)
+            assert "['a', 'c']" in msg, f"应升序去重列出 ['a', 'c']，实际：{msg}"
+        db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 # ==================== 入口 ====================
 
 def main():
