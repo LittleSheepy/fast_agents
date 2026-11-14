@@ -8,7 +8,12 @@ class MemoryError(Exception):
 
 
 class MemoryConflictError(MemoryError):
-    """写入新记忆时检测到与已有记忆冲突时抛出（当前版本未对外抛出，保留给未来显式冲突场景使用）。
+    """写入新记忆时检测到与已有记忆冲突时抛出（B13）。
+
+    当 ``MemoryManager.remember(..., raise_on_conflict=True)`` 命中一条仍有效的已有
+    记忆时抛出，把「覆盖 / 修订 / 拒绝」的决定权交回调用方；只想探测、不想触发写入
+    时，先用 ``MemoryManager.check_conflict()`` 拿到冲突列表。默认
+    ``raise_on_conflict=False`` 仍为静默去重，不抛此异常。
 
     属性：
     - new_record：试图写入的新记忆（尚未入库）

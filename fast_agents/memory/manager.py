@@ -26,6 +26,7 @@ from .buffer import BufferMemory, DEFAULT_SUMMARY_PROMPT
 from .in_memory_store import InMemoryStore
 from .profile_store import ProfileStore
 from .models import ContextPacket, MemoryKind, MemoryRecord, UserProfile
+from .errors import MemoryConflictError
 from .session_store import SessionStore
 
 
@@ -184,6 +185,7 @@ class MemoryManager:
         source: str = "user_stated", importance: float = 0.5,
         ttl: Optional[timedelta] = None,
         conflict_threshold: float = 0.85,
+        raise_on_conflict: bool = False,
     ) -> MemoryRecord:
         """手动写入一条长期记忆
 
@@ -199,20 +201,55 @@ class MemoryManager:
                 兜底检测相似记忆，相似度 ≥ 该阈值时视为「重复写入」，直接返回已有
                 记忆（newest_wins：不重复插入、不新建 superseded 版本，避免冗余）。
                 Chroma 不可用 / embed 失败时自动退化为词法 Jaccard，绝不阻塞写入。
+                命中的若是**已过期但仍 active** 的记忆（过期 ≠ 删除，B12），则不再简单
+                丢弃新内容：内容逐字相同→续期旧条，内容有差异→新条取代旧条（旧条标
+                superseded），避免新旧双丢。
+            raise_on_conflict: 显式冲突模式（默认 False，行为与改造前一致）。
+                为 True 时，若命中一条**仍有效**的记忆，不再静默去重，而是抛出
+                ``MemoryConflictError``（携带未入库的新记录与冲突列表），把「覆盖 /
+                修订 / 拒绝」的决定权交给调用方；过期命中仍按续期 / 取代消化，不抛
+                异常。想先探测再决定时，可配合只读的 ``check_conflict()`` 使用。
         """
         if not content or not content.strip():
             raise ValueError("content 不能为空")
         text = content.strip()
 
         # B13：写入前先做冲突检测——以 Chroma 向量近邻为主，失败回退词法。
-        existing = self._find_conflict(text, threshold=conflict_threshold)
+        # 命中项要分「是否过期」两类处理：过期只是时效到了、不等于删除（B12），
+        # 若把过期命中当成普通重复直接丢弃新内容，随后 purge_expired() 会把旧条
+        # 转 retracted，最终新旧双丢（用户明明写了却查不到）。
+        supersedes: Optional[str] = None        # 将要替代的memory_id
+        existing, conflicts = self._find_conflict(text, threshold=conflict_threshold)
         if existing is not None:
-            return existing
+            if not existing.is_expired():
+                if raise_on_conflict:
+                    # 显式冲突模式：不静默去重，把冲突交给调用方决定（覆盖 / 修订 / 拒绝）；
+                    # conflicts 由 _find_conflict 单次检测直接返回（向量 top-5 + 词法命中，
+                    # 已去重），不再二次调用 check_conflict，避免 embed / 全表扫描翻倍。
+                    if not conflicts:
+                        conflicts = [(existing, "duplicate")]
+                    raise MemoryConflictError(
+                        MemoryRecord(
+                            user_id=self.user_id, session_id=self.session_id,
+                            content=text, source=source, kind=kind,
+                            importance=float(importance),
+                        ),
+                        conflicts,
+                    )
+                # 与一条仍有效的记忆重复：维持原 newest_wins——不重复插入、不新建 superseded 版本
+                return existing
+            if existing.content == text:
+                # 内容逐字相同：续期旧条（保留原 memory_id 与访问统计，零冗余）
+                return self._renew_expired(existing, ttl=ttl)
+            # 内容有差异：让新条取代失效旧条（旧条标记 superseded 留痕），继续往下写入新条
+            self._retire_expired(existing)
+            supersedes = existing.memory_id
 
         expires_at = (cstnow() + ttl) if ttl is not None else None
         record = MemoryRecord(
             user_id=self.user_id, session_id=self.session_id, content=text,
             source=source, kind=kind, importance=float(importance),
+            supersedes=supersedes,
             expires_at=to_cst(expires_at) if expires_at else None,
         )
         return self.long_term.add(record)
@@ -299,58 +336,190 @@ class MemoryManager:
             return []
         return [d for d in data if isinstance(d, dict)]
 
-    def _find_conflict(self, content: str, threshold: float = 0.85) -> Optional[MemoryRecord]:
+    def check_conflict(
+        self, content: str, *, threshold: float = 0.85, limit: int = 5,
+    ) -> List[tuple]:
+        """只读冲突探测（B13）：返回与 ``content`` 冲突的**仍有效**记忆。
+
+        与 ``remember()`` 内部的 ``_find_conflict`` 共用同一套召回口径（向量优先 +
+        词法兜底），区别是这里「只看不动」：不写入、不抛异常，调用方可先探测再自行
+        决定覆盖 / 修订 / 拒绝，也可配合 ``remember(raise_on_conflict=True)`` 使用。
+
+        只报告**仍有效**（未过期、未退休）的冲突：已过期记忆属于「时效到了」，
+        按 B13 语义由续期 / 取代消化，不算需要调用方处理的冲突，故不在此列出。
+
+        Returns:
+            ``[(existing_record, conflict_type), ...]``，``conflict_type`` 目前为
+            ``"duplicate"``；没有冲突时返回空列表。
+        """
+        text = (content or "").strip()
+        if not text:
+            return []
+
+        found: Dict[str, tuple] = {}
+
+        # 路径 1：向量通道（与 _find_conflict 同源，include_expired=False 只取有效记忆；
+        # check_conflict 是只读探测，不传 prefetch_missing，避免触发全库补算写放大）
+        find_similar = getattr(self.long_term, "find_similar", None)
+        if callable(find_similar):
+            try:
+                for rec, _sim in self.long_term.find_similar(
+                    text, limit=limit, threshold=threshold, include_expired=False,
+                ):
+                    found.setdefault(rec.memory_id, (rec, "duplicate"))
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 向量冲突探测失败，降级为词法（{exc}）")
+
+        # 路径 2：词法 Jaccard 兜底（同样只看有效记忆，与 _lexical_duplicate 口径一致）
+        from ..memory.scoring import lexical_terms
+
+        new_terms = set(lexical_terms(text))
+        if new_terms:
+            for existing in self.long_term.all():
+                if existing.is_expired():
+                    continue
+                old_terms = set(lexical_terms(existing.content))
+                if not old_terms:
+                    continue
+                union = new_terms | old_terms
+                if union and len(new_terms & old_terms) / len(union) >= threshold:
+                    found.setdefault(existing.memory_id, (existing, "duplicate"))
+
+        return list(found.values())[:limit]
+
+    def _find_conflict(self, content: str, threshold: float = 0.85) -> tuple[Optional[MemoryRecord], list]:
         """写入前冲突检测（B13，以向量相似度为主）。
 
         检测优先级：
         1. 若 long_term_store 提供 ``find_similar``（ChromaMemoryStore / SemanticMemoryStore
            均已实现），走向量近邻：Chroma 走 ANN 索引 O(log n)，语义兜底走批量 cosine；
+           并传 include_expired=True 让「已过期但仍 active」的记忆也参与查重（过期 ≠ 删除），
+           返回结果里未过期项优先排在前面，只有没有有效冲突时才落到过期项；
         2. 向量通道不可用（无 find_similar、embed 失败、Chroma 未连接）时，回退到词法
            Jaccard（保留原 _is_duplicate 行为作为最后防线）；
         3. 两条路径都不阻塞写入——任何异常都打 warning 后放行，不因为检测失败丢失记忆。
 
-        返回命中的重复记忆（MemoryRecord），未命中返回 None。阈值越高越严格（更不会误杀），
-        默认 0.85 与 merge_similar 对齐。
+        返回二元组 ``(best, conflicts)``：
+        - best 是最佳命中（MemoryRecord），未命中返回 None。阈值越高越严格（更不会误杀），
+          默认 0.85 与 merge_similar 对齐；未过期项优先，仅在无有效冲突时才落到过期项；
+        - conflicts 是本次单次检测已经算出的全部「仍有效」冲突列表
+          ``[(record, reason), ...]``（去重），给 raise_on_conflict 复用，避免再跑一次
+          check_conflict 导致 embed / 全表扫描翻倍。
         """
         if not content:
-            return None
+            return None, []
         text = content.strip()
         if not text:
-            return None
+            return None, []
+
+        found: dict = {}            # memory_id -> (record, reason)
+        best_expired: Optional[MemoryRecord] = None
+        best_active: Optional[MemoryRecord] = None
 
         # 路径 1：向量通道（以 Chroma ANN 为主；SemanticMemoryStore 提供兜底）
         find_similar = getattr(self.long_term, "find_similar", None)
         if callable(find_similar):
             try:
-                hits = find_similar(text, limit=1, threshold=threshold)
-                if hits:
-                    # hits: [(record, similarity), ...]
-                    return hits[0][0]
+                # include_expired=True：过期但仍 active 的记忆也参与查重（过期 ≠ 删除），
+                # 未过期项优先排在前面；limit 取 5 攒冲突列表（单次 ANN / cosine，无额外成本）；
+                # prefetch_missing=True：写入前查重必须覆盖所有记录（含未缓存向量的），
+                # 允许补算缺失向量并落盘，避免漏检刚写入、向量尚未建立的记录
+                hits = self.long_term.find_similar(text, limit=5, threshold=threshold,
+                                                   include_expired=True,
+                                                   prefetch_missing=True)
+                for record, _sim in hits:
+                    if record.status != "active":
+                        continue
+                    if record.is_expired():
+                        if best_expired is None:
+                            best_expired = record
+                        continue
+                    found.setdefault(record.memory_id, (record, "duplicate"))
+                    if best_active is None:
+                        best_active = record
             except Exception as exc:  # noqa: BLE001
                 # 向量检测失败不阻塞写入，降级到词法
                 print(f"⚠️ 向量冲突检测失败，降级为词法（{exc}）")
 
         # 路径 2：词法 Jaccard 兜底（原 _is_duplicate 逻辑）
-        return self._lexical_duplicate(text, threshold=threshold)
+        from ..memory.scoring import lexical_terms
+
+        new_terms = set(lexical_terms(text))
+        if new_terms:
+            for existing in self.long_term.all():
+                if existing.status != "active":
+                    continue
+                old_terms = set(lexical_terms(existing.content))
+                if not old_terms:
+                    continue
+                union = new_terms | old_terms
+                if union and len(new_terms & old_terms) / len(union) >= threshold:
+                    if existing.is_expired():
+                        if best_expired is None:
+                            best_expired = existing
+                        continue
+                    found.setdefault(existing.memory_id, (existing, "duplicate"))
+                    if best_active is None:
+                        best_active = existing
+
+        best = best_active or best_expired
+        return best, list(found.values())
 
     def _lexical_duplicate(self, content: str, threshold: float = 0.85) -> Optional[MemoryRecord]:
-        """词法 Jaccard 去重（v1.4.0 原 _is_duplicate 行为保留为兜底）"""
+        """词法 Jaccard 去重（v1.4.0 原 _is_duplicate 行为保留为兜底）
+
+        过期但仍 active 的记忆同样参与比对（过期 ≠ 删除，查重不能漏检它）；
+        但**有效记忆优先**：先返回有效命中，只有在没有任何有效命中时才返回过期命中，
+        交由 remember() 决定续期 / 取代，避免有效重复被过期项「抢占」而漏判。
+        """
         from ..memory.scoring import lexical_terms
 
         new_terms = set(lexical_terms(content))
         if not new_terms:
             # 切不出有效词项，视为空内容、不写入（由 remember 的空校验挡住，这里返回 None 放行）
             return None
+        expired_hit: Optional[MemoryRecord] = None
         for existing in self.long_term.all():
-            # if existing.is_expired():   # 判断记忆是否已过期
-            #     continue
             old_terms = set(lexical_terms(existing.content))
             if not old_terms:
                 continue
             union = new_terms | old_terms
             if union and len(new_terms & old_terms) / len(union) >= threshold:
-                return existing
-        return None
+                if not existing.is_expired():
+                    return existing
+                if expired_hit is None:
+                    expired_hit = existing
+        return expired_hit
+
+    def _renew_expired(self, existing: MemoryRecord, *, ttl: Optional[timedelta]) -> MemoryRecord:
+        """把一条已过期但仍 active 的记忆按本次写入的时效续期（B13 过期场景）。
+
+        过期只是「时效到了」，并不等于删除（B12）。命中它说明同一内容又被写入，
+        续期 = 按本次 ttl 重算 expires_at（ttl=None 表示改为永不过期）并刷新 updated_at：
+        既不重复入库、也不让旧条随后被 purge_expired() 清掉（避免新旧双丢）。
+        续期失败不抛异常——原样返回旧条，绝不阻塞写入。
+        """
+        new_expires = (cstnow() + ttl) if ttl is not None else None
+        existing.expires_at = to_cst(new_expires) if new_expires else None
+        existing.updated_at = cstnow()
+        try:
+            return self.long_term.update(existing)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 过期记忆续期失败（已跳过，返回原记录）: {exc}")
+            return existing
+
+    def _retire_expired(self, existing: MemoryRecord) -> None:
+        """把一条已过期旧记忆标记为 superseded（软删留痕），交由新写入取代（B13 过期场景）。
+
+        只有内容与旧条有差异时才走这里：新条会写入并带上 supersedes 指针指向旧条，
+        旧条改状态留痕、不再参与检索与后续查重。标记失败只警告，不阻塞新条写入。
+        """
+        existing.status = "superseded"
+        existing.updated_at = cstnow()
+        try:
+            self.long_term.update(existing)
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 过期记忆标记 superseded 失败（已跳过）: {exc}")
 
     def _is_duplicate(self, content: str, threshold: float = 0.85) -> bool:
         """v1.4.0 兼容别名：返回是否与已有记忆重复（True 表示重复）。
@@ -358,7 +527,8 @@ class MemoryManager:
         内部已统一走 ``_find_conflict``（向量优先 + 词法兜底），保留这个名字
         是为了让老测试/老代码不改一行继续能用。
         """
-        return self._find_conflict(content, threshold=threshold) is not None
+        best, _ = self._find_conflict(content, threshold=threshold)
+        return best is not None
 
     # ---------- 3. 维护 ----------
 

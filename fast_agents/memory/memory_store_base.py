@@ -138,13 +138,21 @@ class MemoryStoreBase(ABC):
         return {"available": False}
 
     def find_similar(self, content: str, *, limit: int = 5,
-                     threshold: float = 0.85) -> List[tuple]:
+                     threshold: float = 0.85,
+                     include_expired: bool = False,
+                     prefetch_missing: bool = False) -> List[tuple]:
         """写入前向量冲突检测钩子（B13）。
 
         - 默认返回空列表，表示"后端无向量能力，请调用方回退词法"；
         - ChromaMemoryStore 直接走 ANN 近邻（O(log n)）；SemanticMemoryStore
           提供基于本地向量缓存的批量 cosine 兜底实现；
         - 返回 ``[(MemoryRecord, similarity), ...]``，按相似度降序、已按 threshold 过滤。
+        - ``include_expired=False``（默认）：只返回未过期的有效记忆，行为与改造前一致；
+          ``include_expired=True``：把「已过期但仍 active」的记忆也纳入（过期 ≠ 删除，
+          写入前查重不能漏检它），此时未过期项优先排在前，供调用方取 top-1 时先命中有效冲突。
+        - ``prefetch_missing=False``（默认）：只读路径只读缓存，避免查询触发全库 embed 写放大；
+          ``prefetch_missing=True``：写入前查重路径允许补算缺失向量（仅 SemanticMemoryStore
+          的本地 cosine 兜底需要，Chroma 后端忽略该参数）。
         """
         return []
 

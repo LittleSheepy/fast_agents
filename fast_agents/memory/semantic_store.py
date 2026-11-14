@@ -13,6 +13,12 @@ fast_agents/fast_agents/memory/semantic_store.py
 - 不修改 memories 主表 schema，不污染既有数据；
 - B5 起额外提供 semantic_vectors()（批量向量）与 touch()（记账代理），
   让「记忆合并 / 命中记账」也能用上语义通道。
+- B13 第二步：stale（superseded/retracted/archived）向量不删除，
+  仅在向量表 / 内存缓存里同步 status；_load_vec/_load_vecs_batch 统一按 status='active'
+  过滤，让 search / find_similar / merge_similar 不命中 stale 条目；设计口径
+  与 ChromaMemoryStore 的 where={"status":"active"} + _update_vec_metadata 完全对称。
+  （expired 只是时效到期、status 仍为 active，不等于删除：检索侧按 is_expired() 过滤，
+  写入前查重用 include_expired=True 单独纳入。）
 
 使用方式：
     from fast_agents.llm import LLM
@@ -216,7 +222,10 @@ class SemanticMemoryStore(MemoryStoreBase):
         # 先命中内存缓存（sqlite/memory 后端都走这里，省掉 SQL）
         cached = self._vec_cache.get(record.memory_id)
         if cached is not None:
-            return cached.embedding
+            # B13 第二步：缓存里 stale 的向量视为未命中（不返回给语义计算）
+            if (cached.status or "active") == "active":
+                return cached.embedding
+            return None
         if self._vec_backend == "sqlite":
             from .sqlite_store import SQLiteMemoryStore as _SQLite
             inner: _SQLite = self.inner  # type: ignore[assignment]
@@ -224,6 +233,7 @@ class SemanticMemoryStore(MemoryStoreBase):
                 table_name="memory_embeddings",
                 filters=inner._scope_where([
                     Filter(field="memory_id", op=FilterOp.EQ, value=record.memory_id),
+                    Filter(field="status",    op=FilterOp.EQ, value="active"),
                 ]),
             ))
             if row is None:
@@ -234,7 +244,7 @@ class SemanticMemoryStore(MemoryStoreBase):
         return None
 
     def _load_vecs_batch(self, records: List[MemoryRecord]) -> List[Optional[List[float]]]:
-        """批量从本地缓存读向量（一次 SQL IN，省掉 N 次查询）"""
+        """批量从本地缓存读向量（一次 SQL IN，省掉 N 次查询）；仅返回 status=active 的向量。"""
         result: List[Optional[List[float]]] = [None] * len(records)
         if not records:
             return result
@@ -243,7 +253,9 @@ class SemanticMemoryStore(MemoryStoreBase):
         for i, rec in enumerate(records):
             cached = self._vec_cache.get(rec.memory_id)
             if cached is not None:
-                result[i] = cached.embedding
+                # B13 第二步：缓存里 stale 的向量直接视为未命中
+                if (cached.status or "active") == "active":
+                    result[i] = cached.embedding
             else:
                 miss_idx.append(i)
                 miss_ids.append(rec.memory_id)
@@ -258,6 +270,7 @@ class SemanticMemoryStore(MemoryStoreBase):
                     Filter(field="user_id", op=FilterOp.EQ, value=inner.user_id),
                     Filter(field="session_id", op=FilterOp.EQ, value=inner.session_id),
                     Filter(field="memory_id", op=FilterOp.IN, value=miss_ids),
+                    Filter(field="status", op=FilterOp.EQ, value="active"),
                 ],
             ))
             by_id: Dict[str, MemoryVector] = {}
@@ -283,6 +296,53 @@ class SemanticMemoryStore(MemoryStoreBase):
                     Filter(field="memory_id", op=FilterOp.EQ, value=record.memory_id),
                 ]),
             ))
+
+    def _update_vec_meta(self, record: MemoryRecord) -> None:
+        """同步单条记录的向量元数据（kind/importance/status）——不删向量、不重算 embedding。
+
+        B13 第二步：stale 向量保留在本地表 / 内存缓存中以便审计/回溯，但 metadata 必须实时同步，
+        让 _load_vec/_load_vecs_batch 通过 status='active' 过滤掉 stale。
+        设计口径与 ChromaMemoryStore._update_vec_metadata 完全一致。
+        """
+        cached = self._vec_cache.get(record.memory_id)
+        if cached is None and self._vec_backend == "sqlite":
+            # 没命中缓存：尝试从 SQLite 读出来再更新；读不到就跳过（本来就没向量，将来 rebuild 会补）
+            from .sqlite_store import SQLiteMemoryStore as _SQLite
+            inner: _SQLite = self.inner  # type: ignore[assignment]
+            row = inner._db.select_one_where(Query(
+                table_name="memory_embeddings",
+                filters=inner._scope_where([
+                    Filter(field="memory_id", op=FilterOp.EQ, value=record.memory_id),
+                ]),
+            ))
+            if row is not None:
+                cached = self._row_to_vec(row)
+                self._vec_cache[record.memory_id] = cached
+        if cached is None:
+            return
+        # 同步 meta 字段（保留原 embedding / dim / model）
+        cached.kind = record.kind or ""
+        cached.importance = float(record.importance or 0.0)
+        cached.status = record.status or "active"
+        cached.updated_at = time.time()
+        if self._vec_backend == "sqlite":
+            from .sqlite_store import SQLiteMemoryStore as _SQLite
+            inner: _SQLite = self.inner  # type: ignore[assignment]
+            inner._db.update_where(
+                "memory_embeddings",
+                {
+                    "kind": cached.kind,
+                    "importance": cached.importance,
+                    "status": cached.status,
+                    "updated_at": datetime.fromtimestamp(cached.updated_at).isoformat(),
+                },
+                Query(
+                    table_name="memory_embeddings",
+                    filters=inner._scope_where([
+                        Filter(field="memory_id", op=FilterOp.EQ, value=record.memory_id),
+                    ]),
+                ),
+            )
 
     def _clear_vecs_scope(self) -> None:
         """只清空当前作用域的向量，别把别人的清了"""
@@ -388,18 +448,23 @@ class SemanticMemoryStore(MemoryStoreBase):
         return self.inner.all(include_inactive=include_inactive)
 
     def update(self, record: MemoryRecord) -> MemoryRecord:
-        """更新记忆：content 变化则重算 embedding，否则保留旧向量"""
+        """更新记忆：content 变化则重算 embedding；仅 kind/importance/status 变化则同步向量 meta；无变化保持原样。"""
         old = self.inner.get(record.memory_id)
-        content_changed = old is not None and old.content != record.content
+        # B13 第二步：必须在 inner.update 之前记下旧 content 快照，避免 InMemoryStore 引用语义导致对比失效
+        old_content = old.content if old is not None else None
         record = self.inner.update(record)
-        if content_changed:
-            try:
+        try:
+            if old_content is not None and old_content != record.content:
+                # content 变了→旧向量作废，重算新向量（_save_vec 会 upsert 全字段，status 一并刷新）
                 self._save_vec(record)
-            except Exception as exc:  # noqa: BLE001
-                warnings.warn(
-                    f"SemanticMemoryStore: 更新向量失败（{exc!r}）",
-                    RuntimeWarning, stacklevel=2,
-                )
+            else:
+                # content 没变：只刷新向量表 / 缓存里的 kind/importance/status（不删向量、不重算 embedding）
+                self._update_vec_meta(record)
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"SemanticMemoryStore: 更新向量失败（{exc!r}）",
+                RuntimeWarning, stacklevel=2,
+            )
         return record
 
     def delete(self, memory_id: str) -> bool:
@@ -424,7 +489,8 @@ class SemanticMemoryStore(MemoryStoreBase):
     # ===================== 语义增强 search（核心） =====================
 
     def search(self, query: str, limit: int = 5, *,
-               include_preferences: bool = True) -> List[MemoryRecord]:
+               include_preferences: bool = True,
+               prefetch_top_n: int = 20) -> List[MemoryRecord]:
         # 空查询直接走原后端（最近 N 条），不浪费 embedding 调用
         if not query or not query.strip():
             return self.inner.search(query, limit, include_preferences=include_preferences)
@@ -438,24 +504,60 @@ class SemanticMemoryStore(MemoryStoreBase):
         # B12：rank 之前过滤已到期的 active 记忆，和基类 search 保持一致
         records = [r for r in records if not r.is_expired()]
 
-        # v1.8.3 微调：一次批量读缓存 + 一次批量补算缺失项，
-        # 避免逐条 _load_vec 懒加载触发 N 次 embed 调用
-        vecs = self.semantic_batch_get_and_save(records)
+        # v1.9.3 两段式检索（避免冷库写放大，又保留 B2 同义召回能力）：
+        # 第 1 轮「粗排」：只读向量缓存；有向量的走 hybrid，没向量的按纯词法分参与排序
+        #   （这里显式关闭 semantic_floor——冷库首查时若保留 floor，会把所有"词法=0
+        #    但语义相关"的记忆直接丢掉，永远进不了补算名单，形成「冷库死锁」）。
+        vecs = self.semantic_batch_get(records)
         vec_by_id: Dict[str, List[float]] = {}
         for rec, vec in zip(records, vecs):
             if vec is not None:
-                vec_by_id[rec.memory_id] = vec
+                vec_by_id[rec.memory_id] = list(vec)
 
-        def semantic_getter(r: MemoryRecord) -> Optional[float]:
-            vec = vec_by_id.get(r.memory_id)
-            if vec is None:
-                return None
-            return cosine_similarity(q_vec, vec)
+        def _make_getter(vec_map: Dict[str, List[float]], floor_filter: bool):
+            """粗排阶段 floor_filter=False：无向量条目返回 0（纯词法），不触发 floor；
+            精排阶段 floor_filter=True：无向量条目返回 None，走原生 floor 过滤。"""
+            def _getter(r: MemoryRecord) -> Optional[float]:
+                v = vec_map.get(r.memory_id)
+                if v is None:
+                    return None if floor_filter else 0.0
+                return cosine_similarity(q_vec, v)
+            return _getter
 
+        first_pass_limit = max(limit, int(prefetch_top_n))
+        first_pass = rank_records(
+            query, records, limit=first_pass_limit,
+            include_preferences=include_preferences,
+            semantic_getter=_make_getter(vec_by_id, floor_filter=False),
+            hybrid_weight=self.hybrid_weight,
+            semantic_floor=0.0,  # 粗排关闭 floor，避免冷库死锁
+        )
+
+        # 第 2 轮「补算」：只对粗排进 top-N 的缺向量候选做一次小批量 embed（默认 ≤ 20 条），
+        # 补算结果立即落盘缓存；相比 v1.9.2 的「全库一起补」，不再触发冷库全量写放大。
+        need_prefetch = [r for r in first_pass if r.memory_id not in vec_by_id]
+        if need_prefetch and prefetch_top_n > 0:
+            need_prefetch = need_prefetch[:max(1, int(prefetch_top_n))]
+            try:
+                new_vecs = self.semantic_vectors([r.content for r in need_prefetch])
+                if new_vecs and len(new_vecs) == len(need_prefetch):
+                    for rec, v in zip(need_prefetch, new_vecs):
+                        if v:
+                            vl = list(v)
+                            vec_by_id[rec.memory_id] = vl
+                            try:
+                                self._save_vec(rec, vl)
+                            except Exception:  # noqa: BLE001
+                                pass  # 存不进缓存不影响本次检索
+            except Exception:  # noqa: BLE001
+                pass  # 补算失败就用粗排结果，绝不阻塞检索
+
+        # 第 3 轮「精排」：此时 top-N 候选已有向量，恢复原生 semantic_floor 过滤，
+        # 保证 B2 同义改写（词法=0、语义高）能被提到前面；无向量且语义不足的按 floor 正常丢弃。
         return rank_records(
             query, records, limit,
             include_preferences=include_preferences,
-            semantic_getter=semantic_getter,
+            semantic_getter=_make_getter(vec_by_id, floor_filter=True),
             hybrid_weight=self.hybrid_weight,
             semantic_floor=self._SEMANTIC_FLOOR,
         )
@@ -523,8 +625,9 @@ class SemanticMemoryStore(MemoryStoreBase):
 
     # ===================== B13：写入前向量冲突检测（以 Chroma 为主，本类提供兜底） =====================
 
-    def find_similar(self, content: str, *, limit: int = 5,
-                     threshold: float = 0.85) -> List[tuple]:
+    def find_similar(self, content: str, *, limit: int = 5, threshold: float = 0.85,
+                     include_expired: bool = False,
+                     prefetch_missing: bool = False) -> List[tuple]:
         """按向量相似度召回与 ``content`` 最相似的已有记忆。
 
         这是冲突检测 / 写入前去重的统一接口（B13）：
@@ -533,6 +636,13 @@ class SemanticMemoryStore(MemoryStoreBase):
           取已有向量 → 计算 cosine，按相似度降序返回 [(record, similarity), ...]。
         - 相似度低于 ``threshold`` 的不返回；失败（embed 拿不到向量）返回空列表，
           调用方（MemoryManager）应退化为词法 Jaccard，绝不阻塞写入。
+        - ``include_expired=False``（默认）：只返回未过期的有效记忆（原行为）；
+          ``include_expired=True``：过期但仍 active 的记忆也纳入（过期 ≠ 删除，
+          写入前查重不能漏检），此时未过期项优先排在前面。
+        - ``prefetch_missing=False``（默认）：只读向量缓存，缺失向量的记录直接跳过，
+          避免只读查询（如 manager.check_conflict）触发全库补算写放大；
+          ``prefetch_missing=True``：对缺失向量的条目批量补算并落盘（仅 manager
+          写入前查重走这条），保证冲突检测不漏掉尚未建立向量的新记录。
         """
         if not content or not content.strip():
             return []
@@ -540,10 +650,18 @@ class SemanticMemoryStore(MemoryStoreBase):
         if q_vec is None:
             return []
         records = self.inner.all(include_inactive=False)
-        records = [r for r in records if not r.is_expired()]
+        if not include_expired:
+            # 默认只保留未过期的有效记忆；include_expired=True 时过期但仍 active 的也纳入查重
+            records = [r for r in records if not r.is_expired()]
         if not records:
             return []
-        vecs = self.semantic_batch_get_and_save(records)
+        # v1.9.3 优化：按调用场景区分
+        # - 只读探测（默认）：semantic_batch_get 只读缓存，缺失项跳过，不触发 embed 补算
+        # - 写入前查重（prefetch_missing=True）：semantic_batch_get_and_save 补算缺失项并落盘
+        if prefetch_missing:
+            vecs = self.semantic_batch_get_and_save(records)
+        else:
+            vecs = self.semantic_batch_get(records)
         hits: List[tuple] = []
         for r, v in zip(records, vecs):
             if v is None:
@@ -551,7 +669,12 @@ class SemanticMemoryStore(MemoryStoreBase):
             sim = cosine_similarity(q_vec, list(v))
             if sim >= threshold:
                 hits.append((r, sim))
-        hits.sort(key=lambda x: (-x[1], -x[0].importance))
+        if include_expired:
+            # 未过期项优先（is_expired() False < True），再按相似度降序，
+            # 保证调用方取 top-1 时先命中有效冲突，没有有效冲突才落到过期项
+            hits.sort(key=lambda x: (x[0].is_expired(), -x[1], -x[0].importance))
+        else:
+            hits.sort(key=lambda x: (-x[1], -x[0].importance))
         return hits[:max(1, int(limit))]
 
     def touch(self, memory_ids) -> int:

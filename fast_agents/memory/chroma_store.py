@@ -496,7 +496,6 @@ class ChromaMemoryStore(MemoryStoreBase):
             try:
                 sample = client.get(
                     collection=self._collection_name,
-                    ids=None,
                     limit=1,
                     include_embeddings=True,
                     include_documents=False,
@@ -504,7 +503,8 @@ class ChromaMemoryStore(MemoryStoreBase):
                 )
                 if sample:
                     emb = sample[0].get("embedding")
-                    if isinstance(emb, (list, tuple)) and emb:
+                    # chromadb 返回 numpy.ndarray，用 len 直接测，不要用 bool 判断（numpy 多元素真值歧义）
+                    if emb is not None and hasattr(emb, "__len__"):
                         dim = len(emb)
             except Exception:  # noqa: BLE001
                 dim = None
@@ -521,8 +521,9 @@ class ChromaMemoryStore(MemoryStoreBase):
 
     # ===================== B13：以 Chroma ANN 为主的向量冲突检测 =====================
 
-    def find_similar(self, content: str, *, limit: int = 5,
-                     threshold: float = 0.85) -> List[tuple]:
+    def find_similar(self, content: str, *, limit: int = 5, threshold: float = 0.85,
+                     include_expired: bool = False,
+                     prefetch_missing: bool = False) -> List[tuple]:
         """用 Chroma 近邻检索召回与 ``content`` 最相似的已有记忆（B13 冲突检测主入口）。
 
         优势：直接走 ANN 索引，O(log n) 复杂度，百万级记忆库也能快速检测冲突，
@@ -558,10 +559,12 @@ class ChromaMemoryStore(MemoryStoreBase):
             return []
         if not hits:
             return []
-        # 把 Chroma 返回的 memory_id 映射回 MemoryRecord（只在活跃、未过期的记录里找）
+        # 把 Chroma 返回的 memory_id 映射回 MemoryRecord（只在活跃记录里找）。
+        # include_expired=False（默认）再滤掉过期项；True 时保留「已过期但仍 active」的，
+        # 让写入前查重不漏检过期记忆（过期 ≠ 删除）。
         by_id = {
             r.memory_id: r for r in self.inner.all(include_inactive=False)
-            if not r.is_expired()
+            if include_expired or not r.is_expired()
         }
         out: List[tuple] = []
         for h in hits:
@@ -576,7 +579,11 @@ class ChromaMemoryStore(MemoryStoreBase):
             sim = max(0.0, min(1.0, 1.0 - float(dist)))
             if sim >= threshold:
                 out.append((rec, sim))
-        out.sort(key=lambda x: (-x[1], -x[0].importance))
+        if include_expired:
+            # 未过期项优先，再按相似度降序（供调用方取 top-1 时先命中有效冲突）
+            out.sort(key=lambda x: (x[0].is_expired(), -x[1], -x[0].importance))
+        else:
+            out.sort(key=lambda x: (-x[1], -x[0].importance))
         return out[:max(1, int(limit))]
 
     # ===================== 语义 search =====================
