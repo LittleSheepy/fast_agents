@@ -4,7 +4,7 @@
 
 > **版本**：v1.0.0 · 2026-11-06 · **关系型双后端**（`SQLiteClient` 零依赖默认后端 + `MySQLClient` 可选后端，接口 100% 对齐）+ **统一异常体系**（`errors.py` 基类 + 7 个语义子类，三后端共用）+ **向量型**（`VectorClientBase` 抽象 + `ChromaClient` 落地）
 > **适用版本**：`fast_agents.database`
-> **配套代码**：`fast_agents/database/`（**10 个**源码文件）+ `tests/database/`（**4 个**测试文件、共 **156 项**）+ `examples/database/`（**6 个**可运行示例）
+> **配套代码**：`fast_agents/database/`（**10 个**源码文件）+ `tests/database/`（**4 个**测试文件、共 **182 项**）+ `examples/database/`（**6 个**可运行示例）
 > **运行环境**：Python 3.10+（仓库 `.python-version` = 3.10），Windows（按 AGENTS.md R11 只保证 Windows 平台）
 > **依赖**：关系型默认路径**零新增核心依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic>=2.14.1`）；MySQL 后端 `pymysql`、向量后端 `chromadb` 均为**可选依赖**（`pip install fast-agents[mysql]` / `pip install fast-agents[chroma]`），不进核心依赖；无 SQLAlchemy / Alembic / peewee 等 ORM
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分放在第十二章，并与 `docs/演进路线图.md` 的 J 模块独立编号对齐。
@@ -34,9 +34,8 @@
 
 | **版本** | 日期 | 变更 | 作者 |
 |------|------|------|------|
-| **1.0.0** | 2026-11-03 | **初版**（含后续缺陷修复与能力补全，均并入本版本）：`fast_agents/database/` 作为独立持久化层模块交付，含 **10 个源码文件**、**关系型双后端 + 向量型** 两套平行后端与**统一异常体系**。**关系型**：`SQLiteClient`（零依赖默认后端）提供连接与上下文事务、基础 SQL 通道（`execute / executemany / executescript / query`）、三种声明式建表（dict / list[Column] / Schema）+ 幂等建索引 + `ensure_schema(migrate=True)` 自动 `ALTER TABLE ADD COLUMN` 补列、CRUD（`insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete`）、读侧谓词下推（10 种 `FilterOp` + 多条件 AND + 单/多列排序 + `limit/offset`，值一律参数化）、写侧条件写入（`upsert` 插入或更新、`update_where / delete_where` 带谓词批量改删，`SqlExpr` 支持自增等表达式且非空 filters 兜底防误改全表），标识符走 `check_ident` 白名单防注入，非内存库默认 `WAL + foreign_keys=ON` 并显式 `PRAGMA busy_timeout`；`MySQLClient` 为可选后端（接口与 `SQLiteClient` 100% 对齐，`pymysql` 走 `pip install fast-agents[mysql]` 可选 extras、延迟导入，未装时抛 `DatabaseDriverMissingError`；方言层适配反引号标识符 / `%s` 占位符 / `TYPE_TO_MYSQL` 类型映射（BOOLEAN→TINYINT(1)、TIMESTAMP→DATETIME、INTEGER 主键 `id` 自动 `AUTO_INCREMENT`）/ `ON DUPLICATE KEY UPDATE` / `ENGINE=InnoDB` + `utf8mb4` / 索引查 `information_schema` 幂等），`SqlExpr` 收敛为唯一实现（`mysql_client` 复用 `sqlite_client` 的类，跨后端 `isinstance` 一致）。**向量型**：`vector_query.py` / `vector_client_base.py` / `chroma_client.py` 三个源码文件——`VectorClientBase` 与 `DatabaseClientBase` 平行定义向量后端契约（集合 / 写入 / 删除 / 取 / 近邻检索 / 计数共 12 个方法），`ChromaClient` 作为首个向量后端（本地 `PersistentClient` 与远端 `HttpClient` 双模式，`chromadb` 走可选依赖 extras），`VectorFilter` 提供 EQ/NE/GT/…/IN/AND/OR 的元数据过滤。**统一异常体系**：`errors.py` 定义 `DatabaseError` 基类（继承 `ValueError`）+ 7 个语义子类（Connection / Operational / Validation 三大层 + Identifier / Integrity / Query / DriverMissing 四个场景），`SQLiteClient` / `MySQLClient` / `ChromaClient` 三后端及 `schema.check_ident` 全部按语义接入、不再裸抛驱动原生异常，零破坏。期间修复的关键缺陷：`batch_insert` 未提交导致的静默丢数据（改走 `self.executemany(...)` 封装）、`__enter__` / `__exit__` 事务异常路径误写 `self._sqlite3.Error` 导致的 `AttributeError`、where 值为 `None` 在 SQLite 未编译为 `IS NULL`、`SQLiteClient` 的 `select / update / delete` 字段名白名单缺失、Chroma 的 `drop_collection` 把「集合不存在」以外的异常也一并静默吞掉、以及 `add` 的 ids 判重为 O(n²)。**关系型零新增依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic`）。查询命名对齐仓库既有 `select / select_one` 家族，定为 `select_where / select_one_where`。测试位于 `tests/database/` 下 **4 个**文件、共 **156 项**（`test_database.py` 94 + `test_database_sqlite.py` 11 + `test_database_mysql.py` 18 + `test_database_chroma.py` 31；1 项跳过为需真实 MySQL 的端到端用例，Chroma 31 项需 `fast-agents[chroma]`），由仓库自研零依赖运行器 `tests/_runner.py` 驱动（**不依赖 pytest**）；配套 **6 个**示例。 | — |
+| **1.0.0** | 2026-11-03 | **初版**（含能力补全，均并入本版本）：`fast_agents/database/` 作为独立持久化层模块交付，含 **10 个源码文件**、**关系型双后端 + 向量型** 两套平行后端与**统一异常体系**。**关系型**：`SQLiteClient`（零依赖默认后端）提供连接与上下文事务、基础 SQL 通道（`execute / executemany / executescript / query`）、三种声明式建表（dict / list[Column] / Schema）+ 幂等建索引 + `ensure_schema(migrate=True)` 自动 `ALTER TABLE ADD COLUMN` 补列、CRUD（`insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete`）、读侧谓词下推（10 种 `FilterOp` + 多条件 AND + 单/多列排序 + `Query.columns` 列投影 + `limit/offset`，值一律参数化）、写侧条件写入（`upsert` 插入或更新、`update_where / delete_where` 带谓词批量改删，`SqlExpr` 支持自增等表达式且非空 filters 兜底防误改全表），标识符走 `check_ident` 白名单防注入，非内存库默认 `WAL + foreign_keys=ON` 并显式 `PRAGMA busy_timeout`；`MySQLClient` 为可选后端（接口与 `SQLiteClient` 100% 对齐，`pymysql` 走 `pip install fast-agents[mysql]` 可选 extras、延迟导入，未装时抛 `DatabaseDriverMissingError`；方言层适配反引号标识符 / `%s` 占位符 / `TYPE_TO_MYSQL` 类型映射（BOOLEAN→TINYINT(1)、TIMESTAMP→DATETIME、INTEGER 主键 `id` 自动 `AUTO_INCREMENT`）/ `ON DUPLICATE KEY UPDATE`（8.0.19+ 行别名 `AS new`、5.7 / MariaDB 回退 `VALUES(col)`，按服务端版本自适应）/ `ENGINE=InnoDB` + `utf8mb4` / 索引查 `information_schema` 幂等），`SqlExpr` 收敛为唯一实现（`mysql_client` 复用 `sqlite_client` 的类，跨后端 `isinstance` 一致）。**向量型**：`vector_query.py` / `vector_client_base.py` / `chroma_client.py` 三个源码文件——`VectorClientBase` 与 `DatabaseClientBase` 平行定义向量后端契约（集合 / 写入 / 删除 / 取 / 近邻检索 / 计数共 12 个方法），`ChromaClient` 作为首个向量后端（本地 `PersistentClient` 与远端 `HttpClient` 双模式，`chromadb` 走可选依赖 extras），`VectorFilter` 提供 EQ/NE/GT/…/IN/AND/OR 的元数据过滤。**统一异常体系**：`errors.py` 定义 `DatabaseError` 基类（继承 `ValueError`）+ 7 个语义子类（Connection / Operational / Validation 三大层 + Identifier / Integrity / Query / DriverMissing 四个场景），`SQLiteClient` / `MySQLClient` / `ChromaClient` 三后端及 `schema.check_ident` 全部按语义接入、不再裸抛驱动原生异常，零破坏。**关系型零新增依赖**（标准库 `sqlite3` + 全框架已有的 `pydantic`）。查询命名对齐仓库既有 `select / select_one` 家族，定为 `select_where / select_one_where`。测试位于 `tests/database/` 下 **4 个**文件、共 **182 项**（`test_database.py` 94 + `test_database_sqlite.py` 24 + `test_database_mysql.py` 32 + `test_database_chroma.py` 32；1 项跳过为需真实 MySQL 的端到端用例，Chroma 32 项需 `fast-agents[chroma]`），由仓库自研零依赖运行器 `tests/_runner.py` 驱动（**不依赖 pytest**）；配套 **6 个**示例。 | — |
 
-> 本模块仍处 **1.0.0** 打磨期：期间的新增后端、异常体系补全、测试体系迁移与缺陷修复均并入 1.0.0，**不单独计版本号**；后续出现实质性功能迭代时再在此表追加（保持「使用者可见的变更」倒序排列），内部重构不记录。
 
 ---
 
@@ -55,7 +54,7 @@ Agent 框架里要落盘的东西比想象中多：长期记忆、会话快照�
 | **门面层（出口）** | 进程内 | 统一对外导入入口 | `fast_agents/database/__init__.py` | 只 re-export，不含逻辑 |
 | **抽象层（契约）** | 编译期 | 后端必须实现的最小接口集 | `database_client_base.py`（`DatabaseClientBase`） | 不依赖具体后端；上层模块只引用它 |
 | **声明模型层** | 编译期 | 列/索引/表结构/SQL 片段解析、标识符白名单 | `schema.py`（`ColumnType/Column/Index/Schema` + `check_ident/quote_ident/parse_*`） | **不依赖任何数据库连接**，纯函数可单测 |
-| **查询模型层** | 运行期 | 过滤/排序/分页的轻量对象 + FilterOp 编译 | `query.py`（`Query/Filter/FilterOp/SortOrder`）+ `sqlite_client._compile_filter/_compile_query/_compile_filters` / `mysql_client._compile_filter/_compile_query/_compile_filters`（谓词下推） | 不依赖具体后端，编译逻辑在每个关系型后端内各一份（纯字符串拼装 + 命名参数 / `%s` 位置参数），各后端共用同样的 `Filter` 语义 |
+| **查询模型层** | 运行期 | 过滤/排序/分页/列投影的轻量对象 + FilterOp 编译 | `query.py`（`Query/Filter/FilterOp/SortOrder`）+ `sqlite_client._compile_filter/_compile_query/_compile_filters` / `mysql_client._compile_filter/_compile_query/_compile_filters`（谓词下推） | 不依赖具体后端，编译逻辑在每个关系型后端内各一份（纯字符串拼装 + 命名参数 / `%s` 位置参数），各后端共用同样的 `Filter` 语义；`Query.columns` 支持列投影（`None` 保持 `SELECT *`） |
 | **实现层（后端）** | 运行期 | 具体数据库驱动封装 | `sqlite_client.py`（`SQLiteClient`，零依赖默认后端）、`mysql_client.py`（`MySQLClient`，可选后端，接口与 SQLite 100% 对齐） | 依赖抽象层 + schema 解析函数 + 各自驱动（标准库 `sqlite3` / 可选 `pymysql`） |
 | **上层业务模块** | 运行期 | 记忆落盘 / Trace 落盘 / 画像落盘 | `memory/` 三 store（sqlite_store / session_store / profile_store）、`trace/sqlite_store.py` 等 | 只依赖抽象层 + 声明模型，不直接 `import sqlite3` |
 | **向量抽象层（契约）** | 编译期 | 向量后端必须实现的最小接口集 | `vector_client_base.py`（`VectorClientBase`） | 与 `DatabaseClientBase` **平行、互不继承**；上层只引用它 |
@@ -92,7 +91,7 @@ Agent 框架里要落盘的东西比想象中多：长期记忆、会话快照�
 | 驱动能力 | 连接 / 事务 / 参数化查询 / execute/executemany | 字典结果、WAL、外键默认开启、超时参数 | 异步 `aiosqlite` 连接、连接池 |
 | 建表 | 仍能手写 `db.execute("CREATE TABLE ...")`，**完全向后兼容** | dict / list[Column] / Schema 三种声明式写法；自动建索引；`IF NOT EXISTS` 默认幂等 | 外键声明、CHECK 约束、表注释（SQLite 本身不支持） |
 | 迁移 | — | `ensure_schema(schema, migrate=True)`：SQLite 走 `PRAGMA table_info`、MySQL 查 `information_schema.columns`，缺列自动 ADD COLUMN | 删列 / 改类型 / 改主键 / 重命名 / 数据迁移（后端通用限制） |
-| 查询 | — | where 等值匹配、order_by 白名单校验、limit；`select_where` 接入 10 种 `FilterOp`（>、<、LIKE、IN、IS NULL 等）+ AND 组合 + 单/多列排序 + limit/offset 分页，参数化防注入 | OR、JOIN、聚合、GROUP BY（刻意不做，保持零重型依赖） |
+| 查询 | — | where 等值匹配、order_by 白名单校验、limit（强制非负 int）；`select_where` 接入 10 种 `FilterOp`（>、<、LIKE、IN、IS NULL 等）+ AND 组合 + 单/多列排序 + limit/offset 分页 + `Query.columns` 列投影，参数化防注入 | OR、JOIN、聚合、GROUP BY（刻意不做，保持零重型依赖） |
 | 后端扩展 | — | `DatabaseClientBase` 抽象基类定义了最小接口契约；已落地 MySQL 后端（`MySQLClient`，与 SQLite 接口对齐） | Postgres / DuckDB 后端实现 |
 | 安全 | — | 标识符白名单 `check_ident` 防表名/列名注入；delete 必须带 where | 列级权限、审计日志（留给 trace 模块的审计能力） |
 
@@ -110,9 +109,9 @@ fast_agents/database/                 ← 单数目录（对齐 tools/memory/ski
 ├── database_client_base.py           # 【关系型】抽象基类 DatabaseClientBase：connect/close + DDL（建/查/删表）+ DML（CRUD，含 select_where/select_one_where）+ 事务上下文（__enter__/__exit__）契约
 ├── errors.py                         # 【通用】异常体系：DatabaseError（继承 ValueError）基类 + 7 个语义子类（Connection/Operational/Validation/Identifier/Integrity/Query/DriverMissing），关系型与向量型共用
 ├── schema.py                         # 【关系型】声明模型 ColumnType/Column/Index/Schema + 标识符校验 + Column/Schema→SQL 片段纯函数（各后端复用，与方言无关）
-├── query.py                          # 【关系型】查询模型 SortOrder/FilterOp/Filter/Query（轻量过滤/排序/分页，由各后端 select_where 编译为参数化 SQL）
+├── query.py                          # 【关系型】查询模型 SortOrder/FilterOp/Filter/Query（轻量过滤/排序/分页/列投影，由各后端 select_where 编译为参数化 SQL）
 ├── sqlite_client.py                  # 【关系型】SQLiteClient：零依赖默认后端，封装 sqlite3 连接、事务、字典结果、幂等建表、便捷 CRUD、select_where 谓词下推、count/batch_insert 统计与批量写入，并定义跨后端共用的 SqlExpr
-├── mysql_client.py                   # 【关系型】MySQLClient：可选 MySQL 后端，接口与 SQLiteClient 100% 对齐，pymysql 延迟导入；方言层负责反引号标识符 / %s 占位符 / 类型映射 / ON DUPLICATE KEY UPDATE / InnoDB+utf8mb4 建表 / information_schema 索引幂等
+├── mysql_client.py                   # 【关系型】MySQLClient：可选 MySQL 后端，接口与 SQLiteClient 100% 对齐，pymysql 延迟导入；方言层负责反引号标识符 / %s 占位符 / 类型映射 / ON DUPLICATE KEY UPDATE（8.0.19+ 行别名、5.7/MariaDB 回退 VALUES()）/ InnoDB+utf8mb4 建表 / information_schema 索引幂等
 ├── vector_query.py                   # 【向量型】向量元数据过滤模型 VectorFilterOp/VectorFilter（对齐 query.py，但支持 AND/OR 嵌套、不支持 LIKE/IS NULL）
 ├── vector_client_base.py             # 【向量型】抽象基类 VectorClientBase：连接 + 集合管理 + 写入/删除/取/近邻检索/计数契约（12 个方法）
 └── chroma_client.py                  # 【向量型】ChromaClient：首个向量后端，本地 PersistentClient / 远端 HttpClient 双模式，chromadb 为可选依赖（延迟导入）
@@ -127,9 +126,9 @@ fast_agents/database/                 ← 单数目录（对齐 tools/memory/ski
 - `examples/database/chroma_usage.py` —— 向量后端：建集 → add → get → search → count → delete → drop 完整示例（需 `pip install fast-agents[chroma]`）；
 - `examples/database/mysql_usage.py` —— MySQL 后端：同一套业务代码跑 SQLite / MySQL，默认只跑 SQLite 分支（零依赖、全内存），有 MySQL 环境时取消注释即可切换；
 - `tests/database/test_database.py` —— **94 项**核心单测：连接 / 事务 / DDL / CRUD / 谓词下推 / 条件写入 / 异常体系 / 标识符注入防护，全部走纯内存库、无外部依赖；
-- `tests/database/test_database_sqlite.py` —— **11 项** SQLite 回归单测：直接命中 P0 修复点（事务开启 / 提交失败抛 `DatabaseOperationalError` 而非 `AttributeError`、where 值为 `None` 编译为 `IS NULL`、select / update / delete 的字段名白名单）；
-- `tests/database/test_database_mysql.py` —— **20 项**单测：接口对齐 / 方言编译 / 类型映射 / SqlExpr 跨后端共用 / 可选依赖降级 / 异常语义对齐等离线用例，另有 1 项真实 MySQL 端到端（设 `FAST_AGENTS_TEST_MYSQL_URL` 才跑，否则 skip）；
-- `tests/database/test_database_chroma.py` —— **31 项**单测：向量抽象层契约 + `VectorFilter` 编译 + `ChromaClient` 本地持久化全链路（走真实 Chroma 临时目录，需 `pip install fast-agents[chroma]`）；
+- `tests/database/test_database_sqlite.py` —— **23 项** SQLite 回归单测：直接命中 P0 修复点（事务开启 / 提交失败抛 `DatabaseOperationalError` 而非 `AttributeError`、where 值为 `None` 编译为 `IS NULL`、select / update / delete 的字段名白名单）、`column_sql` 主键列不自动追加 `AUTOINCREMENT`、`Query.columns` 列投影（默认全列 / 指定列 / 白名单 / 组合查询）、`executescript` 事务原子性（事务内执行后外层异常必须回滚）、`executescript` 字符串/注释分号不误切、`executescript` 行注释按 SQLite 方言规则识别（`--` 后无空白仍属注释，`--x;` 注释里的语句不被切出执行）、SQLite / MySQL 切分器方言规则独立（各自遵循各自引擎的注释判定，互不混用）、事务外多语句自动提交、`select` 的 `limit` 非负校验（负数报错、`limit=0` 合法）、`insert` 的 data 键白名单（非法列名在拼接前抛 `DatabaseIdentifierError`，与 `update` 的 data 键同口径）；
+- `tests/database/test_database_mysql.py` —— **31 项**（30 项离线 + 1 项真实 MySQL 端到端）：接口对齐 / 方言编译（含 upsert 行别名版本自适应 + `Query.columns` 列投影）/ 类型映射 / SqlExpr 跨后端共用 / 可选依赖降级 / 异常语义对齐 / `executescript` 的多语句切分 / `insert` 的 data 键白名单（与 SQLite 同口径，非法列名不生成 SQL），其中真实端到端 1 项设 `FAST_AGENTS_TEST_MYSQL_URL` 才跑（否则 skip）；
+- `tests/database/test_database_chroma.py` —— **32 项**单测：向量抽象层契约 + `VectorFilter` 编译 + `ChromaClient` 本地持久化全链路（走真实 Chroma 临时目录，需 `pip install fast-agents[chroma]`）；
 - `tests/_runner.py` —— 仓库自研零依赖测试运行器（提供 `raises / skip / importorskip / tmp_path / MonkeyPatch / fixture` 等工具），四个测试文件统一从它导入，**不再依赖 pytest**。
 
 ### 4.2 分层
@@ -208,7 +207,7 @@ fast_agents/database/                 ← 单数目录（对齐 tools/memory/ski
         ▼
 SQLiteClient.create_table 按 columns 类型分派
    ├─ dict[str,str]   → 逐列 check_ident + quote_ident → _create_table_raw → execute(CREATE TABLE ...)
-   ├─ list[Column]    → schema.parse_column_list → (col_defs, index_stmts)
+   ├─ list[Column]    → 空列表前置校验 → schema.parse_column_list → (col_defs, index_stmts)
    │                       └─ _create_table_raw + 逐条 execute(CREATE INDEX IF NOT EXISTS ...)
    └─ Schema          → _create_table_from_schema(schema)
                             ├─ schema.parse_schema → (col_defs, index_stmts)
@@ -222,7 +221,7 @@ SQLiteClient.create_table 按 columns 类型分派
 **主链路 2：便捷 CRUD**
 
 ```text
-db.insert(t, data)           → 列名 quote_ident + 占位符 :key     → execute(INSERT ...) → lastrowid
+db.insert(t, data)           → 列名 check_ident + quote_ident + :key → execute(INSERT ...) → lastrowid
 db.select(t, where, order_by, limit)
                              → 列名/order_by 白名单 + 参数化     → query(SELECT ...) → list[dict]
 db.select_one(t, where, ...) → select(..., limit=1)              → rows[0] or None
@@ -317,7 +316,8 @@ with db:                      → __enter__ 执行 BEGIN IMMEDIATE，_tx_depth 0
 | LIKE 不替用户补 `%` | `value` 原样传入，要模糊必须自己写 `%name%` | 避免"隐式加通配符"导致的不精确匹配（最小惊讶） |
 | sort_by 支持单字段 str 或多字段 list[str] | 单字段按原样拼；多字段按列顺序展开为 `ORDER BY c1 dir, c2 dir`，方向对每列统一应用 | 知识库的 `ORDER BY updated_at DESC, memory_id` 这类稳定排序需要多列；单字段写法保持兼容 |
 | offset 无 limit 时自动补 `LIMIT -1` | SQLite 语法要求 OFFSET 必须配 LIMIT；`-1` 在 SQLite 里表示"无上限" | 允许 `select_where(Query(..., offset=100))` 这种"从第 N 条开始取全部"用法 |
-| limit/offset 强制非负 int | `< 0` 直接报错 | 防御性校验，避免拼接出语法错误或翻页逻辑翻车 |
+| limit/offset 强制非负 int | `< 0` 直接报错（`select` 与 `Query` 同口径） | 防御性校验，避免拼接出语法错误或翻页逻辑翻车 |
+| `columns` 列投影 | `None` → `SELECT *`；显式列表逐列过 `check_ident` 后加引号拼接，列顺序保持声明顺序 | 少取列省带宽；列名无法参数化，必须白名单拦截拼接注入 |
 
 **为什么保留原 `select(where=dict)` 不替换？**
 
@@ -327,7 +327,7 @@ with db:                      → __enter__ 执行 BEGIN IMMEDIATE，_tx_depth 0
 |---|---|
 | 按主键/外键/精确字段查一行或几行 | `db.select_one("users", {"id": uid})`（最短） |
 | 等值 + AND 组合、不需要比较/模糊 | `db.select("users", {"dept": "eng", "active": 1}, order_by="id")` |
-| 范围查询 / 模糊 / IN / 空值判断 / 分页 | `db.select_where(Query(...))` |
+| 范围查询 / 模糊 / IN / 空值判断 / 分页 / 指定返回列 | `db.select_where(Query(...))` |
 | 多表 JOIN / 聚合 / 子查询 / 复杂表达式 | `db.query("SELECT ...", params)`（回退到裸 SQL，不假装 ORM） |
 
 > **诚实声明能力边界**：本模块不做 OR、不做 JOIN、不做 GROUP BY/HAVING、不做子查询、不做 BETWEEN 语法糖（用 `GTE + LTE` 两个 Filter AND 即可表达）。这些在 Agent 框架的持久化场景里使用频率极低，一旦做了就要持续维护方言差异，违反「零重型依赖、最小可用」原则。
@@ -427,6 +427,7 @@ class Filter(BaseModel):
 
 class Query(BaseModel):
     table_name:  str
+    columns:     Optional[list[str]] = None      # 要返回的列名列表；None 表示 SELECT *（全部列）
     filters:     Optional[list[Filter]] = None  # AND 关系；由 select_where 编译
     sort_by:     Optional[str | list[str]] = None  # 单字段 str 或多字段 list[str]，每列都须是合法标识符
     sort_order:  SortOrder = SortOrder.ASC
@@ -434,7 +435,7 @@ class Query(BaseModel):
     offset:      Optional[int] = None            # 非负 int；单独使用时 SQLite 后端会自动补 LIMIT -1
 ```
 
-> **谓词下推**：`SQLiteClient.select_where(query)` 和 `select_one_where(query)` 把上面这套模型编译为参数化 SQL，覆盖 10 种 `FilterOp`、多条件 AND、单/多列排序与分页；写侧 `update_where / delete_where` 复用同一套 `Filter` 语义。详见 §5.4 / §5.5 与 §9.1 API 速查。等值简单场景仍然推荐用更短的 `select(where=dict)`，两种写法共存。OR / JOIN / 聚合 / BETWEEN 糖衣语法**刻意不做**，保持零重型依赖。
+> **谓词下推**：`SQLiteClient.select_where(query)` 和 `select_one_where(query)` 把上面这套模型编译为参数化 SQL，覆盖 10 种 `FilterOp`、多条件 AND、单/多列排序、列投影（`Query.columns`，`None` 保持 `SELECT *`）与分页；写侧 `update_where / delete_where` 复用同一套 `Filter` 语义。详见 §5.4 / §5.5 与 §9.1 API 速查。等值简单场景仍然推荐用更短的 `select(where=dict)`，两种写法共存。OR / JOIN / 聚合 / BETWEEN 糖衣语法**刻意不做**，保持零重型依赖。
 
 ### 6.6 `DatabaseClientBase`（抽象基类，子类必须实现）
 
@@ -628,6 +629,7 @@ TYPE_TO_SQLITE: dict[ColumnType, str] = {
 ```python
 class Query(BaseModel):
     table_name: str
+    columns: Optional[list[str]] = None   # 返回列；None 表示全部列
     filters: Optional[list[Filter]] = None
     sort_by: Optional[str] = None
     sort_order: SortOrder = SortOrder.ASC
@@ -636,7 +638,7 @@ class Query(BaseModel):
 ```
 
 - **负责什么**：为未来多后端统一的"过滤/排序/分页"表达打基础，避免每个后端各写一套查询 AST。
-- **关键实现**：`FilterOp` 枚举覆盖 =/!=/>/>=/</<=/LIKE/IN/IS NULL/IS NOT NULL 10 种常用操作符；`Filter.value` 对 IS NULL/NOT_NULL 允许为空。
+- **关键实现**：`FilterOp` 枚举覆盖 =/!=/>/>=/</<=/LIKE/IN/IS NULL/IS NOT NULL 10 种常用操作符；`Filter.value` 对 IS NULL/NOT_NULL 允许为空；`Query.columns` 指定返回列（`None` 即全部列），编译时逐列过 `_check_ident` 白名单后拼接。
 - **为什么这么写**：SQLiteClient 用 `_compile_filter / _compile_query` 把这套模型编译为参数化 SQL，上层不写裸 SQL 就能表达比较 / 模糊 / 集合 / 空值 / 分页；模型与后端解耦，未来加 MySQL/Postgres 后端时可直接复用同一套 Filter 语义。
 
 ### 7.5 `sqlite_client.py` —— SQLite 客户端（零依赖默认后端）
@@ -655,9 +657,9 @@ class SQLiteClient(DatabaseClientBase):
 - **负责什么**：把标准库 sqlite3 封装成上层好用的客户端——字典行结果、自动重连、WAL/外键默认开启、事务上下文、声明式建表三写法分派、幂等 migrate、便捷 CRUD。
 - **关键实现**（按方法块）：
   - **连接** `_connect()`：`sqlite3.connect(..., detect_types=PARSE_DECLTYPES, isolation_level=None)`（`isolation_level=None` 关闭 Python 隐式事务，事务边界完全由代码控制）+ `row_factory=Row`（返回字典）+ `PRAGMA foreign_keys=ON` + `PRAGMA busy_timeout=<timeout*1000>`（写锁等待与连接 timeout 同口径，默认 5s）；非内存库自动开 `PRAGMA journal_mode=WAL`（并发读写更友好，呼应 B9 待办）；连接失败抛 `DatabaseConnectionError`。
-  - **基础执行**：`execute/executemany/executescript/query` 四个方法是最底层通道，自动管理事务边界（在 `with db:` 事务内不 commit，由 `__exit__` 统一提交/回滚；不在事务内则单次语句自动 commit，失败自动 rollback）。SQLite 异常统一收口为 `DatabaseOperationalError`（`DatabaseError` 子类，仍可被 `except ValueError` 捕获）抛出，让上层不用 `import sqlite3` 就能 catch。
+  - **基础执行**：`execute/executemany/executescript/query` 四个方法是最底层通道，自动管理事务边界（在 `with db:` 事务内不 commit，由 `__exit__` 统一提交/回滚；不在事务内则单次语句自动 commit，失败自动 rollback）。`executescript` **不使用**标准库原生 `conn.executescript`（它会在执行前隐式 COMMIT 当前事务，导致事务内脚本被提前提交、外层异常无法回滚），改为与 MySQL 端「逐条执行 + 事务语义一致」——通过模块内 `_split_sql_statements` 状态机按「语句正文」分号切分后逐条 `conn.execute`，切分时严格遵守 **SQLite 方言规则**：单引号字符串 / 双引号标识符 / 反引号标识符内的分号不误切；行注释 `--` **不要求**紧跟空白（与 MySQL 的 `--` 后需空白规则不同，SQLite 下 `--x;` 整行都是注释）；块注释 `/* */` 可跨行；事务原子性完好。（MySQL 端的 `_split_sql_statements` 独立维护、遵守 MySQL 方言规则，两后端的切分逻辑互不混用。）SQLite 异常统一收口为 `DatabaseOperationalError`（`DatabaseError` 子类，仍可被 `except ValueError` 捕获）抛出，让上层不用 `import sqlite3` 就能 catch。
   - **DDL**：`table_exists` 查 `sqlite_master`；`create_table` 按 `isinstance(columns, Schema/list/dict)` 分派；`ensure_table` 就是 `create_table(if_not_exists=True)`；`ensure_schema` 先走 `table_exists` 判断，不存在就 `_create_table_from_schema`，已存在且 `migrate=True` 则 PRAGMA 拿现有列集合逐列 ALTER ADD；索引语句始终幂等执行；`drop_table` 默认 IF EXISTS。
-  - **CRUD**：insert 返回 lastrowid；select 的 where 用命名占位符 `:w_k` 防冲突，order_by 走 `^[A-Za-z_][A-Za-z0-9_]*(\s+(ASC|DESC))?$` 白名单校验；update 用 `:set_k / :w_k` 前缀区分 set 和 where 参数避免冲突；delete **必须传 where**，否则抛 `DatabaseValidationError`（防止 `DELETE FROM users` 清空全表的低级错误）。
+  - **CRUD**：insert 的 data 列名先过 `check_ident` 白名单（非法列名在拼接前抛 `DatabaseIdentifierError`）、返回 lastrowid；select 的 where 用命名占位符 `:w_k` 防冲突，order_by 走 `^[A-Za-z_][A-Za-z0-9_]*(\s+(ASC|DESC))?$` 白名单校验；`select_where(Query)` 支持 `columns` 列投影（`None` 即 `SELECT *`，显式列名逐列过白名单后拼接、顺序保持声明顺序）；update 用 `:set_k / :w_k` 前缀区分 set 和 where 参数避免冲突；delete **必须传 where**，否则抛 `DatabaseValidationError`（防止 `DELETE FROM users` 清空全表的低级错误）。
   - **统计与批量写入**：`count(table, where=None)` 做等值条件计数（where 为 None 返回表总行数，值为 None 时按 IS NULL 处理）；`batch_insert(table, rows)` 先校验各行字段一致，再用 `executemany` 参数化批量插入，空列表返回 0。
   - **条件写入**：`upsert` 编译 `INSERT ... ON CONFLICT(keys) DO UPDATE SET col = excluded.col`（`update_columns` 为空则 `DO NOTHING`）；`update_where / delete_where` 复用 `_compile_filters` 把 Filter 编译成 WHERE（与读侧共用 `_compile_filter`），SET 值默认参数化、显式 `SqlExpr` 才原样拼入；两者都要求 `filters` 非空防误改全表。
   - **事务**：`__enter__` 显式 `BEGIN IMMEDIATE` 把 `_tx_depth` 加一（最外层才真正 `BEGIN`，内层嵌套只递增计数器以加入父事务）；`__exit__` 根据是否异常 commit/rollback，finally 里把 `_tx_depth` 归零；`_in_transaction` 是 `_tx_depth > 0` 的只读 property，不保存独立状态，杜绝标志与真实状态失同步；`__del__` 尝试 close，不抛异常。
@@ -697,7 +699,7 @@ class VectorClientBase(ABC):
 - **负责什么**：定义所有向量后端（Chroma / 未来 FAISS / Milvus / pgvector）必须实现的最小接口集——连接（3）+ 集合管理（4）+ 写入/删除/取/检索/计数（5）共 **12 个方法**。
 - **关键实现**：
   - 命名与 `DatabaseClientBase` 平行（"动词 + 对象"，集合方法对齐表方法），降低记忆成本；
-  - **安全约定**：`delete` 的 `ids` 与 `where` 至少要有一个非空，空条件禁止删全量（与 `SQLiteClient.delete_where` 同一条安全线）；同时传 `ids` 与 `where` 时**以 ids 为准**，不依赖各后端未文档化的混用行为；
+  - **安全约定**：`delete` 的 `ids` 与 `where` 至少要有一个非空（`where` 传 `None` 或空 dict `{}` 都视同空条件），空条件禁止删全量（与 `SQLiteClient.delete_where` 同一条安全线）；同时传 `ids` 与 `where` 时**以 ids 为准**，不依赖各后端未文档化的混用行为；
   - `get` 暴露 `include_embeddings / include_documents / include_metadatas` 三个开关（默认不返回向量以省内存/流量）。
 - **为什么这么写**：不把事务 / DDL 迁移 / 外键这类关系型专有能力塞进向量基类（向量库普遍不支持）；两套基类平行之后，一个后端可以**同时继承两者**（Postgres + pgvector），上层 `isinstance` 即判断能力。**你要接新向量后端时，第一个要照着实现的就是这个类。**
 
@@ -766,19 +768,21 @@ class MySQLClient(DatabaseClientBase):
                  password="", database=None, charset="utf8mb4", timeout=5.0):
         _require_pymysql()      # 延迟导入，未装抛 DatabaseDriverMissingError
         self._connect()
-    # 方言层：反引号标识符 / %s 占位符 / TYPE_TO_MYSQL / ON DUPLICATE KEY UPDATE
+    # 方言层：反引号标识符 / %s 占位符 / TYPE_TO_MYSQL / ON DUPLICATE KEY UPDATE（版本自适应行别名）
 ```
 
 - **负责什么**：`SQLiteClient` 的可选对等实现——接口 100% 对齐（同一套 `connect / DDL / CRUD / select_where / upsert / update_where / delete_where / with 事务`），上层改一行构造即可把 SQLite 换成 MySQL。
 - **关键实现**：
   - **方言适配**：标识符用反引号（`_quote_ident_mysql`）；占位符统一 `%s`；`TYPE_TO_MYSQL`（`TEXT→TEXT`、`INTEGER→INT`、`REAL→DOUBLE`、`BLOB→LONGBLOB`、`BOOLEAN→TINYINT(1)`、`VARCHAR→VARCHAR(255)`、`TIMESTAMP→DATETIME`）；INTEGER 主键 `id` 自动补 `AUTO_INCREMENT`。
+  - **列投影**：`_compile_query` 按 `Query.columns` 生成 SELECT 列表——`None` 保持 `SELECT *`，显式列名逐列过 `_check_ident` 后反引号包裹、逗号拼接（与 SQLite 侧同构）。
   - **建表 / 索引幂等**：`ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`；MySQL 无 `CREATE INDEX IF NOT EXISTS`，改为先查 `information_schema.statistics` 再建；补列查 `information_schema.columns`。
-  - **Upsert**：`ON DUPLICATE KEY UPDATE`（SQLite 走 `ON CONFLICT DO UPDATE`），`update_columns` 语义两边一致。
+  - **Upsert（版本自适应）**：`ON DUPLICATE KEY UPDATE`（SQLite 走 `ON CONFLICT DO UPDATE`），`update_columns` 语义两边一致；**MySQL 8.0.19+** 用行别名 `INSERT ... VALUES (...) AS new ON DUPLICATE KEY UPDATE col = new.col`（`VALUES(col)` 自 8.0.20 起已被官方弃用），**5.7 / MariaDB / 版本未知**回退到 `col = VALUES(col)` 保证兼容。版本取自 pymysql 握手阶段已缓存的 `get_server_info()`（不额外往返），首次探测后缓存、重连时重置；`update_columns=[]`（冲突忽略）分支不引用新值，故不追加行别名。
   - **事务**：沿用 `_tx_depth` 嵌套计数（与 SQLite 同构）；`OFFSET` 无 `LIMIT` 时补 `LIMIT 18446744073709551615`（MySQL 语法要求）。
+  - **脚本执行**：`executescript` 用模块内的 `_split_sql_statements` 状态机切分——只按「语句正文」里的分号切，字符串字面量 / 反引号标识符 / `--`、`#`、`/* */` 注释里的分号不会被误切（`sql.split(";")` 会把 `INSERT INTO t VALUES ('a;b')` 拆成两条非法 SQL）。切分严格遵守 **MySQL 方言规则**：行注释 `--` 必须紧跟空白才进入注释态（MySQL 官方要求，区别于 SQLite 的 `--` 一律到行尾），`#` 到行尾也是行注释；SQLite 端同样采用「切分后逐条 `execute`」的执行模型（不再使用标准库原生 `conn.executescript`，避免其隐式 COMMIT 破坏事务），两后端在**事务语义**上对齐（事务内不自动 commit、异常可回滚），但**方言判定各自独立**（注释 / 标识符 / 占位符等细节按各自引擎规则实现，不混用）。
   - **连接细节**：`init_command` 设 `SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'`；`conn` 属性访问时**非事务态** `ping(reconnect=True)` 自动重连（长期空闲连接可无缝复用），**事务态**跳过 ping/重连——避免网络抖动触发隐式重连导致旧连接上已 BEGIN 的事务随连接消失、最后的 commit 静默丢失前面写入，事务中断连由后续 execute 自然抛 `DatabaseOperationalError` 让上层感知重试。
   - **异常与 SqlExpr**：连接失败 `DatabaseConnectionError`、执行失败 `DatabaseOperationalError`、入参 `DatabaseValidationError`、未装 pymysql `DatabaseDriverMissingError`；`SqlExpr` 直接复用 `sqlite_client` 的同一类，跨后端 `isinstance` 一致。
 - **为什么这么写**：把方言差异全部关在 `mysql_client.py` 内部，`DatabaseClientBase` 契约与 `schema.py` 声明模型一行不改——这正好验证了 §7.3「拼 SQL 抽成纯函数 + 各后端分别适配」的设计。**你要接 Postgres 时，照着本文件写 `postgres_client.py` 即可。**
-- **你要改的时候最该看的地方**：改类型映射看 `TYPE_TO_MYSQL`；改索引 / 补列幂等看 `_list_indexes` / `_list_columns` 对 `information_schema` 的查询；改 upsert 看 `ON DUPLICATE KEY UPDATE` 分支；与 SQLite 行为不一致处（如 OFFSET 补 LIMIT）要在两边同时回归。
+- **你要改的时候最该看的地方**：改类型映射看 `TYPE_TO_MYSQL`；改索引 / 补列幂等看 `_list_indexes` / `_list_columns` 对 `information_schema` 的查询；改 upsert 看 `ON DUPLICATE KEY UPDATE` 分支与 `_server_supports_row_alias` 的版本分界（8.0.19）；与 SQLite 行为不一致处（如 OFFSET 补 LIMIT）要在两边同时回归；改脚本切分看 `_split_sql_statements`。
 
 ---
 
@@ -932,7 +936,7 @@ python tests\database\test_database_mysql.py
 python tests\database\test_database_chroma.py
 ```
 
-预期 4 个文件依次输出 `完成：94 通过，0 跳过，0 失败` / `完成：11 通过，0 跳过，0 失败` / `完成：19 通过，1 跳过，0 失败` / `完成：31 通过，0 跳过，0 失败`，合计 **155 通过 / 1 跳过 / 0 失败**（跳过的 1 项是需真实 MySQL 的端到端用例，设 `FAST_AGENTS_TEST_MYSQL_URL` 后才跑）。测试运行器是仓库自研的 `tests/_runner.py`，**不依赖 pytest**；`test_database_chroma.py` 需先 `pip install fast-agents[chroma]`，未装 chromadb 时会在构造 `ChromaClient` 处抛 `DatabaseDriverMissingError`（提示安装命令）。任何一条失败都说明环境或代码有问题（Python 版本过低 / 文件被占用 / 磁盘只读等），按报错定位即可。
+预期 4 个文件依次输出 `完成：94 通过，0 跳过，0 失败` / `完成：24 通过，0 跳过，0 失败` / `完成：31 通过，1 跳过，0 失败` / `完成：32 通过，0 跳过，0 失败`，合计 **181 通过 / 1 跳过 / 0 失败**（跳过的 1 项是需真实 MySQL 的端到端用例，设 `FAST_AGENTS_TEST_MYSQL_URL` 后才跑）。测试运行器是仓库自研的 `tests/_runner.py`，**不依赖 pytest**；`test_database_chroma.py` 需先 `pip install fast-agents[chroma]`，未装 chromadb 时会在构造 `ChromaClient` 处抛 `DatabaseDriverMissingError`（提示安装命令）。任何一条失败都说明环境或代码有问题（Python 版本过低 / 文件被占用 / 磁盘只读等），按报错定位即可。
 
 ### 8.6 向量后端快速上手（Chroma，可选依赖）
 
@@ -1008,7 +1012,7 @@ db = SQLiteClient("app.db")              # 文件库；":memory:" 是内存库
 |---|---|---|---|
 | `execute(sql, params=())` | sql: str；params: tuple\|dict | `{"lastrowid": int, "rowcount": int}` | 执行写 SQL；不在事务中自动 commit |
 | `executemany(sql, params_list)` | sql；list[tuple\|dict] | 同上 | 批量执行 |
-| `executescript(sql)` | sql（多语句，`;` 分隔） | None | 执行脚本；不在事务中自动 commit |
+| `executescript(sql)` | sql（多语句，`;` 分隔） | None | 执行脚本；两端（SQLite / MySQL）均用模块内 `_split_sql_statements` 状态机切分（只认「语句正文」里的分号，字符串 / 注释 / 标识符内的分号不误切）后逐条 `execute`，**事务内不自动 commit**（SQLite 不再使用原生 `conn.executescript`——它会隐式 COMMIT 破坏事务原子性）；事务外所有语句执行成功后统一 commit，异常自动 rollback。**方言差异**：两后端切分器独立，SQLite `--` 后不要求空白即进入行注释，MySQL `--` 后必须紧跟空白；标识符引号 / `#` 行注释等细节按各自引擎规则实现。 |
 | `query(sql, params=(), fetch_one=False)` | sql；params；fetch_one: bool | `list[dict] \| dict \| None` | 读 SQL，默认返回字典列表 |
 
 #### DDL（建表 / 查表 / 删表 / 索引）
@@ -1016,7 +1020,7 @@ db = SQLiteClient("app.db")              # 文件库；":memory:" 是内存库
 | 方法 | 参数 | 说明 |
 |---|---|---|
 | `table_exists(table)` | table: str | 查 sqlite_master 判断表是否存在 |
-| `create_table(table, columns, if_not_exists=True)` | table: str；columns: dict[str,str] / list[Column] / Schema；if_not_exists: bool | 建表；三种 columns 写法任选；默认幂等 |
+| `create_table(table, columns, if_not_exists=True)` | table: str；columns: dict[str,str] / list[Column] / Schema；if_not_exists: bool | 建表；三种 columns 写法任选；默认幂等；空 columns（空 dict / 空 list[Column]）在拼接前抛 `DatabaseValidationError` |
 | `ensure_table(table, columns)` | 同上（无 if_not_exists） | 等价 `create_table(..., if_not_exists=True)`，**最常用入口** |
 | `ensure_schema(schema, migrate=False)` | schema: Schema；migrate: bool | 按 Schema 幂等建表+建索引；migrate=True 自动补缺失列（仅 ADD COLUMN） |
 | `drop_table(table, if_exists=True)` | table: str；if_exists: bool | 删表，默认 IF EXISTS |
@@ -1025,12 +1029,12 @@ db = SQLiteClient("app.db")              # 文件库；":memory:" 是内存库
 
 | 方法 | 参数 | 返回 | 说明 |
 |---|---|---|---|
-| `insert(table, data)` | data: dict（非空） | int（lastrowid） | 插入一行；列名走 quote_ident + 命名占位符 |
+| `insert(table, data)` | data: dict（非空） | int（lastrowid） | 插入一行；列名先过 check_ident 白名单（非法列名在拼接前抛 DatabaseIdentifierError）、再 quote_ident + 命名占位符 |
 | `upsert(table, data, conflict_keys, update_columns=None)` | data: dict；conflict_keys: str \| list[str]（须都在 data 中）；update_columns: list[str] \| None | int（rowcount） | **插入或更新**（`ON CONFLICT DO UPDATE`）；`update_columns` 不传则更新除冲突键外的全部列，传空列表则 DO NOTHING；值全参数化 |
 | `batch_insert(table, rows)` | rows: list[dict]（各行字段须一致） | int（插入行数） | 批量插入；空列表返回 0；字段不一致抛 DatabaseValidationError |
-| `select(table, where=None, order_by=None, limit=None)` | where: dict（等值 AND，值为 None 时按 IS NULL）；order_by: str（白名单，支持 `"id DESC"`）；limit: int | `list[dict]` | **等值查询**的简洁 API；复杂过滤用 `select_where` |
+| `select(table, where=None, order_by=None, limit=None)` | where: dict（等值 AND，值为 None 时按 IS NULL）；order_by: str（白名单，支持 `"id DESC"`）；limit: int（非负，负数报 `DatabaseValidationError`） | `list[dict]` | **等值查询**的简洁 API；复杂过滤用 `select_where` |
 | `select_one(table, where=None, order_by=None)` | 同上 | `dict \| None` | 查询单行，无结果返回 None |
-| `select_where(query)` | query: `Query` | `list[dict]` | **谓词下推入口**：按声明式 Query 查多行，支持 10 种 `FilterOp`、AND 组合、排序、limit/offset；参数化防注入 |
+| `select_where(query)` | query: `Query` | `list[dict]` | **谓词下推入口**：按声明式 Query 查多行，支持 10 种 `FilterOp`、AND 组合、排序、limit/offset、`columns` 列投影；参数化防注入 |
 | `select_one_where(query)` | query: `Query` | `dict \| None` | `select_where` 的单行版本（内部自动 `limit=1`，不修改传入 Query） |
 | `update(table, data, where)` | data: dict（非空）；where: dict（非空，值为 None 时按 IS NULL） | int（rowcount，影响行数） | 更新行 |
 | `count(table, where=None)` | where: dict（等值，值为 None 时按 IS NULL）；None 表示全表 | int | 统计行数 |
@@ -1060,7 +1064,7 @@ with db:
 | `SortOrder` | ASC / DESC | 查询排序方向 |
 | `FilterOp` | EQ/NEQ/GT/GTE/LT/LTE/LIKE/IN/NOT_NULL/IS_NULL | 过滤操作符（由 `select_where` 编译，共 10 种） |
 | `Filter(field, op, value=None)` | — | 单个过滤条件；IN 时 value 必须是非空 list/tuple；IS_NULL/NOT_NULL 无需 value |
-| `Query(table_name, filters=None, sort_by=None, sort_order=ASC, limit=None, offset=None)` | — | 查询对象；`sort_by` 支持单字段 str 或多字段 list[str]；`select_where` / `select_one_where` / `update_where` / `delete_where` 的入参 |
+| `Query(table_name, columns=None, filters=None, sort_by=None, sort_order=ASC, limit=None, offset=None)` | — | 查询对象；`columns` 为返回列名列表（None 表示全部列）；`sort_by` 支持单字段 str 或多字段 list[str]；`select_where` / `select_one_where` / `update_where` / `delete_where` 的入参 |
 | `SqlExpr(sql)` | sql: str（非空） | 写侧 SQL 表达式包装，仅 `update_where` 用；内容原样拼入 SQL，只传程序写死的固定片段 |
 
 ### 9.3 已废弃/暂未开放的写法
@@ -1102,7 +1106,7 @@ with db:
 | 方法 | 参数 | 返回 | 说明 |
 |---|---|---|---|
 | `add(collection, ids, embeddings=None, documents=None, metadatas=None)` | 三个内容字段至少一个非空，长度须与 ids 一致 | int（写入条数） | 按 id upsert（同名覆盖）；ids 去重、批内维度一致、与声明维度一致校验；超 `add_chunk_size` 自动分块 |
-| `delete(collection, ids=None, where=None)` | ids / where 至少一个非空 | int（精确删除条数） | 传 ids 按 id 删、否则按 where 删；**空条件抛 `DatabaseValidationError`** 防误删全量 |
+| `delete(collection, ids=None, where=None)` | ids / where 至少一个非空 | int（精确删除条数） | 传 ids 按 id 删、否则按 where 删；**空条件抛 `DatabaseValidationError`** 防误删全量（`where` 为 `None` 或空 dict `{}` 一律拦截） |
 | `get(collection, ids=None, where=None, limit=None, include_embeddings=False, include_documents=True, include_metadatas=True)` | — | `list[dict]` | 精确取（非近邻）；`limit` 须为正整数 |
 | `search(collection, query_embedding, *, n_results=10, where=None, include_embeddings=False)` | query_embedding: list[float] | `list[dict]` | 近邻检索，按距离升序；结果含 `distance`（`include_embeddings=True` 时含 `embedding`） |
 | `count(collection, where=None)` | — | int | 无 where 走 `col.count()`；有 where 走 `get(include=[])` 计数 |
@@ -1196,7 +1200,7 @@ except DatabaseError:                  # 或统一兜底（等价于 except Valu
 | `DatabaseDriverMissingError: 使用 ChromaClient 需要先安装 chromadb 可选依赖` | 没装可选依赖。执行 `pip install fast-agents[chroma]`（或 `pip install "chromadb>=0.4,<1.0"`）。不装不影响关系型能力 |
 | `DatabaseIdentifierError: 非法集合名: 'ab'；需 3-63 字符...` | Chroma 集合名约束：3–63 字符、**首尾必须是字母或数字**、中间允许字母/数字/`_`/`-`。单字符名（`'a'` / `'t'`）与以下划线/连字符结尾的名都会被拒 |
 | `DatabaseValidationError: embedding 维度(x) 与集合 'y' 声明的维度(z) 不一致` | 建集时声明了 `dimension`，写入/检索向量必须与之一致（Chroma 空集合本身不校验，是客户端补的位）。要么对齐维度，要么建集时不声明 |
-| `DatabaseValidationError: delete 的 ids 和 where 不能同时为空（防止误删全量）` | 向量版 `delete` 与关系型 `delete` 同一条安全线：不带条件不允许删全量。要清空集合请用 `drop_collection` |
+| `DatabaseValidationError: delete 的 ids 和 where 不能同时为空（防止误删全量）` | 向量版 `delete` 与关系型 `delete` 同一条安全线：不带条件（`ids` 与 `where` 均为空，含 `where={}` 空 dict）不允许删全量。要清空集合请用 `drop_collection` |
 | `DatabaseValidationError: 同一批 embeddings 维度不一致：[...]` | 一次 `add` 的 embeddings 必须同维度；分批前先对齐 |
 | `TypeError: 'NoneType' object is not iterable`（`get_or_create_collection` 时） | Chroma 0.6.x 对「已存在但 metadata 为空」的集合合并 metadata 的缺陷；本实现已捕获回退，若绕过 client 直接用 SDK 需自行注意 |
 
@@ -1220,9 +1224,9 @@ except DatabaseError:                  # 或统一兜底（等价于 except Valu
 | 测试文件 | 项数 | 覆盖点 | 运行命令 |
 |---|---|---|---|
 | `tests/database/test_database.py` | **94 / 94** | 连接与基本 CRUD / 字典返回 / 事务提交与回滚 / select order_by 与 limit / 列名与 order_by 注入防护 / delete 必须传 where / 内存库与文件库持久化 / 三种建表写法（dict / list[Column] / Schema）+ 幂等建索引与约束 / migrate 补列语义 / 谓词下推（10 种 FilterOp / AND / 单多列排序 / limit-offset） / 写侧条件写入（upsert / update_where / delete_where / SqlExpr） / 异常体系 8 类继承链 / 标识符白名单 / 顶层 fast_agents 包导出 | `python tests\database\test_database.py` |
-| `tests/database/test_database_sqlite.py` | **11 / 11** | 事务开启 / 提交失败抛 `DatabaseOperationalError`（不再抛 `AttributeError`） / where 值为 `None` 编译为 `IS NULL` 且能命中行 / select-insert-count / select / update / delete 的字段名白名单 / 嵌套事务原子性 / 事务失败后状态复位可继续使用 | `python tests\database\test_database_sqlite.py` |
-| `tests/database/test_database_mysql.py` | **19 / 19 + 1 真实连接** | 与 SQLiteClient 接口 100% 对齐 / 方言编译（反引号标识符 / `%s` 占位符 / `ON DUPLICATE KEY UPDATE` / OFFSET 补 LIMIT） / `TYPE_TO_MYSQL` 类型映射 / `SqlExpr` 跨后端共用 / 可选驱动降级为 `DatabaseDriverMissingError` / 异常语义对齐；真实 MySQL 端到端 1 项（设 `FAST_AGENTS_TEST_MYSQL_URL` 才跑，否则 skip） | `python tests\database\test_database_mysql.py` |
-| `tests/database/test_database_chroma.py` | **31 / 31**（需 `pip install fast-agents[chroma]`） | 向量抽象层契约（`VectorClientBase` 12 个抽象方法） / `VectorFilter` 叶子与 AND 组合编译为 Chroma where / `ChromaClient` 本地持久化全链路（建集→写→取→近邻 search→where 过滤→删→drop 幂等） / dimension 写入 metadata 并校验 / add 分块与 ids 去重 / get limit 与 include 开关 / delete ids 优先且精确计数 / 异常统一收口（集合不存在、metadata 非法、`$in` 非法入参一律转本模块异常，不泄露 SDK 原生异常） / 叶子条件 `value=None` 拦截 / 集合名非法报错文案 / `drop_collection` 仅静默「集合不存在」、其余错误抛 `DatabaseQueryError` / `add` 多个不同重复 id 一次升序列出 | `python tests\database\test_database_chroma.py` |
+| `tests/database/test_database_sqlite.py` | **24 / 24** | 事务开启 / 提交失败抛 `DatabaseOperationalError`（不再抛 `AttributeError`） / where 值为 `None` 编译为 `IS NULL` 且能命中行 / select-insert-count / select / update / delete 的字段名白名单 / 嵌套事务原子性 / 事务失败后状态复位可继续使用 / `column_sql` 主键列不追加 `AUTOINCREMENT` / `Query.columns` 列投影（默认全列 / 指定列 / 白名单 / 与过滤排序组合） / `executescript` 事务原子性（事务内多语句后外层异常必须回滚，锁死「标准库原生 executescript 隐式 COMMIT」这一坑） / `executescript` 切分对字符串/注释里分号不误切 / `executescript` 行注释按 SQLite 方言识别（`--` 后无空白仍进入注释，锁死「照搬 MySQL `--` 后需空白规则」的回归） / SQLite / MySQL 切分器方言规则独立互不混用 / 事务外多语句自动提交 / `select` 的 `limit` 非负校验（负数抛 `DatabaseValidationError`、不生成 SQL） / `insert` 的 data 键白名单（非法列名在拼接前抛 `DatabaseIdentifierError`） / create_table 空列校验（list 空列表抛 `DatabaseValidationError`，与 dict 分支同口径） | `python tests\database\test_database_sqlite.py` |
+| `tests/database/test_database_mysql.py` | **31 / 31 + 1 真实连接** | 与 SQLiteClient 接口 100% 对齐 / 方言编译（反引号标识符 / `%s` 占位符 / `ON DUPLICATE KEY UPDATE`（版本自适应行别名）/ OFFSET 补 LIMIT） / `TYPE_TO_MYSQL` 类型映射 / `SqlExpr` 跨后端共用 / 可选驱动降级为 `DatabaseDriverMissingError` / 异常语义对齐 / upsert 语法版本自适应（8.0.19 分界、5.7 与 MariaDB 回退 `VALUES()`、探测结果缓存） / `executescript` 多语句切分（含分号的字符串 / 注释不误切） / `Query.columns` 投影 SQL（反引号列名 / 白名单 / 默认 `SELECT *` / create_table 空列表校验（与 SQLite 同口径））；真实 MySQL 端到端 1 项（设 `FAST_AGENTS_TEST_MYSQL_URL` 才跑，否则 skip） | `python tests\database\test_database_mysql.py` |
+| `tests/database/test_database_chroma.py` | **32 / 32**（需 `pip install fast-agents[chroma]`） | 向量抽象层契约（`VectorClientBase` 12 个抽象方法） / `VectorFilter` 叶子与 AND 组合编译为 Chroma where / `ChromaClient` 本地持久化全链路（建集→写→取→近邻 search→where 过滤→删→drop 幂等） / dimension 写入 metadata 并校验 / add 分块与 ids 去重 / get limit 与 include 开关 / delete ids 优先且精确计数 / **delete 空条件拦截（`None` 与空 dict `{}` 同口径）** / 异常统一收口（集合不存在、metadata 非法、`$in` 非法入参一律转本模块异常，不泄露 SDK 原生异常） / 叶子条件 `value=None` 拦截 / 集合名非法报错文案 / `drop_collection` 仅静默「集合不存在」、其余错误抛 `DatabaseQueryError` / `add` 多个不同重复 id 一次升序列出 | `python tests\database\test_database_chroma.py` |
 
 **关键回归断言**（这几条锁住了核心设计承诺，改代码时必须保留）：
 
@@ -1239,17 +1243,18 @@ except DatabaseError:                  # 或统一兜底（等价于 except Valu
 - `test_enter_transaction_failure_raises_operational_error_not_attributeerror` —— P0 回归：锁死事务开启失败必须抛 `DatabaseOperationalError`（而非实现细节漏出的 `AttributeError`）；
 - `test_where_none_compiles_to_is_null_and_hits_rows` —— P0 回归：锁死 `where` 值为 `None` 时编译为 `IS NULL`（而非永不命中的 `= NULL`），SQLite 与 MySQL 语义一致。
 - `test_chroma_all_public_methods_wrap_chroma_errors` / `test_chroma_invalid_metadata_value_wrapped` / `test_chroma_invalid_in_filter_wrapped` / `test_chroma_leaf_filter_rejects_none_value` —— 锁死「向量后端不把 chromadb 原生异常抛给上层」：SDK 异常与非法入参一律转 `DatabaseError` 谱系，`EQ / NE` 传 `None` 在编译期拦截。
+- `test_query_columns_default_selects_all` / `test_query_columns_selects_only_specified_columns` / `test_query_columns_validates_identifiers` —— 锁死 `Query.columns` 语义：`None` 保持 `SELECT *`（零破坏），显式列名逐列过 `_check_ident` 白名单（`id; DROP TABLE` 一律拒绝）、空列表报 `DatabaseValidationError`，杜绝借列名的标识符注入。
 
-**全绿基线**：在 Windows PowerShell + Python 3.10+（仓库 `.python-version` = 3.10）+ 干净 venv 环境下，依次跑上面 4 个测试文件，输出末尾应分别为 `完成：94 通过，0 跳过，0 失败` / `完成：11 通过，0 跳过，0 失败` / `完成：19 通过，1 跳过，0 失败` / `完成：31 通过，0 跳过，0 失败`，合计 **155 通过 / 1 跳过 / 0 失败**（跳过的 1 项是需真实 MySQL 的端到端用例，设 `FAST_AGENTS_TEST_MYSQL_URL` 后才跑）。测试运行器是仓库自研的 `tests/_runner.py`，**不依赖 pytest**。任何一条失败都视为环境或代码问题，不应合并。
+**全绿基线**：在 Windows PowerShell + Python 3.10+（仓库 `.python-version` = 3.10）+ 干净 venv 环境下，依次跑上面 4 个测试文件，输出末尾应分别为 `完成：94 通过，0 跳过，0 失败` / `完成：24 通过，0 跳过，0 失败` / `完成：31 通过，1 跳过，0 失败` / `完成：32 通过，0 跳过，0 失败`，合计 **181 通过 / 1 跳过 / 0 失败**（跳过的 1 项是需真实 MySQL 的端到端用例，设 `FAST_AGENTS_TEST_MYSQL_URL` 后才跑）。测试运行器是仓库自研的 `tests/_runner.py`，**不依赖 pytest**。任何一条失败都视为环境或代码问题，不应合并。
 
-**跨模块回归**：database 改动后，除了本模块 156 项，还要跑一遍 `tests/memory/test_memory.py` 里涉及 SQLiteMemoryStore 的用例（memory / trace 已基于 SQLiteClient 的 `ensure_schema` 建表，共用 sqlite3 驱动，方言 / 默认 PRAGMA 变动可能影响），以及 `tests/context/test_context.py` / `tests/agents/test_react_agent.py` 全套，确认没有隐式依赖被破坏。
+**跨模块回归**：database 改动后，除了本模块 182 项，还要跑一遍 `tests/memory/test_memory.py` 里涉及 SQLiteMemoryStore 的用例（memory / trace 已基于 SQLiteClient 的 `ensure_schema` 建表，共用 sqlite3 驱动，方言 / 默认 PRAGMA 变动可能影响），以及 `tests/context/test_context.py` / `tests/agents/test_react_agent.py` 全套，确认没有隐式依赖被破坏。
 
 **当前测试与实现的已知差异**（如实写明，不粉饰）：
 
 - `connect()` 作为基类接口目前只在 `__init__` 和 `close()` 后被调用，没有独立单测；由于 `__init__` 已经调用 `_connect`，功能等价，风险低；
 - `select_where` 的 `sort_by` 已支持单字段与多字段；「按表达式排序」（如 `ORDER BY random()`）**没有实现**，这是刻意为之的能力边界（见 §5.4 / §9.3）；
 - OR / NOT / 括号分组 / JOIN / 聚合 / GROUP BY / 子查询**没有测试也不打算做**，保持零重型依赖；
-- 向量侧的 31 项 Chroma 用例依赖可选依赖 `chromadb`：**未安装时 `test_database_chroma.py` 会在构造 `ChromaClient` 处抛 `DatabaseDriverMissingError` 并中断（不是 skip）**，需先 `pip install fast-agents[chroma]` 再跑；装好后 31/31 全绿。抽象层与 `VectorFilter` 编译校验不依赖 chromadb。
+- 向量侧的 32 项 Chroma 用例依赖可选依赖 `chromadb`：**未安装时 `test_database_chroma.py` 会在构造 `ChromaClient` 处抛 `DatabaseDriverMissingError` 并中断（不是 skip）**，需先 `pip install fast-agents[chroma]` 再跑；装好后 32/32 全绿。抽象层与 `VectorFilter` 编译校验不依赖 chromadb。
 
 ---
 
@@ -1260,9 +1265,9 @@ except DatabaseError:                  # 或统一兜底（等价于 except Valu
 ### 12.1 初版已交付
 
 - **初版**（v1.0.0，2026-11-03；后续的 MySQL 后端、异常体系扩张、测试框架迁移到 `tests/database/` + `tests/_runner.py`、文档对齐代码等均并入本版本，**不单独计版本**）：`fast_agents/database/` **10 个源码文件**，包含**关系型双后端 + 向量型**两套平行后端 + 统一异常体系。
-  - **关系型**：`SQLiteClient` 支持连接与上下文事务、基础 SQL 通道（execute / executemany / executescript / query）、三种声明式建表 + 幂等建索引 + `migrate=True` 补列、CRUD（insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete）、读侧谓词下推（10 种 FilterOp + AND + 单/多列排序 + limit/offset）、写侧条件写入（`upsert` + `update_where` / `delete_where` + `SqlExpr`）、标识符白名单防注入；非内存库默认开启 WAL + foreign_keys，并显式设 `PRAGMA busy_timeout`。
+  - **关系型**：`SQLiteClient` 支持连接与上下文事务、基础 SQL 通道（execute / executemany / executescript / query）、三种声明式建表 + 幂等建索引 + `migrate=True` 补列、CRUD（insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete）、读侧谓词下推（10 种 FilterOp + AND + 单/多列排序 + limit/offset + `Query.columns` 列投影）、写侧条件写入（`upsert` + `update_where` / `delete_where` + `SqlExpr`）、标识符白名单防注入；非内存库默认开启 WAL + foreign_keys，并显式设 `PRAGMA busy_timeout`。
   - **向量型**：`VectorClientBase`（12 个抽象方法，与 `DatabaseClientBase` 平行）+ `VectorFilter` 元数据过滤模型（EQ/NE/GT/…/IN/AND/OR）+ `ChromaClient` 首个向量后端（本地 `PersistentClient` / 远端 `HttpClient` 双模式，`chromadb` 走可选依赖 extras；含"少一次往返 / delete 精确计数 / dimension 真正生效 / add 自动分块 / 关匿名遥测 / 健壮性补强 / drop 仅吞不存在"等优化）。
-  - `tests/database/` 下 **4 个**测试文件、共 **156 项**，全绿基线 **155 通过 / 1 跳过**（`test_database.py` 94 + `test_database_sqlite.py` 11 + `test_database_mysql.py` 18 + `test_database_chroma.py` 31；1 项跳过为需真实 MySQL 的端到端用例，Chroma 31 项需 `fast-agents[chroma]`）；配套 **6 个**示例（含 `mysql_usage.py`）。
+  - `tests/database/` 下 **4 个**测试文件、共 **182 项**，全绿基线 **181 通过 / 1 跳过**（`test_database.py` 94 + `test_database_sqlite.py` 24 + `test_database_mysql.py` 32 + `test_database_chroma.py` 32；1 项跳过为需真实 MySQL 的端到端用例，Chroma 32 项需 `fast-agents[chroma]`）；配套 **6 个**示例（含 `mysql_usage.py`）。
 
 ### 12.2 待办（按优先级）
 
@@ -1281,7 +1286,7 @@ except DatabaseError:                  # 或统一兜底（等价于 except Valu
 ## 十三、参考
 
 - [Python `sqlite3` 标准库文档](https://docs.python.org/3/library/sqlite3.html) —— SQLite 后端的底层驱动参考；Row 工厂、事务语义、PRAGMA 说明全部来源于此。
-- [PyMySQL 文档](https://pymysql.readthedocs.io/) / [Chroma 文档](https://docs.trychroma.com/) —— MySQL 后端（`%s` 占位符、`ON DUPLICATE KEY UPDATE`、`information_schema`）与向量后端（collection / metadata where / 近邻检索）的驱动参考。
+- [PyMySQL 文档](https://pymysql.readthedocs.io/) / [Chroma 文档](https://docs.trychroma.com/) —— MySQL 后端（`%s` 占位符、`ON DUPLICATE KEY UPDATE`（含 8.0.19 行别名与 5.7 回退）、`information_schema`）与向量后端（collection / metadata where / 近邻检索）的驱动参考。
 - [PEP 249 – Python Database API Specification v2.0](https://peps.python.org/pep-0249/) —— `connect/close/cursor/execute` 命名和 Connection/Cursor 抽象的来源。
 - [SQLite 官方文档（CREATE TABLE / ALTER TABLE / CREATE INDEX / PRAGMA）](https://www.sqlite.org/lang.html) —— SQLite 方言能力边界（ADD COLUMN 限制、INTEGER PRIMARY KEY ROWID 别名、WAL 模式）的权威依据。
 - [SQLAlchemy Core – Table / Column / MetaData](https://docs.sqlalchemy.org/en/latest/core/metadata.html) —— 声明式 Schema / Column / Index 模型的设计借鉴，但刻意不引入 SQLAlchemy 依赖。
@@ -1309,7 +1314,7 @@ except DatabaseError:                  # 或统一兜底（等价于 except Valu
 - [x] API 速查按类分小节（SQLiteClient 连/DDL/CRUD/事务 + 数据模型速查），无已废弃旧 API 需迁移；
 - [x] 第十章三块齐全：设计决策 11 条（每条都是"为什么不是另一种做法"）、常见坑 17 条（每条都是"现象 + 可执行解法"）、Windows 注意事项 6 条；
 - [x] Windows 注意事项已并入 10.3（按 v2.0 模板要求不再独立成章；按 R11 只保证 Windows）；
-- [x] 测试章节列出 `tests/database/` 4 个文件 156 项覆盖点 + 关键回归断言（每条锁死一个设计承诺）+ 全绿基线（155 通过 / 1 跳过）；未单测 / 刻意不做的能力边界如实写明；
+- [x] 测试章节列出 `tests/database/` 4 个文件 182 项覆盖点 + 关键回归断言（每条锁死一个设计承诺）+ 全绿基线（181 通过 / 1 跳过）；未单测 / 刻意不做的能力边界如实写明；
 - [x] 演进路线 J2–J8 每条都说明"现状是什么、为什么现在不做"，与《演进路线图.md》的 G / J / B 系列编号一致；
 - [x] 章节数量、顺序、编号（开篇 → 一～十三 → 附录）与工具/记忆/Skill/MCP/context 五份成品文档完全一致；
 - [x] 全文无"待补充 / TBD"残留，无大段与 README 重复的安装/特性介绍（README 讲怎么用，本文讲怎么实现/怎么扩展，分工明确）；
