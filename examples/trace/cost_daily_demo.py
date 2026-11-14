@@ -22,8 +22,6 @@ from datetime import datetime, timezone, timedelta
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from fast_agents.trace import (
-    JsonlStore,
-    MEMORY_PATH,
     SpanKind,
     SpanStatus,
     TraceEvaluator,
@@ -93,7 +91,7 @@ def _fake_run(
 
 
 def main():
-    tracer = TraceLogger(store=JsonlStore(MEMORY_PATH))
+    tracer = TraceLogger()  # 默认 store=":memory:"（InMemoryTraceStore）
     CST = timezone(timedelta(hours=8))
     now = datetime.now(CST)
 

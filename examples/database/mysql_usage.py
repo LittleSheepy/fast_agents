@@ -41,9 +41,9 @@ def demo_mysql():
     # 初始化连接（数据库需要提前创建好，客户端不会自动 CREATE DATABASE）
     db = MySQLClient(
         host="127.0.0.1",
-        port=3306,
+        port=9999,
         user="root",
-        password="your_password",
+        password="123456",
         database="fast_agents_demo",
         charset="utf8mb4",
         timeout=5.0,
@@ -150,7 +150,7 @@ def _run_demo(db):
 
 if __name__ == "__main__":
     # 默认只跑 SQLite demo（无需外部依赖）
-    demo_sqlite()
+    # demo_sqlite()
 
     # 有 MySQL 环境时取消注释跑 MySQL demo
     demo_mysql()

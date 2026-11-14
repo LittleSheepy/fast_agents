@@ -94,7 +94,7 @@ def main() -> None:
     print(f"trace 将落盘到：{db_path}")
     print("-" * 60)
 
-    tracer = TraceLogger(path=db_path, session_id="demo_session")
+    tracer = TraceLogger(store=db_path, session_id="demo_session")
 
     # ---- 模拟三次运行 ----
     # 运行 1：成功，2 次 LLM + 1 次 search 工具

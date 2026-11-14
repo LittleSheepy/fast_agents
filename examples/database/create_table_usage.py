@@ -27,7 +27,8 @@ from fast_agents.database import (
 
 
 def main() -> None:
-    db = SQLiteClient("../../tmp/sql/sql.db")
+    # ":memory:"     "../../tmp/sql/sql.db"
+    db = SQLiteClient()
 
     # ---------- 方式 1：dict，一行建表 ----------
     db.ensure_table(

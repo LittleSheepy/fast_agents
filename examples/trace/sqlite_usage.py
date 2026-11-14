@@ -2,7 +2,7 @@
 
 演示：
   1. 用 SQLiteStore 落 SQLite 文件（自动建表建索引、WAL 并发写友好）；
-  2. 两种接入方式：显式 ``store=SQLiteStore(path)``、或 ``TraceLogger(backend="sqlite")`` 一行切换；
+  2. 两种接入方式：显式 ``store=SQLiteStore(path)``、或 ``TraceLogger(store="xxx.db")`` 按后缀一行切换；
   3. 按 trace_id / session_id / kind 谓词下推过滤（比 jsonl 逐行扫描快）；
   4. iter_records() 流式遍历、replay() 回放整条链路；
   5. 关掉再打开同一文件，历史 span 仍在（跨进程回放）；
@@ -106,9 +106,9 @@ def main() -> None:
     print(f"[8] 重新打开后读到 {store2.count()} 条历史 Span")
     store2.close()
 
-    # ---------- 8. 方式二：backend='sqlite' 一行切换 ----------
-    t2 = TraceLogger(backend="sqlite")
-    print(f"[9] TraceLogger(backend='sqlite') 的 store 类型: {type(t2.store).__name__}")
+    # ---------- 8. 方式二：按后缀自动识别（.db → SQLiteStore）一行切换 ----------
+    t2 = TraceLogger(store=str(db_dir / "demo_auto.db"))
+    print(f"[9] TraceLogger(store='...demo_auto.db') 的 store 类型: {type(t2.store).__name__}")
     t2.close()
 
     print("\n[10] 你可以直接用 SQLite 客户端查看原始表：")

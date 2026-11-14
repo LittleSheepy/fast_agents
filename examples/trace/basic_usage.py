@@ -33,7 +33,7 @@ def do_compute(x: int) -> int:
 
 def main() -> None:
     # ---------- 1. 默认内存模式（不落盘，适合调试 / 测试） ----------
-    tracer = TraceLogger()  # 默认 path=":memory:"
+    tracer = TraceLogger()  # 默认 store=":memory:"（纯内存 InMemoryTraceStore）
     print("[1] session_id:", tracer.session_id)
 
     # ---------- 2. with trace / with span 打点 ----------

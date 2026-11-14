@@ -46,7 +46,7 @@ def main() -> None:
     if Path(trace_path).exists():
         Path(trace_path).unlink()
 
-    tracer = TraceLogger(path=trace_path)
+    tracer = TraceLogger(store=trace_path)
     print(f"[1] trace 落盘路径: {trace_path}")
 
     # ---------- 2. 接入工具注册表（一行搞定） ----------
@@ -83,7 +83,7 @@ def main() -> None:
     print(f"[4] 文件已落盘，大小 {file_size} 字节")
 
     # ---------- 5. 重新打开同一文件做「回放」（模拟新进程） ----------
-    tracer2 = TraceLogger(path=trace_path)  # 默认 append=True，会把历史读入内存
+    tracer2 = TraceLogger(store=trace_path)  # 默认 append=True
     all_spans = tracer2.read_spans()
     print(f"[5] 重新打开后读到 {len(all_spans)} 条历史 Span")
 
