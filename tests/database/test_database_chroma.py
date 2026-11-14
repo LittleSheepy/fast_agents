@@ -647,6 +647,49 @@ def test_chroma_add_reports_all_duplicated_ids_sorted():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_chroma_delete_empty_where_dict_rejected_like_none():
+    """回归（bug：where={} 绕过空条件拦截）：where 传空 dict 必须与 None 同口径拦截。
+
+    delete 的空条件校验发生在访问集合之前，故用 __new__ 构造未初始化实例 + 假集合即可，
+    无需真实 chromadb；假集合用于证明「校验先于任何集合访问」。
+    """
+    from fast_agents.database.chroma_client import ChromaClient
+
+    class _FakeCol:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, **kw):
+            self.calls.append(("get", kw))
+            return {"ids": []}
+
+        def delete(self, **kw):
+            self.calls.append(("delete", kw))
+            return None
+
+    db = ChromaClient.__new__(ChromaClient)
+    fake = _FakeCol()
+    db._get_collection = lambda name: fake
+
+    # 三种「空条件」都必须拦截
+    with raises(ValueError):
+        db.delete("mem_v1")
+    with raises(ValueError):
+        db.delete("mem_v1", where={})
+    with raises(ValueError):
+        db.delete("mem_v1", ids=[], where={})
+    # 校验先于集合访问：假集合一次都不该被触达
+    assert fake.calls == [], f"空条件校验应先于集合访问，实际触达：{fake.calls}"
+
+    # 非空 where 仍放行（语义未被误伤）：走到假集合
+    removed = db.delete("mem_v1", where={"kind": {"$eq": "fact"}})
+    assert removed == 0
+    assert fake.calls == [
+        ("get", {"where": {"kind": {"$eq": "fact"}}, "include": []}),
+        ("delete", {"where": {"kind": {"$eq": "fact"}}}),
+    ]
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -664,7 +707,7 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
-    pass
+    test_chroma_delete_empty_where_dict_rejected_like_none()  # AI新加的测试
 
 
 if __name__ == "__main__":

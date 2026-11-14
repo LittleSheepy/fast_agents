@@ -5,6 +5,7 @@
 - 可选依赖降级：未装 pymysql 时给出明确安装提示（不影响 SQLite / Chroma 等其他后端导入）；
 - MySQL 方言：标识符反引号 / 占位符 %s / 类型映射（BOOLEAN→TINYINT(1)、TIMESTAMP→DATETIME…）/
   声明式建表 SQL 生成 / Query 谓词编译；
+- executescript 的多语句切分：只认「语句正文」里的分号，字符串 / 反引号 / 注释内的分号不误切；
 - SqlExpr 跨后端共用一个类（上层从 SQLite 切到 MySQL 时 SqlExpr 无需换类）；
 - 真实 MySQL 端到端 CRUD（默认 skip，设置 FAST_AGENTS_TEST_MYSQL_URL 后才跑）。
 
@@ -25,6 +26,8 @@ from fast_agents.database import (
     ColumnType,
     DatabaseClientBase,
     DatabaseDriverMissingError,
+    DatabaseIdentifierError,
+    DatabaseValidationError,
     Filter,
     FilterOp,
     Index,
@@ -95,8 +98,8 @@ def test_constructor_without_pymysql_raises_install_hint(monkeypatch):
 
 # ---------- MySQL 方言适配（离线，不需要真实连接） ----------
 def test_quote_ident_uses_backtick():
-    assert _mc._quote_ident_mysql("name") == "`name`"
-    assert _mc._quote_ident_mysql("na`me") == "`na``me`"
+    assert _mc.quote_ident("name") == "`name`"
+    assert _mc.quote_ident("na`me") == "`na``me`"
 
 
 def test_type_mapping_covers_every_column_type():
@@ -105,26 +108,26 @@ def test_type_mapping_covers_every_column_type():
 
 
 def test_column_sql_mysql_dialect():
-    id_sql = _mc._column_sql_mysql(Column(name="id", type=ColumnType.INTEGER, primary_key=True))
+    id_sql = _mc.column_sql(Column(name="id", type=ColumnType.INTEGER, primary_key=True), **_mc._MYSQL_COLUMN_KW)
     assert "INT" in id_sql
     assert "PRIMARY KEY" in id_sql
     assert "AUTO_INCREMENT" in id_sql  # MySQL 主键自增
 
-    name_sql = _mc._column_sql_mysql(Column(name="name", type=ColumnType.VARCHAR, nullable=False, length=100))
+    name_sql = _mc.column_sql(Column(name="name", type=ColumnType.VARCHAR, nullable=False, length=100), **_mc._MYSQL_COLUMN_KW)
     assert "VARCHAR(100)" in name_sql
     assert "NOT NULL" in name_sql
 
-    flag_sql = _mc._column_sql_mysql(Column(name="is_active", type=ColumnType.BOOLEAN, default=True))
+    flag_sql = _mc.column_sql(Column(name="is_active", type=ColumnType.BOOLEAN, default=True), **_mc._MYSQL_COLUMN_KW)
     assert "TINYINT(1)" in flag_sql
     assert "DEFAULT 1" in flag_sql
 
-    ts_sql = _mc._column_sql_mysql(Column(name="created_at", type=ColumnType.TIMESTAMP, nullable=False))
+    ts_sql = _mc.column_sql(Column(name="created_at", type=ColumnType.TIMESTAMP, nullable=False), **_mc._MYSQL_COLUMN_KW)
     assert "DATETIME" in ts_sql  # TIMESTAMP 映射为 DATETIME，与 SQLite 行为对齐
 
 
 def test_parse_schema_mysql_generates_ddl():
     """声明式 Schema → MySQL 列定义 + CREATE INDEX（列级 index=True 与显式 Index 都要出）。"""
-    col_defs, index_stmts = _mc._parse_schema_mysql(Schema(
+    col_defs, index_stmts = _mc.parse_schema(Schema(
         table_name="orders",
         columns=[
             Column(name="id", type=ColumnType.INTEGER, primary_key=True),
@@ -133,11 +136,12 @@ def test_parse_schema_mysql_generates_ddl():
         indexes=[
             Index(name="idx_orders_user_time", columns=["user_id", "created_at"]),
         ],
-    ))
+    ), **_mc._MYSQL_COLUMN_KW)
     assert any("`id` INT" in d and "AUTO_INCREMENT" in d for d in col_defs)
     assert any("idx_orders_user_id" in s for s in index_stmts)   # 列级 index=True
     assert any("idx_orders_user_time" in s for s in index_stmts)  # 显式复合索引
     assert all("CREATE" in s.upper() and "INDEX" in s.upper() for s in index_stmts)
+    assert not any("IF NOT EXISTS" in s for s in index_stmts)  # MySQL 不支持 CREATE INDEX IF NOT EXISTS
 
 
 def test_query_compile_uses_percent_placeholder():
@@ -256,19 +260,29 @@ def _install_fake_pymysql(monkeypatch):
     - state["execute_error"]：设置后 cursor.execute() 抛该异常（模拟 SQL 执行失败）
     - state["ping_error"]：设置后 conn.ping() 抛该异常（模拟网络抖动/断开）
     - state["ping_called"]：记录 ping 的调用次数，用于断言事务中不 ping
+    - state["server_version"]：conn.get_server_info() 的返回值（默认 "8.0.36"），用于测 upsert 行别名分支
+    - state["executed_sql"]：记录 cursor.execute() 收到的 SQL 文本，用于断言生成的方言 SQL
     """
     import types
 
     class MySQLError(Exception):
         pass
 
-    state = {"connect_error": None, "execute_error": None, "ping_error": None, "ping_called": 0}
+    state = {
+        "connect_error": None,
+        "execute_error": None,
+        "ping_error": None,
+        "ping_called": 0,
+        "server_version": "8.0.36",
+        "executed_sql": [],
+    }
 
     class _FakeCursor:
         lastrowid = 1
         rowcount = 1
 
         def execute(self, sql, params=None):
+            state["executed_sql"].append(sql)
             if state["execute_error"] is not None:
                 raise state["execute_error"]
 
@@ -306,6 +320,9 @@ def _install_fake_pymysql(monkeypatch):
             if state["ping_error"] is not None:
                 raise state["ping_error"]
             return None
+
+        def get_server_info(self):
+            return state["server_version"]
 
     fake = types.ModuleType("pymysql")
     fake.MySQLError = MySQLError
@@ -442,7 +459,214 @@ def test_mysql_conn_ping_error_outside_transaction_reconnects(monkeypatch):
     db.close()
 
 
+# ---------- upsert 语法自适应：MySQL 8.0.19+ 行别名 / 5.7 & MariaDB 回退 VALUES() ----------
+def test_server_supports_row_alias_version_matrix():
+    """_server_supports_row_alias 版本判定矩阵：8.0.19 为分界，MariaDB / 无版本信息一律 False。"""
+    class _C:
+        def __init__(self, info):
+            self._info = info
+
+        def get_server_info(self):
+            return self._info
+
+    assert _mc._server_supports_row_alias(_C("8.0.19")) is True
+    assert _mc._server_supports_row_alias(_C("8.0.36")) is True
+    assert _mc._server_supports_row_alias(_C("8.4.0")) is True
+    assert _mc._server_supports_row_alias(_C("8.0.36-0ubuntu0.22.04.1")) is True
+    assert _mc._server_supports_row_alias(_C("8.0.18")) is False
+    assert _mc._server_supports_row_alias(_C("5.7.44")) is False
+    assert _mc._server_supports_row_alias(_C("5.6.51-log")) is False
+    assert _mc._server_supports_row_alias(_C("10.6.12-MariaDB")) is False
+    assert _mc._server_supports_row_alias(_C("")) is False
+    assert _mc._server_supports_row_alias(_C("unknown")) is False
+    assert _mc._server_supports_row_alias(object()) is False  # 连接对象没有 get_server_info
+
+
+def test_mysql_upsert_row_alias_sql_shape(monkeypatch):
+    """MySQL 8 生成的 upsert SQL 形如 ... VALUES (%s, %s) AS new ON DUPLICATE KEY UPDATE `v` = new.`v`。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    state["server_version"] = "8.0.36"
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    db.upsert("kv", {"k": "a", "v": "1"}, conflict_keys="k")
+    sql = state["executed_sql"][-1]
+    assert " AS new ON DUPLICATE KEY UPDATE" in sql, sql
+    assert "`v` = new.`v`" in sql, sql
+    assert "VALUES(`v`)" not in sql, sql
+    db.close()
+
+
+def test_mysql_upsert_falls_back_to_values_on_mysql57(monkeypatch):
+    """MySQL 5.7：行别名语法不可用，回退到 VALUES(col)，保证 5.7 兼容。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    state["server_version"] = "5.7.44"
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    db.upsert("kv", {"k": "a", "v": "1"}, conflict_keys="k")
+    sql = state["executed_sql"][-1]
+    assert " AS new" not in sql, sql
+    assert "VALUES(`v`)" in sql, sql
+    db.close()
+
+
+def test_mysql_upsert_falls_back_to_values_on_mariadb(monkeypatch):
+    """MariaDB 各版本都不支持行别名：即使版本号是 10.x 也要回退 VALUES(col)。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    state["server_version"] = "10.6.12-MariaDB-1:10.6.12+maria~ubu2004"
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    db.upsert("kv", {"k": "a", "v": "1"}, conflict_keys="k")
+    sql = state["executed_sql"][-1]
+    assert " AS new" not in sql, sql
+    assert "VALUES(`v`)" in sql, sql
+    db.close()
+
+
+def test_mysql_upsert_row_alias_probe_is_cached(monkeypatch):
+    """行别名支持标记惰性探测一次后缓存：多次 upsert 不重复取服务端版本。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    state["server_version"] = "8.0.36"
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    calls = {"n": 0}
+    real = db._conn.get_server_info
+
+    def _counting():
+        calls["n"] += 1
+        return real()
+
+    db._conn.get_server_info = _counting
+    db.upsert("kv", {"k": "a", "v": "1"}, conflict_keys="k")
+    db.upsert("kv", {"k": "a", "v": "2"}, conflict_keys="k")
+    assert calls["n"] == 1, f"版本探测应只发生一次，实际 {calls['n']}"
+    db.close()
+
+
+def test_mysql_upsert_empty_update_columns_has_no_row_alias(monkeypatch):
+    """update_columns=[]（冲突忽略）分支不引用新值，SQL 里不应出现 AS new。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    state["server_version"] = "8.0.36"
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    db.upsert("kv", {"k": "a", "v": "1"}, conflict_keys="k", update_columns=[])
+    sql = state["executed_sql"][-1]
+    assert " AS new" not in sql, sql
+    assert "ON DUPLICATE KEY UPDATE `k` = `k`" in sql, sql
+    db.close()
+
+
+def test_split_sql_statements_ignores_semicolons_in_literals_and_comments():
+    """executescript 的切分只认「语句正文」里的分号：字符串 / 反引号 / 注释内的分号不切。"""
+    split = _mc._split_sql_statements
+    assert split("SELECT 1; SELECT 2") == ["SELECT 1", "SELECT 2"]
+    assert split("INSERT INTO t VALUES ('a;b'); SELECT 1") == ["INSERT INTO t VALUES ('a;b')", "SELECT 1"]
+    assert split("SELECT 'it''s; fine'; SELECT 2") == ["SELECT 'it''s; fine'", "SELECT 2"]
+    assert split("SELECT 'a\\';b'; SELECT 2") == ["SELECT 'a\\';b'", "SELECT 2"]
+    assert split('SELECT "a;b"; SELECT 2') == ['SELECT "a;b"', "SELECT 2"]
+    assert split("CREATE TABLE `a;b` (id INT); SELECT 1") == ["CREATE TABLE `a;b` (id INT)", "SELECT 1"]
+    assert split("SELECT 1; -- a; b\nSELECT 2") == ["SELECT 1", "-- a; b\nSELECT 2"]
+    assert split("SELECT 1; /* a; b */ SELECT 2") == ["SELECT 1", "/* a; b */ SELECT 2"]
+    assert split("SELECT 1;; ; SELECT 2") == ["SELECT 1", "SELECT 2"]
+    assert split("SELECT 1;") == ["SELECT 1"]
+    assert split("SELECT 1--2; SELECT 2") == ["SELECT 1--2", "SELECT 2"]
+
+
+def test_mysql_executescript_splits_on_statement_semicolons(monkeypatch):
+    """executescript 用状态机切分：含分号的字符串字面量只算一条，最终逐条 execute。"""
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+    db.executescript("INSERT INTO t VALUES ('a;b'); UPDATE t SET v = 1")
+    assert state["executed_sql"] == ["INSERT INTO t VALUES ('a;b')", "UPDATE t SET v = 1"], state["executed_sql"]
+    db.close()
+
+
 # ==================== 入口 ====================
+
+def test_mysql_query_columns_projects_specified_columns():
+    """MySQL 方言同样按 Query.columns 投影：反引号包裹、逐列白名单；默认仍为 SELECT *。"""
+    sql, params = MySQLClient._compile_query(Query(table_name="t", columns=["v", "k"]))
+    assert sql == "SELECT `v`, `k` FROM `t`", f"投影 SQL 错误: {sql}"
+    assert params == []
+
+    sql2, _ = MySQLClient._compile_query(Query(table_name="t"))
+    assert sql2 == "SELECT * FROM `t`", f"默认应保持 SELECT *，实际: {sql2}"
+
+    with raises(DatabaseIdentifierError):
+        MySQLClient._compile_query(Query(table_name="t", columns=["v; DROP TABLE t"]))
+    with raises(DatabaseValidationError):
+        MySQLClient._compile_query(Query(table_name="t", columns=[]))
+
+
+def test_mysql_select_negative_limit_raises_validation_error(monkeypatch):
+    """MySQL 侧 select(limit=负数) 也必须抛 DatabaseValidationError，不生成非法 SQL。
+
+    修复前 MySQL 会拼出 `LIMIT -1`（服务端语法错误），且与 _compile_query 口径不一致；
+    修复后两后端同口径：负数在拼接前就拦下，不产生任何待执行 SQL。
+    """
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+
+    with raises(DatabaseValidationError, match="limit 不能为负数"):
+        db.select("t", limit=-1)
+    # 被拦下时不应留下任何已执行的 SQL
+    assert state["executed_sql"] == [], f"负数 limit 不应生成/执行 SQL: {state['executed_sql']}"
+
+    # 正数仍然生成合法 SQL：LIMIT N
+    db.select("t", limit=3)
+    assert state["executed_sql"][-1].endswith("LIMIT 3"), state["executed_sql"][-1]
+    db.close()
+
+
+def test_mysql_insert_data_keys_are_ident_checked(monkeypatch):
+    """回归：MySQL insert 的 data 键必须走标识符白名单（与 SQLite / update 统一）。
+
+    修复前 MySQL insert 只做 _quote_ident_mysql 转义、不过白名单，非法列名靠服务端兜底
+    （反引号转义后不构成注入，但与「标识符一律走 check_ident」的约定不符）；修复后与
+    SQLite 端同口径：非法列名在拼接前抛 DatabaseIdentifierError、不产生任何待执行 SQL。
+    """
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+
+    with raises(DatabaseIdentifierError):
+        db.insert("t_ik", {"id": 1, "v; DROP": 2})
+    with raises(DatabaseIdentifierError):
+        db.insert("t_ik", {"1bad": 1})
+    # 校验先于执行：非法列名不应生成 / 执行任何 SQL
+    assert state["executed_sql"] == [], state["executed_sql"]
+
+    # 合法列名照常生成 MySQL 方言 SQL
+    db.insert("t_ik", {"id": 1, "v": 10})
+    assert state["executed_sql"][-1] == "INSERT INTO `t_ik` (`id`, `v`) VALUES (%s, %s)", state["executed_sql"][-1]
+    db.close()
+
+
+def test_mysql_create_table_empty_list_raises_validation_error(monkeypatch):
+    """回归：MySQL create_table 的 list[Column] 空列表也必须走校验层，与 SQLite 对称。
+
+    修复前 MySQL 的 list 分支同样无校验，[] 被拼成 `CREATE TABLE t ()` 交给服务端；
+    修复后与 dict 分支对称：空列表在拼接前抛 DatabaseValidationError、不产生任何待执行 SQL。
+    """
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC, Column, ColumnType
+    db = _MC(host="127.0.0.1", database="x")
+
+    with raises(DatabaseValidationError, match="columns 不能为空"):
+        db.create_table("t_empty_list", [])
+    # 校验先于执行：空列表不应生成 / 执行任何 SQL
+    assert state["executed_sql"] == [], state["executed_sql"]
+
+    # 非空 list 照常生成 MySQL 方言建表 SQL
+    db.create_table(
+        "t_ok",
+        [Column(name="id", type=ColumnType.INTEGER, primary_key=True),
+         Column(name="name", type=ColumnType.TEXT)],
+    )
+    assert any(s.startswith("CREATE TABLE") for s in state["executed_sql"]), state["executed_sql"]
+    db.close()
+
 
 def main():
     from tests._runner import run_all
@@ -458,7 +682,16 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
-    pass
+    test_split_sql_statements_ignores_semicolons_in_literals_and_comments()
+    with monkeypatch() as _mp:
+        test_mysql_executescript_splits_on_statement_semicolons(_mp)
+    test_mysql_query_columns_projects_specified_columns()
+    with monkeypatch() as _mp:
+        test_mysql_select_negative_limit_raises_validation_error(_mp)
+    with monkeypatch() as _mp:
+        test_mysql_insert_data_keys_are_ident_checked(_mp)
+    with monkeypatch() as _mp:
+        test_mysql_create_table_empty_list_raises_validation_error(_mp)
 
 
 if __name__ == "__main__":

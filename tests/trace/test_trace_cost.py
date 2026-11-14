@@ -15,7 +15,7 @@
     - to_dict/to_json/to_text/to_csv 四种输出不抛异常，JSON 可反序列化
     - to_csv(path=) 落盘 roundtrip 成功（utf-8-sig）
     - 脏数据（metadata 非 dict / usage 字段缺失 / 无 root span）不抛异常
-    - JsonlStore 路径构造评估器后可跑日报
+    - 文件后端（jsonl/sqlite）路径构造评估器后可跑日报
     - 默认关闭：不调用 daily_cost_report 时零开销（import 不触发计算）
     - timezone_offset 切换（UTC）日期归属正确
 
@@ -41,8 +41,6 @@ from fast_agents.trace import (
     DEFAULT_PRICE_TABLE,
     CostDailyReport,
     DayCostMetrics,
-    JsonlStore,
-    MEMORY_PATH,
     SpanKind,
     SpanRecord,
     SpanStatus,
@@ -97,7 +95,7 @@ def _write_spans(tracer: TraceLogger, spans: List[SpanRecord]):
 
 # ==================== Fixture ====================
 def fresh_tracer():
-    t = TraceLogger(store=JsonlStore(MEMORY_PATH))
+    t = TraceLogger()
     yield t
 
 
@@ -207,6 +205,45 @@ def test_unknown_model_falls_back_to_default(fresh_tracer):
     expected_out = 2_000_000 * d_out / 1_000_000
     assert abs(rep.total_input_cost_usd - expected_in) < 1e-6
     assert abs(rep.total_output_cost_usd - expected_out) < 1e-6
+
+
+# ==================== Bug4 回归：未登记新模型不得误命中前缀老模型 ====================
+def test_unregistered_new_model_not_matched_to_prefix_old(fresh_tracer):
+    """Bug4 回归：gpt-4.1 未登记，不得被误判成 gpt-4(30/60)，应走 DEFAULT_PRICE 兜底。"""
+    now = time.time() - 600
+    root_id = _new_id()
+    spans = [
+        _make_span("t1", None, "agent.run", SpanKind.AGENT, start_ts=now, duration_ms=500),
+        _make_span("t1", root_id, "llm.call", SpanKind.LLM, start_ts=now + 0.01, duration_ms=300,
+                   metadata={"model": "gpt-4.1",
+                             "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}}),
+    ]
+    spans[0].span_id = root_id
+    _write_spans(fresh_tracer, spans)
+
+    rep = TraceEvaluator(fresh_tracer).daily_cost_report()
+    d_in, d_out = DEFAULT_PRICE
+    assert abs(rep.total_input_cost_usd - d_in) < 1e-6, (
+        f"gpt-4.1 应走兜底 {d_in}，实际 {rep.total_input_cost_usd}（疑似误命中 gpt-4 前缀）")
+    assert abs(rep.total_output_cost_usd - d_out) < 1e-6
+
+
+def test_registered_model_with_version_suffix_still_matches(fresh_tracer):
+    """已登记模型带「-日期」后缀仍命中族价目（gpt-4o-2024-08-06 → gpt-4o 2.5/10）。"""
+    now = time.time() - 600
+    root_id = _new_id()
+    spans = [
+        _make_span("t1", None, "agent.run", SpanKind.AGENT, start_ts=now, duration_ms=500),
+        _make_span("t1", root_id, "llm.call", SpanKind.LLM, start_ts=now + 0.01, duration_ms=300,
+                   metadata={"model": "gpt-4o-2024-08-06",
+                             "usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0}}),
+    ]
+    spans[0].span_id = root_id
+    _write_spans(fresh_tracer, spans)
+
+    rep = TraceEvaluator(fresh_tracer).daily_cost_report()
+    assert abs(rep.total_input_cost_usd - 2.5) < 1e-6, (
+        f"gpt-4o-2024-08-06 应命中 gpt-4o(2.5)，实际 {rep.total_input_cost_usd}")
 
 
 # ==================== 跨天聚合 ====================
@@ -413,7 +450,7 @@ def test_dirty_data_does_not_crash():
     s4.duration_ms = None
     s4.end_time = None
     spans = [s1, s2, s3, s4]
-    _write_spans_tmp = TraceLogger(store=JsonlStore(MEMORY_PATH))
+    _write_spans_tmp = TraceLogger()
     for s in spans:
         _write_spans_tmp.store.write(s)
 
@@ -427,7 +464,7 @@ def test_dirty_data_does_not_crash():
 # ==================== Jsonl 文件路径 from_path ====================
 def test_from_path_jsonl_roundtrip(tmp_path):
     path = str(tmp_path / "cost.jsonl")
-    tracer = TraceLogger(path=path)
+    tracer = TraceLogger(store=path)
     now = time.time() - 30
     rid = _new_id()
     spans = [
@@ -552,6 +589,44 @@ def test_timezone_utc_offset(fresh_tracer):
     assert rep_utc.days[0].date == "2026-11-10"
 
 
+# ==================== 代表 root 选择（序号键不能与时间戳混量级） ====================
+def test_daily_cost_representative_root_seq_not_mixed_with_timestamp(fresh_tracer):
+    """同一条 trace 有两个 root，其中一个来自读回的老数据（无序号 _create_seq=0）。
+    选代表 root 的排序键若写成 `_create_seq or start_time`，会把序号 0 换成时间戳
+    （约 1.7e9），与其它 root 的整数序号混在同一比较里，导致选错代表 root，
+    成本被归到错误的自然日。修复后应与其它四处一致，用 (序号, start_time) 元组键。"""
+    import datetime
+    cst = datetime.timezone(datetime.timedelta(hours=8))
+
+    def _ts(y, m, d, h):
+        return datetime.datetime(y, m, d, h, 0, 0, tzinfo=cst).timestamp()
+
+    ts_old = _ts(2026, 11, 9, 12)     # 老数据：无序号 → 应作为序号最小的代表 root
+    ts_new = _ts(2026, 11, 10, 12)    # 新数据：有序号
+
+    rid_old, rid_new, tid = _new_id(), _new_id(), "t_multi_root_scale"
+
+    old_root = _make_span(tid, None, "agent.run.old", SpanKind.AGENT, start_ts=ts_old, duration_ms=100)
+    old_root.span_id = rid_old
+    old_root._create_seq = 0          # 读回老数据：注入序号为 0
+    new_root = _make_span(tid, None, "agent.run.new", SpanKind.AGENT, start_ts=ts_new, duration_ms=100)
+    new_root.span_id = rid_new
+    new_root._create_seq = 5          # 新数据：进程内分配的正序号
+    llm = _make_span(tid, rid_old, "llm.call", SpanKind.LLM, start_ts=ts_old + 0.05, duration_ms=50,
+                     metadata={"model": "gpt-4o-mini",
+                               "usage": {"prompt_tokens": 1000, "completion_tokens": 0}})
+    for s in (old_root, new_root, llm):
+        fresh_tracer.store.write(s)
+
+    ev = TraceEvaluator(fresh_tracer)
+    rep = ev.daily_cost_report()
+    assert len(rep.days) == 1
+    # 序号最小的 root 是 seq=0 的老数据，应归到它的日期（11-09），
+    # 而不是被时间戳量级顶到后面的 11-10
+    assert rep.days[0].date == "2026-11-09", (
+        f"代表 root 选错：应归 2026-11-09，实际 {rep.days[0].date}")
+
+
 # ==================== DEFAULT_PRICE_TABLE 覆盖性 ====================
 def test_default_price_table_covers_common_models():
     # 至少覆盖几个代表性模型前缀
@@ -570,11 +645,12 @@ def main():
 
 
 def _mem_tracer():
-    return TraceLogger(store=JsonlStore(MEMORY_PATH))
+    return TraceLogger()
 
 
 def main_of_new_add():
     """新添加的测试在这里跑"""
+    # 人工添加测针对测试：AI不要删除覆盖
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
@@ -582,6 +658,8 @@ def main_of_new_add():
     test_single_day_single_trace_cost(_mem_tracer())
     test_longest_prefix_matching(_mem_tracer())
     test_unknown_model_falls_back_to_default(_mem_tracer())
+    test_unregistered_new_model_not_matched_to_prefix_old(_mem_tracer())
+    test_registered_model_with_version_suffix_still_matches(_mem_tracer())
     test_multi_day_grouping(_mem_tracer())
     test_date_range_filter(_mem_tracer())
     test_session_filter(_mem_tracer())
@@ -591,6 +669,7 @@ def main_of_new_add():
     test_to_json_roundtrip(_mem_tracer())
     test_to_text_contains_key_sections(_mem_tracer())
     test_timezone_utc_offset(_mem_tracer())
+    test_daily_cost_representative_root_seq_not_mixed_with_timestamp(_mem_tracer())
     test_default_price_table_covers_common_models()
     # tmp_path 相关
     import tests._runner as _r

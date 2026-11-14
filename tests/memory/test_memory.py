@@ -1,5 +1,5 @@
 """记忆模块测试：不依赖真实 LLM，用假 LLM 验证记忆闭环
-
+fast_agents/tests/memory/test_memory.py
 覆盖：
 1. 短期窗口是否按 max_messages 滑动
 2. 滚动摘要是否被写入
@@ -645,92 +645,14 @@ def test_manager_compact_and_retrieve_touch():
     print("✅ test_manager_compact_and_retrieve_touch 通过（B5 维护入口）")
 
 
-# ===================== ChromaMemoryStore 阶段 1 测试 =====================
-# 阶段 1：不引 chromadb、不传真实客户端，验证 ①纯词法降级②代理记账③Manager 集成。
+# ===================== 共享假 LLM（Chroma 专项测试见 test_memory_chroma_store.py） =====================
 
 class _FakeLLMNoEmbedding:
-    """假 LLM：embedding 永远失败，逼 ChromaMemoryStore 走纯词法降级"""
+    """假 LLM：embedding 永远失败，逼包装器走纯词法降级（词法兜底 / Chroma 降级共用）"""
     embedding_model = "fake-none"
 
     def embed_query(self, q):           return None
     def embed_documents(self, texts):   return None
-
-
-def test_chroma_store_pure_lexical_degrade():
-    """chroma_client=None + 假 LLM（embedding 失败）→ 仍可正常 CRUD + 检索，不抛异常"""
-    with tempfile.TemporaryDirectory() as d:
-        inner = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1")
-        store = ChromaMemoryStore(inner, _FakeLLMNoEmbedding())  # chroma_client=None
-
-        r1 = store.add(MemoryRecord(content="Python 是解释型语言", kind="fact", importance=0.7))
-        r2 = store.add(MemoryRecord(content="Java 是编译型语言", kind="fact", importance=0.6))
-        assert store.get(r1.memory_id) is not None
-        assert store.get(r2.memory_id) is not None
-
-        # search 纯词法可召回（含 query 关键字的那条）
-        hits = store.search("Python", limit=2)
-        assert any(h.memory_id == r1.memory_id for h in hits), "纯词法降级应能召回含关键词的记忆"
-
-        # delete/clear 不抛异常
-        assert store.delete(r1.memory_id) is True
-        assert store.get(r1.memory_id) is None
-        store.clear()
-        assert store.all() == []
-        store.close()
-        inner.close()
-    print("✅ test_chroma_store_pure_lexical_degrade 通过（Chroma 纯词法降级 CRUD/search）")
-
-
-def test_chroma_store_b5_proxy_methods():
-    """B5 的 touch / revise / retract / archive_stale / merge_similar 都能正确代理 inner"""
-    with tempfile.TemporaryDirectory() as d:
-        inner = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1")
-        store = ChromaMemoryStore(inner, _FakeLLMNoEmbedding())
-        r = store.add(MemoryRecord(content="我喜欢吃苹果", kind="preference", importance=0.9))
-
-        # touch 能记账（不抛、不刷 updated_at）
-        assert store.touch([r.memory_id]) == 1
-        assert store.get(r.memory_id).access_count == 1
-
-        # revise 能修订（content 改了、向量重算降级不抛）
-        revised = store.revise(r.memory_id, "我喜欢吃香蕉", source="test")
-        assert revised is not None and revised.content == "我喜欢吃香蕉"
-
-        # archive_stale 正常代理（新写入的记忆不会被归档）
-        archived = store.archive_stale(stale_days=90, max_importance=0.3)
-        assert isinstance(archived, list) and len(archived) == 0
-
-        # merge_similar 正常代理（批量向量拿不到就降级纯词法，不抛）
-        merged = store.merge_similar(threshold=0.99)
-        assert isinstance(merged, list)
-
-        # retract 能撤回（同步不抛）——撤回后 active 列表里不应再出现该条
-        retracted = store.retract(r.memory_id)
-        assert retracted is not None
-        assert retracted.status in ("archived", "superseded", "retracted")
-        active_ids = {x.memory_id for x in store.all(include_inactive=False)}
-        assert r.memory_id not in active_ids
-        store.close()
-        inner.close()
-    print("✅ test_chroma_store_b5_proxy_methods 通过（B5 方法代理 + 降级不抛）")
-
-
-def test_chroma_store_with_manager_integration():
-    """ChromaMemoryStore 能直接插进 MemoryManager，retrieve/record/render_context 不抛"""
-    with tempfile.TemporaryDirectory() as d:
-        inner = SQLiteMemoryStore(os.path.join(d, "mem.db"), user_id="u1")
-        store = ChromaMemoryStore(inner, _FakeLLMNoEmbedding())
-        mgr = MemoryManager(llm=_FakeLLMNoEmbedding(), long_term_store=store)
-        # record 时 auto_extract 会调 embed_documents → None 降级，不抛
-        mgr.record("我叫小明", "你好小明")
-        hits = mgr.retrieve("你叫什么")
-        assert isinstance(hits, list)
-        rendered = mgr.render_context("你叫什么")
-        assert isinstance(rendered, str)
-        mgr.close()
-        store.close()
-        inner.close()
-    print("✅ test_chroma_store_with_manager_integration 通过（Manager 接入零感知）")
 
 
 def test_sqlite_upsert_full_column_overwrite():
@@ -1326,102 +1248,6 @@ def test_merge_similar_reuses_semantic_cache():
           "（合并命中本地向量缓存、零/最小重复 embed）")
 
 
-def test_v183_chroma_client_none_is_lexical_only():
-    """v1.8.3 ②：ChromaMemoryStore 在 chroma_client=None 时整类降级为纯词法直通 inner，
-    集合名归一化仍生效；语义通道关闭但不报错。"""
-    import warnings
-    with tempfile.TemporaryDirectory() as td:
-        db = os.path.join(td, "m.db")
-        inner = SQLiteMemoryStore(db, user_id="u1", session_id="s")
-        # 传入含中文/特殊符号的 collection_name，验证归一化不炸
-        llm = _CountingSemanticLLM()
-        store = ChromaMemoryStore(inner, llm, collection_name="测试/集合:名-含中文")
-        # 归一化后非法字符被替换、首尾字母数字，不以 / : 结尾；
-        # 长度够 3 时不会自动加 fa_mem_ 前缀（长度不足才加）。
-        assert "/" not in store._collection_name and ":" not in store._collection_name
-        assert re.match(r"^[a-zA-Z0-9]", store._collection_name)
-        assert re.match(r".*[a-zA-Z0-9]$", store._collection_name)
-        assert 3 <= len(store._collection_name) <= 63
-
-        # chroma_client=None → 语义通道关闭，embedding_stats 显示 available=False
-        stats = store.embedding_stats()
-        assert stats["available"] is False
-        assert stats["chroma_connected"] is False
-
-        # 词法能命中的记录正常召回
-        store.add(MemoryRecord(user_id="u1", session_id="s",
-                               content="我爱吃辣", source="t",
-                               kind="preference", importance=0.8))
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            hits = store.search("爱吃辣", limit=5)
-        assert any("辣" in h.content for h in hits), [h.content for h in hits]
-
-        store.close()
-        inner.close()
-    print("✅ test_v183_chroma_client_none_is_lexical_only 通过（chroma_client=None 纯词法降级 + 集合名归一化）")
-
-
-def test_v183_chroma_with_real_chromaclient_semantic():
-    """v1.8.3 ②b：传真实 ChromaClient 时，语义通道可用、二次 search 从 Chroma 读缓存、
-    delete 同步清向量。环境未安装 chromadb 时自动 skip。"""
-    from fast_agents.database import ChromaClient
-    from fast_agents.database.errors import DatabaseDriverMissingError
-    import warnings
-    with tempfile.TemporaryDirectory() as td:
-        db = os.path.join(td, "m.db")
-        chroma_path = os.path.join(td, "chroma")
-        inner = SQLiteMemoryStore(db, user_id="u1", session_id="s")
-        llm = _CountingSemanticLLM()
-        try:
-            chroma = ChromaClient(path=chroma_path)
-        except (DatabaseDriverMissingError, ImportError, ModuleNotFoundError):
-            print("⏭️  skip test_v183_chroma_with_real_chromaclient_semantic（未安装 chromadb）")
-            inner.close()
-            return
-        try:
-            store = ChromaMemoryStore(inner, llm, chroma_client=chroma,
-                                      collection_name="b13_test")
-            stats = store.embedding_stats()
-            assert stats["available"] is True
-            assert stats["chroma_connected"] is True
-            assert stats["dimension"] in (None, 3)
-
-            store.add(MemoryRecord(user_id="u1", session_id="s",
-                                   content="我在上海工作", source="t",
-                                   kind="fact", importance=0.7))
-            store.add(MemoryRecord(user_id="u1", session_id="s",
-                                   content="我爱吃辣", source="t",
-                                   kind="preference", importance=0.8))
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                hits = store.search("用户所在地", limit=5)
-            assert any("上海" in h.content for h in hits), [h.content for h in hits]
-
-            after_first = llm.doc_calls
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                store.search("口味偏好", limit=5)
-            assert llm.doc_calls == after_first, "Chroma 缓存未命中导致重复 embed"
-
-            stats2 = store.embedding_stats()
-            assert stats2["cached_total"] >= 2
-            assert stats2["dimension"] == 3
-
-            # delete 后 Chroma 向量也被清掉
-            r_first = store.all()[0]
-            store.delete(r_first.memory_id)
-            assert store.embedding_stats()["cached_total"] == 1
-            store.close()
-        finally:
-            try:
-                chroma.close()
-            except Exception:
-                pass
-            inner.close()
-    print("✅ test_v183_chroma_with_real_chromaclient_semantic 通过（真实 ChromaClient 语义通道 + 缓存命中）")
-
-
 def test_v183_embedding_stats_default_and_errors_export():
     """v1.8.3 ③：基类 embedding_stats 默认返回 available=False；
     errors.py 中 MemoryError / MemoryConflictError 应从 memory 包正确导出。"""
@@ -1521,52 +1347,10 @@ def test_b13_conflict_falls_back_to_lexical():
     print("✅ test_b13_conflict_falls_back_to_lexical 通过（向量不可用时回退词法 Jaccard）")
 
 
-def test_b13_chroma_find_similar_ann():
-    """B13 ④：ChromaMemoryStore.find_similar 用 ANN 近邻做冲突检测（B13 主路径）。
-    环境未安装 chromadb 时自动 skip。"""
-    from fast_agents.database import ChromaClient
-    from fast_agents.database.errors import DatabaseDriverMissingError
-    import warnings
-    with tempfile.TemporaryDirectory() as td:
-        db = os.path.join(td, "m.db")
-        chroma_path = os.path.join(td, "chroma")
-        inner = SQLiteMemoryStore(db, user_id="u1", session_id="s")
-        llm = _CountingSemanticLLM()
-        try:
-            chroma = ChromaClient(path=chroma_path)
-        except (DatabaseDriverMissingError, ImportError, ModuleNotFoundError):
-            print("⏭️  skip test_b13_chroma_find_similar_ann（未安装 chromadb）")
-            inner.close()
-            return
-        try:
-            store = ChromaMemoryStore(inner, llm, chroma_client=chroma,
-                                      collection_name="b13_conflict")
-            store.add(MemoryRecord(user_id="u1", session_id="s",
-                                   content="我在上海工作", source="t",
-                                   kind="fact", importance=0.7))
-            store.add(MemoryRecord(user_id="u1", session_id="s",
-                                   content="我爱吃辣", source="t",
-                                   kind="preference", importance=0.8))
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                hits = store.find_similar("本人居住于上海上班", limit=3, threshold=0.7)
-            assert hits, "Chroma ANN find_similar 应召回到冲突记忆"
-            top_rec, top_sim = hits[0]
-            assert "上海" in top_rec.content
-            assert top_sim >= 0.7
-            store.close()
-        finally:
-            try:
-                chroma.close()
-            except Exception:
-                pass
-            inner.close()
-    print("✅ test_b13_chroma_find_similar_ann 通过（Chroma ANN 近邻冲突检测）")
-
-
 def test_b13_bugfix_stale_vecs_cleanup_and_embed_query():
     """B13 bug 修复回归：
-    1. revise 后旧版本（superseded）向量必须被清理，不能再被 find_similar 命中；
+    1. revise 后旧版本（superseded）向量保留在向量表 / 缓存中（便于审计/回溯），
+       但必须通过 status='active' 过滤，不能再被 find_similar / search 命中；
     2. find_similar 必须调用 embed_query（查询侧）而不是 embed_documents（文档侧）。
     用 SemanticMemoryStore（语义兜底，不依赖 chromadb）即可复现。
     """
@@ -1605,18 +1389,29 @@ def test_b13_bugfix_stale_vecs_cleanup_and_embed_query():
         revised = mgr.revise(r1.memory_id, "我明天要去北京出差", source="test")
         assert revised.memory_id != r1.memory_id, "revise 应生成新 memory_id"
 
-        # 断言：修订后再用旧内容做冲突检测，不应该命中（旧版本向量已被清理）；
+        # 断言：修订后再用旧内容做冲突检测，不应该命中；
+        #      旧版本向量保留在表中（status=superseded），但通过 status='active' 过滤被排除；
         #      同时也验证 find_similar 走的是 embed_query（query_calls 增长而不是 doc_calls 单条增长）
         before_q = llm.query_calls
         before_d = llm.doc_calls
         hits = store.find_similar("我在上海做后端开发", limit=3, threshold=0.5)
-        # 旧内容不应该再被命中（旧版本已 superseded 且向量被清理）
-        assert not hits, f"B13 bug: revise 后旧版本向量未清理，仍命中了 {hits}"
+        # 旧内容不应该再被命中（旧版本 superseded，被 status 过滤排除）
+        assert not hits, f"B13 bug: revise 后旧版本仍被命中（status 过滤未生效），hits={hits}"
         # find_similar 应通过 embed_query 走查询侧（BGE/E5 等模型的正确性前提）
         assert llm.query_calls > before_q, (
             f"B13 bug: find_similar 没用 embed_query（query_calls 未增长，"
             f"before={before_q} after={llm.query_calls}）"
         )
+        # 向量本身没有被删除（审计/回溯保留）：直接查向量表能看到旧 memory_id 的行
+        from fast_agents.database import Query, Filter, FilterOp
+        row = inner._db.select_one_where(Query(
+            table_name="memory_embeddings",
+            filters=inner._scope_where([
+                Filter(field="memory_id", op=FilterOp.EQ, value=r1.memory_id),
+            ]),
+        ))
+        assert row is not None, "B13 第二步设计：stale 向量不删除，旧版本向量应仍在表中"
+        assert row["status"] == "superseded", f"旧向量 status 应为 superseded，实际 {row['status']!r}"
     finally:
         try:
             store.close()
@@ -1629,334 +1424,7 @@ def test_b13_bugfix_stale_vecs_cleanup_and_embed_query():
         import shutil
         shutil.rmtree(tmpdir, ignore_errors=True)
     print("✅ test_b13_bugfix_stale_vecs_cleanup_and_embed_query 通过"
-          "（revise 清 stale 向量 + find_similar 用 embed_query）")
-
-
-def test_b13_chroma_stale_cleanup_and_where_filter():
-    """B13 第一步【chroma_store】stale 向量不删除，靠 metadata.status + where 过滤。
-    设计原则：status 非 active 的向量保留在 Chroma 中以便审计/回溯，
-    但 search/find_similar 必须用 where={"status":"active"} 在向量库侧过滤 stale；
-    revise/retract/archive_stale/merge_similar/purge_expired 这些仅改状态的路径
-    不清向量，只同步 metadata.status。
-    覆盖：
-    1. _meta_for 给 metadata 加 status="active"；
-    2. _query_chroma（search 语义路径）与 find_similar 都带 where={"status":"active"}；
-    3. revise：新版本写新向量，老版本向量保留但 metadata.status 同步为 superseded；
-    4. retract：向量保留，metadata.status 同步为 retracted；
-    5. 语义 search 路径对 non-active 向量不命中；
-    6. find_similar 路径对 non-active 向量不命中。
-    """
-    import math
-
-    class _FakeChromaClient:
-        """最小可用的内存向量客户端（鸭子类型，对齐 VectorClientBase 签名）。"""
-        def __init__(self):
-            self.cols = {}
-
-        def get_or_create_collection(self, name, *, dimension=None, metric="cosine"):
-            self.cols.setdefault(name, {})
-
-        def drop_collection(self, name):
-            self.cols.pop(name, None)
-
-        def add(self, collection, ids, embeddings=None, documents=None, metadatas=None):
-            col = self.cols.setdefault(collection, {})
-            for i, _id in enumerate(ids):
-                # upsert 语义：已存在时只覆盖传入的非 None 字段，保留下已有向量/文档
-                existing = col.get(_id, {"embedding": None, "document": None, "metadata": None})
-                if embeddings is not None and i < len(embeddings) and embeddings[i] is not None:
-                    existing["embedding"] = list(embeddings[i])
-                if documents is not None and i < len(documents) and documents[i] is not None:
-                    existing["document"] = documents[i]
-                if metadatas is not None and i < len(metadatas) and metadatas[i] is not None:
-                    existing["metadata"] = dict(metadatas[i])
-                col[_id] = existing
-            return len(ids)
-
-        def update(self, collection, ids, embeddings=None, documents=None, metadatas=None):
-            """兼容别名：底层也是 upsert 语义。"""
-            return self.add(collection, ids, embeddings=embeddings,
-                            documents=documents, metadatas=metadatas)
-
-        def delete(self, collection, ids=None, where=None):
-            col = self.cols.get(collection, {})
-            cnt = 0
-            for _id in (ids or []):
-                if _id in col:
-                    del col[_id]
-                    cnt += 1
-            return cnt
-
-        def get(self, collection, ids=None, where=None, limit=None,
-                include_embeddings=False, include_documents=True, include_metadatas=True):
-            col = self.cols.get(collection, {})
-            out = []
-            for _id, rec in col.items():
-                if ids and _id not in ids:
-                    continue
-                d = {"id": _id}
-                if include_embeddings:
-                    d["embedding"] = rec["embedding"]
-                if include_documents:
-                    d["document"] = rec["document"]
-                if include_metadatas:
-                    d["metadata"] = rec["metadata"]
-                out.append(d)
-            return out[:limit] if limit else out
-
-        def count(self, collection, where=None):
-            return len(self.cols.get(collection, {}))
-
-        def search(self, collection, query_embedding, *, n_results=10, where=None,
-                   include_embeddings=False):
-            col = self.cols.get(collection, {})
-            scored = []
-            for _id, rec in col.items():
-                emb = rec["embedding"]
-                if emb is None:
-                    continue
-                if where:
-                    md = rec.get("metadata") or {}
-                    if any(md.get(k) != v for k, v in where.items()):
-                        continue
-                dot = sum(a * b for a, b in zip(query_embedding, emb))
-                na = math.sqrt(sum(a * a for a in query_embedding))
-                nb = math.sqrt(sum(b * b for b in emb))
-                sim = dot / (na * nb) if na and nb else 0.0
-                scored.append((_id, 1.0 - sim))
-            scored.sort(key=lambda x: x[1])
-            return [{"id": i, "distance": d} for i, d in scored[:n_results]]
-
-    class _FakeLLM:
-        """按词项类别做 3 维 one-hot-ish 向量；query/document 同分布。"""
-        embedding_model = "fake-semantic"
-
-        def _vec(self, text):
-            v = [0.0, 0.0, 0.0]
-            if any(w in text for w in ("上海", "北京", "住", "所在", "位置", "在哪", "地")):
-                v[0] = 1.0
-            if any(w in text for w in ("工作", "上班", "公司", "开发", "后端")):
-                v[1] = 1.0
-            if any(w in text for w in ("吃", "辣", "口味", "喜欢", "爱")):
-                v[2] = 1.0
-            return v
-
-        def embed_query(self, q):
-            return self._vec(q)
-
-        def embed_documents(self, texts):
-            return [self._vec(t) for t in texts]
-
-    fake = _FakeChromaClient()
-    inner = InMemoryStore()
-    store = ChromaMemoryStore(inner, _FakeLLM(), chroma_client=fake,
-                              collection_name="b13_stale")
-    cname = store._collection_name
-    r1 = store.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
-                                source="t", kind="fact", importance=0.7))
-    store.add(MemoryRecord(user_id="u1", session_id="s", content="我爱吃辣",
-                           source="t", kind="preference", importance=0.8))
-
-    # 1) metadata 带 status
-    assert fake.cols[cname][r1.memory_id]["metadata"]["status"] == "active"
-
-    # 2) find_similar 走 Chroma ANN 召回冲突
-    hits = store.find_similar("本人居住于上海上班", limit=3, threshold=0.7)
-    assert hits and "上海" in hits[0][0].content, f"未召回冲突：{hits}"
-
-    # 3) revise：新版本写入新向量，老版本保留向量但 metadata.status 同步为 superseded（不清向量）
-    old_id = r1.memory_id
-    revised = store.revise(old_id, "我明天要去北京出差", source="test")
-    # 旧版本向量保留（审计/回溯可查）——不再删除
-    assert old_id in fake.cols[cname], "revise 后旧版本向量应保留（不清向量）"
-    assert fake.cols[cname][old_id]["metadata"]["status"] == "superseded", \
-        f"revise 后旧版本 metadata.status 应同步为 superseded，实际 {fake.cols[cname][old_id]['metadata']}"
-    assert revised.memory_id in fake.cols[cname], "revise 后新版本向量应写入"
-    assert fake.cols[cname][revised.memory_id]["metadata"]["status"] == "active"
-
-    # 4) 旧内容不再被 find_similar 命中（靠 where={"status":"active"} 过滤，而不是删向量）
-    hits_after = store.find_similar("我在上海工作", limit=3, threshold=0.5)
-    assert not any(h[0].memory_id == old_id for h in hits_after), \
-        "旧版本（superseded）应被 where 过滤，不应被命中"
-
-    # 5) retract：保留向量，只同步 metadata.status=retracted，find_similar 不再命中
-    rid = revised.memory_id
-    store.retract(rid)
-    assert rid in fake.cols[cname], "retract 后向量应保留（不清向量）"
-    assert fake.cols[cname][rid]["metadata"]["status"] == "retracted", \
-        f"retract 后 metadata.status 应为 retracted，实际 {fake.cols[cname][rid]['metadata']}"
-    hits_retract = store.find_similar("北京出差", limit=3, threshold=0.0)
-    assert not any(h[0].memory_id == rid for h in hits_retract), \
-        "retracted 版本应被 where 过滤"
-
-    # 6) 语义 search 路径同样走 where 过滤：把"爱吃辣"标记 archived 后 search 不再命中
-    spicy_id = next(_id for _id, rec in fake.cols[cname].items()
-                    if rec.get("document") and "辣" in rec["document"])
-    spicy_rec = inner.get(spicy_id)
-    assert spicy_rec is not None
-    spicy_rec.status = "archived"
-    store.update(spicy_rec)  # 通过 store.update 走正规路径，会同步 metadata.status 到 Chroma
-    assert fake.cols[cname][spicy_id]["metadata"]["status"] == "archived", \
-        "update(status→archived) 应同步 metadata 到 Chroma"
-    hits_search = store.search("我爱吃辣", limit=3)
-    assert not any(r.memory_id == spicy_id for r in hits_search), \
-        "archived 记录应被 _query_chroma 的 where 过滤"
-    # 恢复 active 后应能命中
-    spicy_rec.status = "active"
-    store.update(spicy_rec)
-    hits_search2 = store.search("我爱吃辣", limit=3)
-    assert any(r.memory_id == spicy_id for r in hits_search2), \
-        "恢复 active 后应能被语义 search 命中"
-
-    store.close()
-    print("✅ test_b13_chroma_stale_cleanup_and_where_filter 通过"
-          "（stale 向量保留、metadata.status 同步、where 过滤生效）")
-
-
-def test_b13_chroma_update_content_replace_vec():
-    """B13 bugfix：update content 变化时，必须『先删旧向量 + 再加新向量』两步走，
-    不能只依赖 ChromaClient.add 底层的隐式 upsert（语义上 add 是新增，不是更新；
-    未来 add 收紧为真 add 时会抛 DuplicateIDError，或因 payload 不全导致旧字段残留）。
-    验证：
-    1. content 变化后，Chroma 里该 id 对应的 document 与 embedding 都被新内容替换，
-       不是在旧条目上只覆盖局部字段；
-    2. metadata.status 保持 active；
-    3. content 未变化（仅 metadata/status 变化）时，不触发删+加流程，走 _update_vec_metadata
-       同步 metadata，embedding 不变。
-    """
-    import math
-
-    class _CountingFakeChromaClient:
-        """记录 add/delete 调用次数与最后一次 payload，用来断言 update 的调用路径。"""
-        def __init__(self):
-            self.cols = {}
-            self.add_calls = 0
-            self.delete_calls = 0
-
-        def get_or_create_collection(self, name, *, dimension=None, metric="cosine"):
-            self.cols.setdefault(name, {})
-
-        def drop_collection(self, name):
-            self.cols.pop(name, None)
-
-        def add(self, collection, ids, embeddings=None, documents=None, metadatas=None):
-            self.add_calls += 1
-            col = self.cols.setdefault(collection, {})
-            for i, _id in enumerate(ids):
-                col[_id] = {
-                    "embedding": list(embeddings[i]) if embeddings and i < len(embeddings) and embeddings[i] is not None else None,
-                    "document": documents[i] if documents and i < len(documents) else None,
-                    "metadata": dict(metadatas[i]) if metadatas and i < len(metadatas) else None,
-                }
-            return len(ids)
-
-        def delete(self, collection, ids=None, where=None):
-            col = self.cols.get(collection, {})
-            cnt = 0
-            for _id in (ids or []):
-                if _id in col:
-                    del col[_id]
-                    self.delete_calls += 1
-                    cnt += 1
-            return cnt
-
-        def get(self, collection, ids=None, where=None, limit=None,
-                include_embeddings=False, include_documents=True, include_metadatas=True):
-            col = self.cols.get(collection, {})
-            out = []
-            for _id, rec in col.items():
-                if ids and _id not in ids:
-                    continue
-                d = {"id": _id}
-                if include_embeddings:
-                    d["embedding"] = rec["embedding"]
-                if include_documents:
-                    d["document"] = rec["document"]
-                if include_metadatas:
-                    d["metadata"] = rec["metadata"]
-                out.append(d)
-            return out[:limit] if limit else out
-
-        def count(self, collection, where=None):
-            return len(self.cols.get(collection, {}))
-
-        def search(self, collection, query_embedding, *, n_results=10, where=None,
-                   include_embeddings=False):
-            col = self.cols.get(collection, {})
-            scored = []
-            for _id, rec in col.items():
-                emb = rec["embedding"]
-                if emb is None:
-                    continue
-                if where:
-                    md = rec.get("metadata") or {}
-                    if any(md.get(k) != v for k, v in where.items()):
-                        continue
-                dot = sum(a * b for a, b in zip(query_embedding, emb))
-                na = math.sqrt(sum(a * a for a in query_embedding))
-                nb = math.sqrt(sum(b * b for b in emb))
-                sim = dot / (na * nb) if na and nb else 0.0
-                scored.append((_id, 1.0 - sim))
-            scored.sort(key=lambda x: x[1])
-            return [{"id": i, "distance": d} for i, d in scored[:n_results]]
-
-    class _TinyLLM:
-        def embed_query(self, q): return [1.0, 0.0, 0.0] if "工作" in q else [0.0, 1.0, 0.0]
-        def embed_documents(self, texts):
-            out = []
-            for t in texts:
-                out.append([1.0, 0.0, 0.0] if "工作" in t else [0.0, 1.0, 0.0])
-            return out
-
-    fake = _CountingFakeChromaClient()
-    inner = InMemoryStore()
-    store = ChromaMemoryStore(inner, _TinyLLM(), chroma_client=fake,
-                              collection_name="b13_upd")
-    cname = store._collection_name
-    r = store.add(MemoryRecord(user_id="u1", session_id="s", content="我在上海工作",
-                               source="t", kind="fact", importance=0.7))
-    old_add_calls = fake.add_calls
-    old_del_calls = fake.delete_calls
-
-    # 1) 内容变更：先 delete 再 add（两步走），document/embedding 全部被新内容替换。
-    #    说明：InMemoryStore 持有的是同一对象引用，若外部直接在 s.add 返回的 r 上改字段
-    #    再调 update(r)，update 内部 inner.get 拿到的已经是"被外部改完"的 r，content_changed
-    #    会误判。这是调用方的使用姿势问题（应该构造新记录或 copy 后改）；真实业务路径
-    #    （revise/retract/manager.remember）都不会这么做。测试里按正确用法：基于返回
-    #    的记录 id 构造一个新的 MemoryRecord 传入，与 revise 的用法一致。
-    new_r = MemoryRecord(
-        memory_id=r.memory_id, user_id=r.user_id, session_id=r.session_id,
-        content="我爱吃辣", source=r.source, kind=r.kind, importance=r.importance,
-        created_at=r.created_at,
-    )
-    store.update(new_r)
-    assert fake.delete_calls == old_del_calls + 1, \
-        f"content 变化应先 delete 旧向量，实际 delete_calls={fake.delete_calls}, 之前={old_del_calls}"
-    assert fake.add_calls == old_add_calls + 1, \
-        f"content 变化应再 add 新向量，实际 add_calls={fake.add_calls}, 之前={old_add_calls}"
-    row = fake.cols[cname][r.memory_id]
-    assert row["document"] == "我爱吃辣", f"document 应被替换为新内容，实际 {row['document']}"
-    assert row["embedding"] == [0.0, 1.0, 0.0], \
-        f"embedding 应重算为新内容的向量，实际 {row['embedding']}"
-    assert row["metadata"]["status"] == "active"
-
-    # 2) 仅 status 变更：不触发删+加，embedding 保持不变，只同步 metadata
-    old_add_calls2 = fake.add_calls
-    old_del_calls2 = fake.delete_calls
-    saved_vec = list(row["embedding"])
-    cur = inner.get(r.memory_id)
-    cur.status = "retracted"
-    store.update(cur)
-    assert fake.delete_calls == old_del_calls2, \
-        "仅 status 变化不应 delete 向量"
-    # _update_vec_metadata 会用 add（upsert）回写 metadata，但 embedding 不重算
-    assert fake.cols[cname][r.memory_id]["embedding"] == saved_vec, \
-        "仅 status 变化不应重算 embedding"
-    assert fake.cols[cname][r.memory_id]["metadata"]["status"] == "retracted"
-
-    store.close()
-    print("✅ test_b13_chroma_update_content_replace_vec 通过"
-          "（update content 走 delete-then-add 语义、仅 status 变化不重算 embedding）")
+          "（revise 不删向量、靠 status 过滤 + find_similar 用 embed_query）")
 
 
 def test_b14_semantic_vector_meta_sqlite_and_memory():
@@ -2286,6 +1754,308 @@ def test_b13_bugfix_rebuild_reuses_batch_vecs():
           "（rebuild 复用批量向量，不逐条重算）")
 
 
+def test_b13_expired_lexical_duplicate_renewed():
+    """B13 过期修复①：词法兜底路径下，命中「已过期但仍 active」的记忆时不能丢弃新内容，
+    而应续期旧条（过期 ≠ 删除；否则随后 purge_expired 会把旧条也清掉，造成新旧双丢）。"""
+    from fast_agents.utils.time_utils import cstnow
+
+    plain = InMemoryStore()
+    mgr = MemoryManager(long_term_store=plain, llm=_FakeLLMNoEmbedding(),
+                        user_id="u", session_id="s")
+    # 直接放一条「已过期但仍 active」的记忆（模拟 ttl 到期、compact 尚未跑）
+    expired = plain.add(MemoryRecord(
+        user_id="u", session_id="s", content="用户喜欢用 Python 写后端",
+        source="t", kind="preference", importance=0.8,
+        expires_at=cstnow() - timedelta(seconds=1),
+    ))
+    assert expired.is_expired() is True, "前置条件：这条应已过期"
+    assert plain.get(expired.memory_id).status == "active", "前置条件：过期不改 status，仍是 active"
+
+    # 再写一条完全相同的记忆
+    r2 = mgr.remember("用户喜欢用 Python 写后端", kind="preference", importance=0.8)
+    assert r2.memory_id == expired.memory_id, "过期重复应续期旧条，而不是新建一条"
+    assert len(plain.all()) == 1, f"库中不应新增记录，实际 {len(plain.all())}"
+    renewed = plain.get(expired.memory_id)
+    assert renewed.status == "active"
+    assert renewed.is_expired() is False, "续期后这条不应再算过期"
+
+    # 续期后 compact 不再把它当到期项清掉（新旧都不丢）
+    rep = mgr.compact()
+    assert rep["expired"] == 0, f"续期后不应再被清理，实际 {rep}"
+    assert plain.get(expired.memory_id).status == "active"
+    mgr.close()
+    plain.close()
+    print("✅ test_b13_expired_lexical_duplicate_renewed 通过（过期重复→续期旧条，不双丢）")
+
+
+def test_b13_expired_semantic_conflict_superseded():
+    """B13 过期修复②：向量路径下命中「已过期但仍 active」且内容有差异的记忆时，
+    应写入新条并让旧条 superseded 留痕（新内容生效、旧条不再占用 active 位）。"""
+    import warnings
+    from fast_agents.utils.time_utils import cstnow
+
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "m.db")
+        llm = _CountingSemanticLLM()
+        inner = SQLiteMemoryStore(db, user_id="u1", session_id="s")
+        store = SemanticMemoryStore(inner, llm)
+        mgr = MemoryManager(long_term_store=store, llm=llm, user_id="u1", session_id="s")
+        expired = store.add(MemoryRecord(
+            user_id="u1", session_id="s", content="我在上海工作",
+            source="t", kind="fact", importance=0.7,
+            expires_at=cstnow() - timedelta(seconds=1),
+        ))
+        assert store.get(expired.memory_id).status == "active"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # 语义相近、内容不同的改写 → 命中过期旧条（threshold 调低命中假向量）
+            r2 = mgr.remember("本人居住于上海上班", kind="fact", importance=0.6,
+                              conflict_threshold=0.7)
+        assert r2.memory_id != expired.memory_id, "过期且内容不同的冲突应写入新条"
+        assert r2.supersedes == expired.memory_id, "新条应指向被取代的旧条"
+        old = store.get(expired.memory_id)
+        assert old.status == "superseded", f"过期旧条应标记 superseded，实际 {old.status}"
+        assert store.get(r2.memory_id).status == "active"
+        mgr.close()
+        store.close()
+        inner.close()
+    print("✅ test_b13_expired_semantic_conflict_superseded 通过（过期+内容不同→新条取代旧条）")
+
+
+def test_b13_conflict_error_raised_on_duplicate():
+    """B13 异常接线：remember(raise_on_conflict=True) 命中有效重复时抛 MemoryConflictError，
+    不再静默写入；异常携带 new_record（未入库）与 conflicts 列表。"""
+    from fast_agents.memory import MemoryConflictError
+
+    plain = InMemoryStore()
+    mgr = MemoryManager(long_term_store=plain, llm=_FakeLLMNoEmbedding(),
+                        user_id="u", session_id="s")
+    r1 = mgr.remember("用户偏好深色主题", kind="preference", importance=0.7)
+
+    # 默认（raise_on_conflict=False）：维持静默去重、不抛异常
+    r_dup = mgr.remember("用户偏好深色主题", kind="preference", importance=0.7)
+    assert r_dup.memory_id == r1.memory_id
+    assert len(plain.all()) == 1
+
+    # 显式开启：抛 MemoryConflictError，且库中不新增
+    try:
+        mgr.remember("用户偏好深色主题", kind="preference", importance=0.7,
+                     raise_on_conflict=True)
+        raise AssertionError("命中有效重复且 raise_on_conflict=True 时应抛 MemoryConflictError")
+    except MemoryConflictError as exc:
+        assert exc.new_record.content == "用户偏好深色主题"
+        assert exc.new_record.memory_id != r1.memory_id, "new_record 应是尚未入库的预览记录"
+        assert any(rec.memory_id == r1.memory_id for rec, _ in exc.conflicts), exc.conflicts
+        assert all(ctype == "duplicate" for _, ctype in exc.conflicts)
+    assert len(plain.all()) == 1, f"抛异常时不应写入新记录，实际 {len(plain.all())}"
+    mgr.close()
+    plain.close()
+    print("✅ test_b13_conflict_error_raised_on_duplicate 通过（显式冲突抛异常、不静默写入）")
+
+
+def test_b13_check_conflict_readonly_and_expired_excluded():
+    """B13 只读接口：check_conflict 返回有效冲突列表但不写入；过期记忆不算作冲突。"""
+    from fast_agents.utils.time_utils import cstnow
+
+    plain = InMemoryStore()
+    mgr = MemoryManager(long_term_store=plain, llm=_FakeLLMNoEmbedding(),
+                        user_id="u", session_id="s")
+
+    # 无冲突：空列表
+    assert mgr.check_conflict("一句与库内毫无关系的话") == []
+
+    r1 = mgr.remember("用户的部署环境是 CentOS 7", kind="fact")
+    hits = mgr.check_conflict("用户的部署环境是 CentOS 7")
+    assert any(rec.memory_id == r1.memory_id for rec, _ in hits), hits
+    assert all(ctype == "duplicate" for _, ctype in hits)
+    assert len(plain.all()) == 1, "check_conflict 必须只读、不写入"
+
+    # 过期记忆不列为冲突（过期 ≠ 删除，由续期 / 取代消化）
+    plain.add(MemoryRecord(
+        user_id="u", session_id="s", content="本次验证码是 123456",
+        source="t", kind="episode",
+        expires_at=cstnow() - timedelta(seconds=1),
+    ))
+    assert mgr.check_conflict("本次验证码是 123456") == [], "过期记忆不应算作有效冲突"
+    mgr.close()
+    plain.close()
+    print("✅ test_b13_check_conflict_readonly_and_expired_excluded 通过（只读探测、过期不算冲突）")
+
+
+def test_v193_search_no_write_amp_on_cold_cache():
+    """v1.9.3：SemanticMemoryStore.search 在冷库下只补算词法粗排 top-N 条，不全库 embed。
+
+    - 冷库（缓存空）首次 search：只对词法粗排进 top-N（默认 20）的候选做一次小批量
+      embed 并落盘，不再像 v1.9.2 那样一次把全库所有缺失向量都补算；
+    - 第二次同 query search：所有涉及候选已有向量，零额外 embed；
+    - 大库（100+ 条）场景：首次 search 也只触发 1 次批量 embed（上限 20 条），
+      不是全库 100 条；B2 同义召回（"用户所在地"→"我在上海工作"）依然成立。
+    """
+    import random as _rnd
+
+    class _ColdCacheLLM:
+        """spy LLM：记录 embed_documents 被调用的次数和每次入参条数。"""
+        def __init__(self):
+            self.query_calls = 0
+            self.doc_batch_sizes: List[int] = []  # 每次 embed_documents 的入参条数
+            self.embedding_model = "cold-cache-mock"
+            self._rng = _rnd.Random(42)
+
+        def embed_query(self, text):
+            self.query_calls += 1
+            # 让"上海"类语义向量固定下来，保证 B2 同义召回在小库下可复现
+            if "所在地" in text:
+                return [0.9, 0.1, 0.1, 0.1]
+            return [self._rng.uniform(-1, 1) for _ in range(4)]
+
+        def embed_documents(self, texts):
+            self.doc_batch_sizes.append(len(texts))
+            result = []
+            for t in texts:
+                if "上海" in t:
+                    result.append([0.9, 0.1, 0.1, 0.1])  # 与"所在地"query 高相似
+                else:
+                    result.append([self._rng.uniform(-1, 1) for _ in range(4)])
+            return result
+
+    # ---- 场景 A：小库 5 条，验证首次只补算一次、二次零补算、同义召回命中 ----
+    llm = _ColdCacheLLM()
+    plain_a = InMemoryStore()
+    for i in range(5):
+        plain_a.add(MemoryRecord(
+            user_id="u", session_id="s",
+            content=f"第 {i} 条测试记忆内容，彼此独立不重复",
+            source="t", kind="fact",
+        ))
+    plain_a.add(MemoryRecord(
+        user_id="u", session_id="s", content="我在上海工作",
+        source="t", kind="fact", importance=0.7,
+    ))
+    sem_a = SemanticMemoryStore(plain_a, llm=llm)
+
+    batches_before = len(llm.doc_batch_sizes)
+    q_before = llm.query_calls
+    results = sem_a.search("用户所在地", limit=3)
+    q_after = llm.query_calls
+    batches_after = len(llm.doc_batch_sizes)
+
+    assert q_after - q_before == 1, f"查询本身应 embed query 1 次，实际 {q_after - q_before}"
+    # 首次 search：应触发 1 次批量补算（补词法粗排 top-N 里缺向量的候选）
+    assert batches_after - batches_before == 1, (
+        f"冷库首次 search 应触发 1 次小批量 embed（top-N 候选），实际 {batches_after - batches_before} 次"
+    )
+    # 补算条数不能超过 prefetch_top_n=20
+    first_batch = llm.doc_batch_sizes[batches_before]
+    assert first_batch <= 20, f"首次补算条数 {first_batch} 超过 prefetch_top_n=20"
+    # B2 同义召回应命中"我在上海工作"
+    assert any("上海" in r.content for r in results), (
+        f"两段式检索下 B2 同义召回应命中，实际 top3={[r.content for r in results]}"
+    )
+
+    # 第二次 search：所有涉及候选已有向量，零新增 embed
+    batches_before_2 = len(llm.doc_batch_sizes)
+    sem_a.search("用户所在地", limit=3)
+    batches_after_2 = len(llm.doc_batch_sizes)
+    assert batches_after_2 == batches_before_2, (
+        f"第二次 search 不应再触发补算（向量已缓存），新增 {batches_after_2 - batches_before_2} 次"
+    )
+
+    sem_a.close()
+    plain_a.close()
+
+    # ---- 场景 B：大库 100 条无关 + 1 条目标，验证不全库补算 ----
+    llm2 = _ColdCacheLLM()
+    plain_b = InMemoryStore()
+    for i in range(100):
+        plain_b.add(MemoryRecord(
+            user_id="u", session_id="s",
+            content=f"第 {i} 条无关测试内容，编号为 {i}",
+            source="t", kind="fact", importance=0.3,
+        ))
+    plain_b.add(MemoryRecord(
+        user_id="u", session_id="s", content="我在上海工作",
+        source="t", kind="fact", importance=0.7,
+    ))
+    sem_b = SemanticMemoryStore(plain_b, llm=llm2)
+
+    batches_before = len(llm2.doc_batch_sizes)
+    results_b = sem_b.search("用户所在地", limit=3, prefetch_top_n=20)
+    batches_after = len(llm2.doc_batch_sizes)
+
+    assert batches_after - batches_before == 1, (
+        f"大库首次 search 应只触发 1 次批量补算，实际 {batches_after - batches_before} 次"
+    )
+    first_batch_b = llm2.doc_batch_sizes[batches_before]
+    assert first_batch_b <= 20, (
+        f"v1.9.3 回归：大库首次 search 补算 {first_batch_b} 条，超过 prefetch_top_n=20（写放大）"
+    )
+    # 语义精排应把"上海"提到 top3
+    assert any("上海" in r.content for r in results_b), (
+        f"两段式检索下大库 B2 同义召回应命中，实际 top3={[r.content for r in results_b]}"
+    )
+
+    sem_b.close()
+    plain_b.close()
+    print(f"✅ test_v193_search_no_write_amp_on_cold_cache 通过"
+          f"（小库首次 batch={first_batch}、大库首次 batch={first_batch_b}，均≤20；二次零补算；B2 召回命中）")
+
+
+def test_v193_prefetch_missing_writes_vs_readonly():
+    """v1.9.3：写入路径（remember 冲突检测）会补算缺失向量；只读探测（check_conflict）不会。"""
+    import random as _rnd
+
+    class _SpyLLM:
+        def __init__(self):
+            self.query_calls = 0
+            self.doc_calls = 0
+            self.embedding_model = "spy-mock"
+            self._rng = _rnd.Random(7)
+
+        def embed_query(self, text):
+            self.query_calls += 1
+            return [self._rng.uniform(-1, 1) for _ in range(4)]
+
+        def embed_documents(self, texts):
+            self.doc_calls += 1
+            return [[self._rng.uniform(-1, 1) for _ in range(4)] for _ in texts]
+
+    llm = _SpyLLM()
+    plain = InMemoryStore()
+    # 关键：long_term 必须是 SemanticMemoryStore，find_similar 才会真的走我们加的
+    # prefetch_missing 分支；先把 SemanticMemoryStore 包上，再直接往内层塞一条
+    # （绕过 sem.add，模拟"冷库启动、记录已在库但无向量"的场景）
+    sem = SemanticMemoryStore(plain, llm=llm)
+    mgr = MemoryManager(long_term_store=sem, llm=llm, user_id="u", session_id="s")
+    plain.add(MemoryRecord(
+        user_id="u", session_id="s",
+        content="用户偏好深色主题",
+        source="t", kind="preference",
+    ))
+
+    # 1) 只读探测：不应触发 doc embed 补算（prefetch_missing=False）
+    doc_before = llm.doc_calls
+    hits = mgr.check_conflict("用户偏好深色主题")
+    doc_after_ro = llm.doc_calls
+    assert doc_after_ro == doc_before, (
+        f"check_conflict 只读路径不应触发 doc embed，doc_calls 从 {doc_before} 涨到 {doc_after_ro}"
+    )
+
+    # 2) remember 写入路径：prefetch_missing=True 会补算缺失向量，正确去重
+    doc_before = llm.doc_calls
+    mgr.remember("用户偏好深色主题")
+    doc_after_wr = llm.doc_calls
+    assert doc_after_wr > doc_before, (
+        "remember 写入查重应 prefetch_missing=True 补算缺失向量，"
+        f"doc_calls 未增长（before={doc_before}, after={doc_after_wr}）"
+    )
+    # 命中重复、未新增（库里仍是 1 条）
+    assert len(plain.all()) == 1
+
+    mgr.close()
+    sem.close()
+    plain.close()
+    print("✅ test_v193_prefetch_missing_writes_vs_readonly 通过（写入/只读补算口径分离）")
+
 # ==================== 入口 ====================
 
 def main():
@@ -2305,20 +2075,21 @@ def main_of_new_add():
     test_b10_fix_extract_after_window_full()  # AI新加的测试
     test_v183_semantic_cache_avoids_re_embed()
     test_merge_similar_reuses_semantic_cache()
-    test_v183_chroma_client_none_is_lexical_only()
-    test_v183_chroma_with_real_chromaclient_semantic()
     test_v183_embedding_stats_default_and_errors_export()
     test_b13_semantic_find_similar_detects_conflict()
     test_b13_manager_remember_dedup_by_vector()
     test_b13_conflict_falls_back_to_lexical()
-    test_b13_chroma_find_similar_ann()
     test_b13_bugfix_stale_vecs_cleanup_and_embed_query()
-    test_b13_chroma_stale_cleanup_and_where_filter()
-    test_b13_chroma_update_content_replace_vec()
     test_b14_semantic_vector_meta_sqlite_and_memory()
     test_bugfix_inmemory_value_semantics_vec_recompute()
     test_b13_bugfix_batch_save_vec_persists_after_compute()
     test_b13_bugfix_rebuild_reuses_batch_vecs()
+    test_b13_expired_lexical_duplicate_renewed()  # AI新加的测试
+    test_b13_expired_semantic_conflict_superseded()  # AI新加的测试
+    test_b13_conflict_error_raised_on_duplicate()  # AI新加的测试
+    test_b13_check_conflict_readonly_and_expired_excluded()  # AI新加的测试
+    test_v193_search_no_write_amp_on_cold_cache()  # AI新加的测试
+    test_v193_prefetch_missing_writes_vs_readonly()  # AI新加的测试
 
 
 if __name__ == "__main__":

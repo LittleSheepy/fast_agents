@@ -43,7 +43,7 @@ from tests._runner import raises, tmp_path
 
 from fast_agents.trace import (
     EvaluationReport,
-    JsonlStore,
+    InMemoryTraceStore,
     MEMORY_PATH,
     SpanKind,
     SpanRecord,
@@ -94,7 +94,7 @@ def _make_span(
 # ==================== 构造与空数据 ====================
 def test_evaluator_constructs_from_trace_logger():
     """TraceEvaluator 可从 TraceLogger 实例构造。"""
-    tracer = TraceLogger(path=MEMORY_PATH)
+    tracer = TraceLogger(store=MEMORY_PATH)
     with tracer.trace("t_root") as tid:
         with tracer.span("llm.invoke", SpanKind.LLM) as s:
             s.finish(output="hello", metadata={"model": "gpt-4o"})
@@ -107,7 +107,7 @@ def test_evaluator_constructs_from_trace_logger():
 
 def test_evaluator_constructs_from_store():
     """TraceEvaluator 可从 Store 实例构造。"""
-    store = JsonlStore(MEMORY_PATH)
+    store = InMemoryTraceStore()
     s = _make_span("t1", "x", SpanKind.CUSTOM, duration_ms=5.0)
     store.write(s)
     ev = TraceEvaluator(store)
@@ -152,6 +152,24 @@ def test_evaluator_from_path_nonexistent_no_crash():
     """不存在的路径不抛异常，返回空报告。"""
     ev = TraceEvaluator.from_path("definitely_not_exist_xxx.jsonl")
     assert ev.evaluate().total_traces == 0
+
+
+# ==================== Bug5 回归：from_path 只读、不产生写副作用 ====================
+def test_evaluator_from_path_is_readonly_no_side_effect():
+    """Bug5 回归：from_path 对不存在的路径不得凭空创建 jsonl / db 文件（连父目录都不建）。"""
+    with tmp_path() as td:
+        p = os.path.join(str(td), "not_exists_yet.jsonl")
+        assert not os.path.exists(p)
+        ev = TraceEvaluator.from_path(p)
+        assert ev.evaluate().total_traces == 0
+        assert not os.path.exists(p), "from_path 对不存在的 jsonl 不应创建文件"
+
+        parent = os.path.join(str(td), "nested_dir")
+        q = os.path.join(parent, "not_exists_yet.db")
+        ev2 = TraceEvaluator.from_path(q)
+        assert ev2.evaluate().total_traces == 0
+        assert not os.path.exists(parent), "from_path 不应创建父目录"
+        assert not os.path.exists(q)
 
 
 # ==================== 单 trace 计数 ====================
@@ -421,7 +439,7 @@ def test_from_path_jsonl_roundtrip():
     """from_path 对 .jsonl 文件自动选择 JsonlStore，并能正确评估。"""
     with tmp_path() as td:
         p = os.path.join(td, "run.jsonl")
-        tracer = TraceLogger(path=p)
+        tracer = TraceLogger(store=p)
         with tracer.trace("root"):
             with tracer.span("llm.invoke", SpanKind.LLM, metadata={"model": "m"}) as s:
                 s.finish(output="ok", metadata={"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})
@@ -436,7 +454,7 @@ def test_from_path_sqlite_roundtrip():
     """from_path 对 .db 文件自动选择 SQLiteStore，并能正确评估。"""
     with tmp_path() as td:
         p = os.path.join(td, "run.db")
-        tracer = TraceLogger(path=p)
+        tracer = TraceLogger(store=p)
         with tracer.trace("root"):
             with tracer.span("llm.invoke", SpanKind.LLM, metadata={"model": "m"}) as s:
                 s.finish(output="ok", metadata={"usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}})
@@ -476,7 +494,7 @@ def test_dirty_data_does_not_crash():
 
 def test_evaluator_on_disabled_tracer_store_still_works():
     """enabled=False 的 tracer 虽然不打点，但如果 store 里已有数据，evaluator 仍可评估。"""
-    store = JsonlStore(MEMORY_PATH)
+    store = InMemoryTraceStore()
     s = _make_span("t1", "a", SpanKind.AGENT, duration_ms=10.0)
     store.write(s)
     # evaluator 离线读数据，和 tracer.enabled 无关
@@ -566,6 +584,77 @@ def test_to_csv_success_flag_and_none_cells():
     assert rows[1][CSV_COLUMNS.index("tool_error_rate")] == ""
 
 
+# ==================== Bug1 回归：多 root 时 success 判定口径统一 ====================
+def test_multi_root_error_detected_as_trace_failure():
+    """Bug1 回归：存在两个 root 时，非代表 root 出错也必须让整条 trace 判失败。"""
+    a = _make_span("t1", "root.A", SpanKind.AGENT)
+    b = _make_span("t1", "root.B", SpanKind.AGENT, status=SpanStatus.ERROR, error="boom")
+    c = _make_span("t1", "child.llm", SpanKind.LLM, parent_id=a.span_id)
+    a._create_seq = 1          # A 作为代表 root（序号最小、且成功）
+    b._create_seq = 2          # B 是另一个 root，出错
+    c._create_seq = 3
+    report = TraceEvaluator([a, b, c]).evaluate()
+    tm = report.traces[0]
+    assert tm.error_count == 1
+    assert tm.success is False, "非代表 root 出错时整条 trace 应判失败"
+    assert report.failed_traces == 1
+    assert report.successful_traces == 0
+
+
+def test_no_root_with_error_span_still_fails():
+    """无 root（所有 span 都有 parent_id）时，任何 error span 仍让 trace 判失败。"""
+    x = _make_span("t1", "orphan.llm", SpanKind.LLM, parent_id="p1")
+    y = _make_span("t1", "orphan.tool", SpanKind.TOOL, parent_id="p2",
+                   status=SpanStatus.ERROR, error="e")
+    report = TraceEvaluator([x, y]).evaluate()
+    assert report.traces[0].success is False
+
+def test_no_root_with_success_span_still_success():
+    """无 root（所有 span 都有 parent_id）时，都成功 仍让 trace 判成功。"""
+    x = _make_span("t1", "orphan.llm", SpanKind.LLM, parent_id="p1")
+    y = _make_span("t1", "orphan.tool", SpanKind.TOOL, parent_id="p2")
+    report = TraceEvaluator([x, y]).evaluate()
+    assert report.traces[0].success is True
+
+
+# ==================== 回归：limit 按 trace 粒度截断（不截断 trace 内部结构） ====================
+def test_evaluate_limit_keeps_failed_trace_intact():
+    """回归：limit 不得按 span 截断而丢掉 root，导致失败 trace 被误判成功。"""
+    root_fail = _make_span("t_fail", "agent", SpanKind.AGENT,
+                           status=SpanStatus.ERROR, error="boom", start_offset=100.0)
+    child_ok = _make_span("t_fail", "tool.x", SpanKind.TOOL,
+                          parent_id=root_fail.span_id, start_offset=0.0)
+    ev = TraceEvaluator([root_fail, child_ok])
+    # 未修复时 limit=1 只保留后创建的（序号更大）子 span（成功）→ success=True 误判
+    r = ev.evaluate(limit=1)
+    assert r.total_traces == 1
+    assert r.traces[0].span_count == 2, "limit 必须取整条 trace，不得截断 trace 内部 span"
+    assert r.traces[0].success is False
+    assert r.traces[0].error_count == 1
+    assert r.failed_traces == 1
+    assert r.successful_traces == 0
+
+
+def test_evaluate_limit_and_top_n_share_trace_granularity():
+    """回归：limit 与 top_n_traces 同口径，均按「最近 N 条完整 trace」截断。"""
+    spans = [
+        _make_span("t0", "agent", SpanKind.AGENT,
+                   status=SpanStatus.ERROR, error="e0", start_offset=100.0),
+        _make_span("t1", "agent", SpanKind.AGENT, start_offset=50.0),
+        _make_span("t2", "agent", SpanKind.AGENT, start_offset=0.0),
+    ]
+    ev = TraceEvaluator(spans)
+    assert ev.evaluate(limit=1).total_traces == 1
+    r2 = ev.evaluate(limit=2)
+    assert r2.total_traces == 2
+    assert r2.failed_traces == 0, "limit=2 只取最近两条成功 trace"
+    r3 = ev.evaluate(limit=3)
+    assert r3.total_traces == 3
+    assert r3.failed_traces == 1
+    # 与 top_n_traces 同口径：两者同时传时取更严的那个
+    assert ev.evaluate(limit=3, top_n_traces=2).total_traces == 2
+
+
 # ==================== 入口 ====================
 def main():
     from tests._runner import run_all
@@ -581,12 +670,14 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
-    test_to_csv_header_and_row_count()
-    test_to_csv_empty_report_header_only()
-    test_to_csv_write_file_roundtrip()
-    test_to_csv_tool_distribution_serialized()
-    test_to_csv_error_messages_escaped()
-    test_to_csv_success_flag_and_none_cells()
+    # test_to_csv_header_and_row_count()
+    # test_to_csv_empty_report_header_only()
+    # test_to_csv_write_file_roundtrip()
+    # test_to_csv_tool_distribution_serialized()
+    # test_to_csv_error_messages_escaped()
+    # test_to_csv_success_flag_and_none_cells()
+    test_evaluate_limit_keeps_failed_trace_intact()
+    test_evaluate_limit_and_top_n_share_trace_granularity()
     pass
 
 

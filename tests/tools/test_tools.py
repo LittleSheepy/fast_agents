@@ -1376,6 +1376,186 @@ def test_a23_builtin_lazy_import():
     print("✅ A23 builtin 延迟导入（隔离验证：不提前拉起 memory/mcp、按需加载、API 兼容）通过")
 
 
+# ─────────────────────────────────────────────────────────
+# A19：异步入口现代化（asyncio.to_thread，消除 DeprecationWarning）
+# ─────────────────────────────────────────────────────────
+
+def test_a19_arun_no_deprecation_warning_and_result():
+    """A19：ToolBase.arun 已改用 asyncio.to_thread——不再触发
+    asyncio.get_event_loop() 的 DeprecationWarning，且返回与同步路径一致。"""
+    import asyncio
+    import warnings
+
+    class EchoTool(ToolBase):
+        name = "a19_echo"
+        description = "回显文本"
+        def run(self, text: str = ""):
+            return f"ECHO={text}"
+
+    async def _drive():
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            r = await EchoTool().arun(text="hi")
+        dep = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        return r, dep
+
+    result, dep = asyncio.run(_drive())
+    assert not dep, f"arun 触发了 DeprecationWarning: {[str(w.message) for w in dep]}"
+    assert str(result) == "ECHO=hi", f"arun 结果异常: {result!r}"
+    print("✅ A19 arun 走 asyncio.to_thread、无 DeprecationWarning、结果一致通过")
+
+
+# ─────────────────────────────────────────────────────────
+# A11：Tavily provider 缺依赖 / 缺 Key 的明确指引
+# ─────────────────────────────────────────────────────────
+
+def test_a11_tavily_missing_key_guide():
+    """A11：Tavily 缺 API Key 时返回明确配置指引，而非笼统「搜索失败」"""
+    import sys as _sys
+    import types as _types
+    from fast_agents.tools.builtin.search_tool import SearchTool
+
+    # 注入 tavily 桩模块：让依赖检查通过，从而走到「缺 Key」分支
+    stub = _types.ModuleType("tavily")
+
+    class _StubClient:
+        def __init__(self, *a, **k):
+            raise AssertionError("缺 Key 时不应构造客户端")
+
+    stub.TavilyClient = _StubClient
+
+    old_mod = _sys.modules.get("tavily")
+    saved_key = os.environ.pop("TAVILY_API_KEY", None)
+    _sys.modules["tavily"] = stub
+    try:
+        out = str(SearchTool(provider="tavily", api_key=None).run("测试关键词"))
+    finally:
+        if old_mod is not None:
+            _sys.modules["tavily"] = old_mod
+        else:
+            _sys.modules.pop("tavily", None)
+        if saved_key is not None:
+            os.environ["TAVILY_API_KEY"] = saved_key
+
+    assert "TAVILY_API_KEY" in out, f"缺 Key 未给出明确指引: {out!r}"
+    assert "duckduckgo" in out, f"指引应含免 Key 备选方案: {out!r}"
+    print("✅ A11 Tavily 缺 Key 返回明确指引通过")
+
+
+def test_a11_tavily_with_key_ready():
+    """A11：提供 Key 时前置检查放行，能正常返回结果（不误报缺 Key）"""
+    import sys as _sys
+    import types as _types
+    from fast_agents.tools.builtin.search_tool import SearchTool
+
+    stub = _types.ModuleType("tavily")
+    captured = {}
+
+    class _StubClient:
+        def __init__(self, api_key=None, **k):
+            captured["api_key"] = api_key
+
+        def search(self, query, max_results=5):
+            return {"results": [{"title": "标题", "url": "http://example.com/x", "content": "摘要"}]}
+
+    stub.TavilyClient = _StubClient
+
+    old_mod = _sys.modules.get("tavily")
+    _sys.modules["tavily"] = stub
+    try:
+        res = SearchTool(provider="tavily", api_key="demo-key").run("测试")
+    finally:
+        if old_mod is not None:
+            _sys.modules["tavily"] = old_mod
+        else:
+            _sys.modules.pop("tavily", None)
+
+    assert "http://example.com/x" in str(res), f"有 Key 时应正常返回结果: {res!r}"
+    assert captured.get("api_key") == "demo-key", f"Key 未透传给客户端: {captured!r}"
+    print("✅ A11 Tavily 有 Key 正常返回通过")
+
+
+# ─────────────────────────────────────────────────────────
+# A26：并发工具执行时 hooks 可回调用方线程触发
+# ─────────────────────────────────────────────────────────
+
+def test_a26_concurrent_hooks_can_run_in_caller_thread():
+    """A26：invoke_tools_concurrent 新增 hooks_in_caller_thread 开关。
+
+    - 默认 False：hook 仍在子线程触发（与改动前行为一致）；
+    - True：hook 收回调用方线程，按 calls 顺序各触发一次；
+    - 两种情况返回结果都仍与 calls 严格一一对应，且 hook 收到的 result 与返回一致。
+    """
+    import threading
+
+    main_tid = threading.get_ident()
+
+    def _build():
+        reg = ToolRegistry(max_workers=4)
+        reg.register_tools(_sleep_tool("h1", 0.05), _sleep_tool("h2", 0.05))
+        return reg
+
+    # 默认：hook 在子线程触发
+    reg = _build()
+    default_seen = []
+    reg.add_hook(lambda name, args, res: default_seen.append((name, threading.get_ident())))
+    results = reg.invoke_tools_concurrent([("h1", None), ("h2", None)])
+    assert [r.output for r in results] == ["h1 done", "h2 done"], results
+    assert len(default_seen) == 2, f"默认模式 hook 应触发 2 次，实际 {len(default_seen)}"
+    assert not any(tid == main_tid for _, tid in default_seen), \
+        "默认模式下 hook 不应跑在调用方线程（须与改动前一致）"
+
+    # 开启开关：hook 回到调用方线程，且顺序与 calls 一致
+    reg2 = _build()
+    caller_seen = []
+
+    def _hook(name, args, res):
+        caller_seen.append((name, threading.get_ident(), res.output))
+
+    reg2.add_hook(_hook)
+    results2 = reg2.invoke_tools_concurrent(
+        [("h2", None), ("h1", None)], hooks_in_caller_thread=True,
+    )
+    assert [r.output for r in results2] == ["h2 done", "h1 done"], results2
+    assert [n for n, _, _ in caller_seen] == ["h2", "h1"], \
+        f"hook 顺序应与 calls 一致，实际 {[n for n, _, _ in caller_seen]}"
+    assert all(tid == main_tid for _, tid, _ in caller_seen), \
+        "开启 hooks_in_caller_thread 后 hook 必须在调用方线程执行"
+    assert [out for _, _, out in caller_seen] == [r.output for r in results2], \
+        "hook 拿到的 result 应与返回列表一一对应"
+    print("✅ A26 并发 hooks 可回调用方线程、按序触发通过")
+
+
+def test_a26_caller_thread_hooks_keep_trace_parent_chain():
+    """A26：hook 收在调用方线程后，tracer 的工具 Span 能正常落库并保持父链。
+
+    动机：tracer 的 Span 栈是实例级 ``contextvars``（线程绑定），且底层 SQLite
+    连接禁止跨线程使用——hook 若在子线程触发，工具 Span 会既丢父链又不落库。
+    """
+    import tempfile
+    from fast_agents.trace import TraceLogger
+
+    reg = ToolRegistry(max_workers=4)
+    reg.register_tools(_sleep_tool("t1", 0.05), _sleep_tool("t2", 0.05))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tracer = TraceLogger(store=os.path.join(tmp, "trace.db"))
+        tracer.start_trace(name="parent.trace")
+        parent_trace_id = tracer._current_trace_id()
+        tracer.attach_to_tool_registry(reg)
+
+        reg.invoke_tools_concurrent(
+            [("t1", None), ("t2", None)], hooks_in_caller_thread=True,
+        )
+        spans = tracer.read_spans()
+
+    tool_spans = [s for s in spans if s.name.startswith("tool.")]
+    assert len(tool_spans) == 2, f"应有 2 条工具 Span 落库，实际 {len(tool_spans)}：{[s.name for s in spans]}"
+    assert {s.trace_id for s in tool_spans} == {parent_trace_id}, \
+        f"工具 Span 丢失父链：{[ (s.name, s.trace_id) for s in tool_spans ]}"
+    print("✅ A26 hook 回主线程后工具 Span 正常落库且父链正确通过")
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -1392,7 +1572,11 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
-    pass
+    test_a19_arun_no_deprecation_warning_and_result()  # A19
+    test_a11_tavily_missing_key_guide()  # A11
+    test_a11_tavily_with_key_ready()  # A11
+    test_a26_concurrent_hooks_can_run_in_caller_thread()  # A26
+    test_a26_caller_thread_hooks_keep_trace_parent_chain()  # A26
 
 
 if __name__ == "__main__":

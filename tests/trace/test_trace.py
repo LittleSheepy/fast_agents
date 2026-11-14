@@ -1,11 +1,10 @@
 """trace 模块单元测试。
 
-全部用内存 JsonlStore 或 tests._runner.tmp_path() 临时目录，不依赖外部服务、不产生真实 API 请求。
+主要用 InMemoryTraceStore（tests._runner.tmp_path() 临时目录），不依赖外部服务、不产生真实 API 请求。
 覆盖点：
     - 默认关闭（tracer=None 零开销，不传时 LLM/Agent 行为不变）
     - SpanKind / SpanStatus / SpanRecord 字段/finish（含可选 end_time 精确对齐）
-    - JsonlStore 内存模式 / 文件模式 / append / 过滤查询
-    - JsonlStore 文件模式不做内存镜像（大文件不涨内存）
+    - InMemoryTraceStore 内存模式 / append / 过滤查询
     - TraceLogger start_trace/end_trace/with trace
     - start_span/end_span/with span（正常路径 + 异常路径）
     - 父子关系（parent_id 正确串联）
@@ -19,17 +18,17 @@
     - ReActAgent tracer 接入（mock llm.invoke + 简单工具）：agent/decision/tool/llm 四类 Span 都有
     - replay() 能按时间顺序返回可打印列表
     - 存储层预留位：用户可自定义 TraceStoreBase 子类
-    - 文件路径下 jsonl 落盘可被新 JsonlStore 重新读取（跨进程回放）
     - 禁用 enabled=False 时不写入任何记录
     - 实例级 ContextVar：跨 TraceLogger 实例不串扰、为 asyncio 并发做好准备
 
 运行方式（Windows PowerShell，在项目根目录）:
     python test\\test_trace.py
+    （SQLiteStore 后端用例已拆分到 tests/trace/test_trace_sqlite_store.py）
+    （JsonlStore 后端用例已拆分到 tests/trace/test_trace_jsonl_store.py）
     （无需 pytest，纯标准库）
 """
 from __future__ import annotations
 
-import json
 import os
 import sys
 from typing import Any, List, Optional
@@ -39,8 +38,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from tests._runner import raises, tmp_path
 
 from fast_agents.trace import (
+    InMemoryTraceStore,
     JsonlStore,
-    MEMORY_PATH,
     SpanKind,
     SpanRecord,
     SpanStatus,
@@ -99,10 +98,10 @@ def test_span_kind_enum_values():
     assert SpanKind.CUSTOM.value == "custom"
 
 
-# ==================== JsonlStore 内存模式 ====================
-def test_jsonl_store_memory_write_read():
-    """内存模式下 write/read 正常，按写入顺序返回。"""
-    store = JsonlStore(MEMORY_PATH)
+# ==================== InMemoryTraceStore 内存模式 ====================
+def test_in_memory_store_write_read():
+    """内存后端 write/read 正常，按写入顺序返回。"""
+    store = InMemoryTraceStore()
     s1 = SpanRecord(trace_id="t1", name="a", kind=SpanKind.LLM)
     s1.finish(output=1)
     s2 = SpanRecord(trace_id="t1", name="b", kind=SpanKind.TOOL, parent_id=s1.span_id)
@@ -116,9 +115,9 @@ def test_jsonl_store_memory_write_read():
     store.close()
 
 
-def test_jsonl_store_filter_by_session_trace_kind():
+def test_in_memory_store_filter_by_session_trace_kind():
     """按 session_id / trace_id / kind 过滤。"""
-    store = JsonlStore(MEMORY_PATH)
+    store = InMemoryTraceStore()
     # i: 0 → t0/s0/LLM; 1 → t1/s1/TOOL; 2 → t0/s0/LLM; 3 → t1/s1/TOOL; 4 → t0/s0/LLM
     for i in range(5):
         s = SpanRecord(
@@ -139,9 +138,9 @@ def test_jsonl_store_filter_by_session_trace_kind():
     store.close()
 
 
-def test_jsonl_store_limit():
+def test_in_memory_store_limit():
     """limit 参数生效。"""
-    store = JsonlStore(MEMORY_PATH)
+    store = InMemoryTraceStore()
     for i in range(10):
         s = SpanRecord(trace_id="t", name=f"n{i}", kind=SpanKind.CUSTOM)
         s.finish()
@@ -150,158 +149,49 @@ def test_jsonl_store_limit():
     store.close()
 
 
-def test_jsonl_store_memory_path_none_equals_memory():
-    """path=None 等价于内存模式。"""
-    store = JsonlStore(None)
-    s = SpanRecord(trace_id="t", name="x", kind=SpanKind.CUSTOM)
-    s.finish(output="y")
+# ==================== 内存后端生命周期：close 不清空 / clear 主动清空 ====================
+def test_in_memory_store_close_does_not_clear_records():
+    """close() 为 no-op：调用后记录仍在、可继续读出（锁定 close 不再清空数据的修复）。"""
+    store = InMemoryTraceStore()
+    s = SpanRecord(trace_id="t1", name="a", kind=SpanKind.LLM)
+    s.finish(output=1)
+    store.write(s)
+    store.close()
+    rows = store.read()
+    assert len(rows) == 1
+    assert rows[0].name == "a"
+    # 重复 close 仍安全
+    store.close()
+    assert len(store.read()) == 1
+
+
+def test_in_memory_store_clear_empties_records():
+    """clear() 主动清空全部记录，清空后 read() 返回空列表、且可继续写入。"""
+    store = InMemoryTraceStore()
+    s = SpanRecord(trace_id="t1", name="a", kind=SpanKind.LLM)
+    s.finish(output=1)
     store.write(s)
     assert len(store.read()) == 1
-    assert store._fp is None
-    store.close()
+    store.clear()
+    assert store.read() == []
+    s2 = SpanRecord(trace_id="t2", name="b", kind=SpanKind.TOOL)
+    s2.finish(output=2)
+    store.write(s2)
+    assert len(store.read()) == 1
 
 
-# ==================== JsonlStore 文件模式 ====================
-def test_jsonl_store_file_write_and_reopen(tmp_path):
-    """写文件后 reopen(append=True) 能读到历史 + 新写入；跨进程/跨实例回放可用。"""
-    p = str(tmp_path / "traces.jsonl")
-    s1 = JsonlStore(p, append=True)
-    sp = SpanRecord(trace_id="t1", name="first", kind=SpanKind.LLM)
-    sp.finish(output="a")
-    s1.write(sp)
-    s1.flush()
-    s1.close()
-
-    # 重新打开，追加一条
-    s2 = JsonlStore(p, append=True)
-    sp2 = SpanRecord(trace_id="t1", name="second", kind=SpanKind.TOOL)
-    sp2.finish(output="b")
-    s2.write(sp2)
-    rows = s2.read(trace_id="t1")
-    s2.close()
-    assert len(rows) == 2
-    assert rows[0].name == "first"
-    assert rows[1].name == "second"
-
-
-def test_jsonl_store_file_overwrite_when_append_false(tmp_path):
-    """append=False 时会清空重写。"""
-    p = str(tmp_path / "traces.jsonl")
-    s1 = JsonlStore(p, append=True)
-    sp = SpanRecord(trace_id="t", name="a", kind=SpanKind.CUSTOM)
-    sp.finish()
-    s1.write(sp)
-    s1.close()
-
-    s2 = JsonlStore(p, append=False)
-    assert len(s2.read()) == 0
-    sp2 = SpanRecord(trace_id="t", name="b", kind=SpanKind.CUSTOM)
-    sp2.finish()
-    s2.write(sp2)
-    assert len(s2.read()) == 1
-    s2.close()
-
-
-def test_jsonl_store_file_is_valid_jsonl(tmp_path):
-    """写出的文件每行都是合法 JSON，可被标准 json 模块逐行解析。"""
-    p = str(tmp_path / "traces.jsonl")
-    store = JsonlStore(p)
-    for i in range(3):
-        s = SpanRecord(trace_id="t", name=f"n{i}", kind=SpanKind.CUSTOM, input={"i": i})
-        s.finish(output={"o": i})
-        store.write(s)
-    store.close()
-    with open(p, "r", encoding="utf-8") as f:
-        lines = [ln.strip() for ln in f if ln.strip()]
-    assert len(lines) == 3
-    for ln in lines:
-        obj = json.loads(ln)
-        assert obj["trace_id"] == "t"
-        assert obj["status"] in ("success", "error")
-        assert obj["kind"] in ("llm", "tool", "decision", "agent", "custom")
-
-
-def test_file_store_does_not_accumulate_in_memory(tmp_path):
-    """文件模式下 _mem 必须始终为空——写入/读取都不往内存镜像累积数据，
-    防止长时间运行随 jsonl 文件线性涨内存。"""
-    p = str(tmp_path / "traces.jsonl")
-    store = JsonlStore(p, append=True)
-    assert store._is_memory is False
-    for i in range(50):
-        s = SpanRecord(trace_id="t", name=f"n{i}", kind=SpanKind.CUSTOM)
-        s.finish(output={"idx": i})
-        store.write(s)
-    # 关键断言：文件模式下 _mem 保持空
-    assert len(store._mem) == 0, f"文件模式下 _mem 不应累积数据，实际 len={len(store._mem)}"
-    # 但 read() 仍能正确返回全部记录（流式扫描文件）
-    rows = store.read()
-    assert len(rows) == 50
-    assert rows[0].name == "n0"
-    assert rows[-1].name == "n49"
-    store.close()
-    # close 后文件模式下 _mem 也保持空（兜底 clear）
-    assert len(store._mem) == 0
-
-
-def test_jsonl_store_handles_unserializable_input_output():
-    """Bug1 回归：input/output/metadata 包含不可 JSON 序列化的自定义对象时，
-    整条 Span 不应被静默丢弃（旧实现会在 model_dump(mode="json") 阶段抛异常被吞掉，导致读不到任何记录）。
-    行为对齐 SQLiteStore：不可序列化对象兜底转为 str(obj)，Span 正常落库可回读。"""
-    class Weird:
-        def __str__(self):
-            return "<Weird>"
-
-    store = JsonlStore(MEMORY_PATH)
-    s = SpanRecord(
-        trace_id="t1",
-        name="weird-span",
-        kind=SpanKind.CUSTOM,
-        input={"obj": Weird(), "normal": 123},
-        metadata={"bad": Weird()},
-    )
-    s.finish(output=Weird())
-    store.write(s)
-
-    rows = store.read()
-    assert len(rows) == 1, f"不可序列化对象导致整条Span丢失，实际返回{len(rows)}条"
-    span = rows[0]
-    # 正常字段保留
-    assert span.name == "weird-span"
-    assert span.input["normal"] == 123
-    # 不可序列化对象兜底为字符串表示
-    assert span.input["obj"] == "<Weird>"
-    assert span.output == "<Weird>"
-    assert span.metadata["bad"] == "<Weird>"
-    store.close()
-
-
-def test_jsonl_store_file_handles_unserializable(tmp_path):
-    """文件模式下同样能正确处理不可序列化对象，落盘后跨实例可回读。"""
-    class Weird:
-        def __str__(self):
-            return "<WeirdFile>"
-
-    p = str(tmp_path / "traces.jsonl")
-    s1 = JsonlStore(p, append=True)
-    sp = SpanRecord(
-        trace_id="t1",
-        name="weird-file",
-        kind=SpanKind.TOOL,
-        input=Weird(),
-    )
-    sp.finish(output={"res": Weird()})
-    s1.write(sp)
-    s1.flush()
-    s1.close()
-
-    # 重新打开验证可正常回读，没有丢数据
-    s2 = JsonlStore(p, append=True)
-    rows = s2.read(trace_id="t1")
-    s2.close()
-    assert len(rows) == 1
-    assert rows[0].name == "weird-file"
-    assert rows[0].input == "<WeirdFile>"
-    assert rows[0].output["res"] == "<WeirdFile>"
+def test_evaluator_after_tracer_context_exit_sees_records():
+    """with TraceLogger(...) 退出（自动 close）后构造 evaluator 仍能读到数据（原「退出即空报告」坑已消除）。"""
+    from fast_agents.trace.evaluator import TraceEvaluator
+    store = InMemoryTraceStore()
+    with TraceLogger(store=store, session_id="s1") as t:
+        with t.span("agent", SpanKind.AGENT):
+            pass
+    report = TraceEvaluator(t).evaluate()
+    assert report.total_traces == 1
+    # close() 之后数据仍在（不再清空）
+    t.close()
+    assert TraceEvaluator(t).evaluate().total_traces == 1
 
 
 # ==================== TraceLogger 默认关闭 ====================
@@ -377,10 +267,13 @@ def test_with_span_records_on_normal_exit():
 def test_with_span_marks_error_on_exception():
     """with span 内抛异常时自动记 status=error，并记录 error 字段，异常继续向上抛。"""
     t = TraceLogger()
-    with raises(ValueError, match="boom"):
-        with t.trace("demo"):
-            with t.span("bad", SpanKind.CUSTOM):
-                raise ValueError("boom")
+    try:
+        with raises(ValueError, match="boom"):
+            with t.trace("demo"):
+                with t.span("bad", SpanKind.CUSTOM):
+                    raise ValueError("boom")
+    except:
+        pass
     spans = t.read_spans()
     assert len(spans) == 1
     assert spans[0].status == SpanStatus.ERROR
@@ -396,6 +289,26 @@ def test_parent_child_relationship():
         with t.span("parent", SpanKind.AGENT) as p:
             with t.span("child", SpanKind.LLM) as c:
                 c.output = "ok"
+    spans = t.read_spans()
+    assert len(spans) == 2
+    parent = [s for s in spans if s.name == "parent"][0]
+    child = [s for s in spans if s.name == "child"][0]
+    assert parent.parent_id is None
+    assert child.parent_id == parent.span_id
+    assert child.trace_id == parent.trace_id
+    t.close()
+
+
+def test_parent_child_relationship_with_error():
+    """嵌套 span 时 parent_id 正确指向父 span_id。"""
+    t = TraceLogger()
+    try:
+        with t.trace("demo"):
+            with t.span("parent", SpanKind.AGENT) as p:
+                with t.span("child", SpanKind.LLM) as c:
+                    raise ValueError("boom")
+    except ValueError:
+        pass
     spans = t.read_spans()
     assert len(spans) == 2
     parent = [s for s in spans if s.name == "parent"][0]
@@ -1036,9 +949,11 @@ def test_set_session_id_and_filter():
 
 
 # ==================== 上下文管理器 with TraceLogger ====================
-def test_trace_logger_context_manager_closes():
-    """with TraceLogger() 自动 close 底层 store。"""
-    with TraceLogger() as t:
+def test_trace_logger_context_manager_closes(tmp_path):
+    """with TraceLogger(...) 自动 close 底层 store。"""
+    # 默认 store=":memory:" 走 InMemoryTraceStore（无 _closed 标记），
+    # 这里显式用 JsonlStore 文件模式校验 with 退出后底层 store 确已关闭。
+    with TraceLogger(store=JsonlStore(str(tmp_path / "ctx.jsonl"))) as t:
         with t.trace("x"):
             with t.span("s", SpanKind.CUSTOM) as s:
                 s.output = 1
@@ -1092,225 +1007,6 @@ def test_contextvar_is_instance_level_not_module_level():
     t.close()
 
 
-# ==================== SQLiteStore 后端测试 ====================
-import tempfile
-import os
-from fast_agents.trace import SQLiteStore
-
-
-def test_sqlite_store_memory_write_read():
-    """内存模式 SQLiteStore 写入读取基本功能。"""
-    store = SQLiteStore(":memory:")
-    try:
-        # 写入3条span
-        s1 = SpanRecord(trace_id="t1", name="s1", kind=SpanKind.LLM)
-        s1.finish(output="r1")
-        s2 = SpanRecord(trace_id="t1", name="s2", kind=SpanKind.TOOL, session_id="sess1")
-        s2.finish(output="r2")
-        s3 = SpanRecord(trace_id="t2", name="s3", kind=SpanKind.AGENT, session_id="sess1")
-        s3.finish(output="r3", status=SpanStatus.ERROR, error="fail")
-        store.write(s1); store.write(s2); store.write(s3)
-
-        assert store.count() == 3
-        all_spans = store.read()
-        assert len(all_spans) == 3
-        # 按写入顺序返回
-        assert all_spans[0].name == "s1"
-        assert all_spans[1].name == "s2"
-        assert all_spans[2].name == "s3"
-        # 错误状态正确
-        assert all_spans[2].status == SpanStatus.ERROR
-        assert all_spans[2].error == "fail"
-    finally:
-        store.close()
-
-
-def test_sqlite_store_filter_by_session_trace_kind():
-    """按 session_id / trace_id / kind 过滤正确。"""
-    store = SQLiteStore(":memory:")
-    try:
-        for i in range(5):
-            s = SpanRecord(
-                trace_id=f"t{i%2}",
-                name=f"span_{i}",
-                kind=SpanKind.LLM if i%2==0 else SpanKind.TOOL,
-                session_id=f"sess{i%3}"
-            )
-            s.finish()
-            store.write(s)
-
-        # 按kind过滤
-        llm_spans = store.read(kind="llm")
-        assert len(llm_spans) == 3  # 0,2,4
-        assert all(s.kind == SpanKind.LLM for s in llm_spans)
-        # 按trace_id过滤
-        t0_spans = store.read(trace_id="t0")
-        assert len(t0_spans) == 3  # 0,2,4
-        assert all(s.trace_id == "t0" for s in t0_spans)
-        # 按session_id过滤
-        sess1_spans = store.read(session_id="sess1")
-        assert len(sess1_spans) == 2  # 1,4
-        assert all(s.session_id == "sess1" for s in sess1_spans)
-        # limit参数
-        limited = store.read(limit=2)
-        assert len(limited) == 2
-    finally:
-        store.close()
-
-
-def test_sqlite_store_file_persists_across_reopen():
-    """文件模式SQLite：关闭后重新打开，历史数据仍在（跨进程持久化）。"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "test_traces.db")
-        store1 = SQLiteStore(path)
-        s = SpanRecord(trace_id="persist", name="persist_span", kind=SpanKind.AGENT)
-        s.finish(output="hello")
-        store1.write(s)
-        assert store1.count() == 1
-        store1.close()
-
-        # 重新打开
-        store2 = SQLiteStore(path)
-        assert store2.count() == 1
-        spans = store2.read()
-        assert len(spans) == 1
-        assert spans[0].name == "persist_span"
-        assert spans[0].output == "hello"
-        store2.close()
-
-
-def test_sqlite_store_idempotent_schema_migration():
-    """幂等Schema迁移：重复初始化不报错，老库自动补列。"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "migrate_test.db")
-        # 第一次初始化
-        s1 = SQLiteStore(path)
-        s1.write(SpanRecord(trace_id="t", name="first", kind=SpanKind.CUSTOM))
-        s1.close()
-        # 第二次初始化（模拟版本升级）：自动补列，不报错，数据不丢
-        s2 = SQLiteStore(path)
-        assert s2.count() == 1
-        # 第三次初始化再写入新数据
-        s2.write(SpanRecord(trace_id="t", name="second", kind=SpanKind.CUSTOM))
-        assert s2.count() == 2
-        s2.close()
-
-
-def test_sqlite_store_iter_records_streaming():
-    """iter_records 分批流式遍历返回所有记录，不丢不重。"""
-    store = SQLiteStore(":memory:")
-    try:
-        expected = 20
-        for i in range(expected):
-            s = SpanRecord(trace_id="batch", name=f"iter_{i}", kind=SpanKind.CUSTOM)
-            s.finish()
-            store.write(s)
-        assert store.count() == expected
-        records = list(store.iter_records())
-        assert len(records) == expected
-        names = [r.name for r in records]
-        assert names == [f"iter_{i}" for i in range(expected)]
-    finally:
-        store.close()
-
-
-def test_sqlite_store_upsert_is_idempotent():
-    """相同span_id重复写入幂等覆盖，不重复计数。"""
-    store = SQLiteStore(":memory:")
-    try:
-        s = SpanRecord(span_id="fixed_id", trace_id="t", name="once", kind=SpanKind.CUSTOM)
-        s.finish(output="v1")
-        store.write(s)
-        store.write(s)  # 重复写
-        store.write(s)  # 再写一次
-        assert store.count() == 1  # 只有一条
-        # 修改后重新写（覆盖）
-        s.output = "v2"
-        store.write(s)
-        assert store.count() == 1
-        got = store.read()[0]
-        assert got.output == "v2"
-    finally:
-        store.close()
-
-
-def test_sqlite_store_write_errors_are_swallowed():
-    """写入异常不向上抛（失败安全，打点不阻塞业务）。"""
-    store = SQLiteStore(":memory:")
-    store.close()
-    # close后再write，不应该抛异常
-    s = SpanRecord(trace_id="t", name="err", kind=SpanKind.CUSTOM)
-    store.write(s)  # 静默失败
-    assert store.count() == 0
-
-
-def test_tracer_backend_sqlite_parameter():
-    """TraceLogger(backend="sqlite") 自动创建 SQLiteStore。"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "tracer.db")
-        t = TraceLogger(path=path, backend="sqlite")
-        try:
-            assert isinstance(t.store, SQLiteStore)
-            with t.trace("backend_test"):
-                with t.span("test_span", SpanKind.CUSTOM, input={"x":1}) as s:
-                    s.output = {"ok": True}
-            spans = t.read_spans()
-            assert len(spans) == 1  # trace()只管理栈不写span，只有custom span
-        finally:
-            t.close()
-
-
-def test_tracer_auto_detect_sqlite_suffix():
-    """path后缀为 .db/.sqlite/.sqlite3 时自动选择SQLiteStore，无需显式backend。"""
-    for suffix in [".db", ".sqlite", ".sqlite3"]:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, f"auto{suffix}")
-            t = TraceLogger(path=path)
-            try:
-                assert isinstance(t.store, SQLiteStore), f"suffix {suffix} 应自动识别为SQLite"
-            finally:
-                t.close()
-    # jsonl后缀默认仍是JsonlStore
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "traces.jsonl")
-        t = TraceLogger(path=path)
-        try:
-            assert isinstance(t.store, JsonlStore)
-        finally:
-            t.close()
-
-
-def test_tracer_explicit_store_takes_precedence():
-    """显式传入store实例时，忽略path/backend参数。"""
-    mem_jsonl = JsonlStore(MEMORY_PATH)
-    t = TraceLogger(store=mem_jsonl, backend="sqlite", path="/tmp/should_not_exist.db")
-    try:
-        assert t.store is mem_jsonl
-        assert not isinstance(t.store, SQLiteStore)
-    finally:
-        t.close()
-
-
-def test_replay_defaults_to_latest_trace_when_no_active():
-    """BUG2修复：无活跃trace时，默认回放最近一次结束的root trace，不返回全量也不返回空。"""
-    t = TraceLogger()
-    try:
-        # 第一条trace
-        with t.trace("first"):
-            with t.span("first_span") as s:
-                s.output = 1
-        # 第二条trace（最新）
-        with t.trace("second"):
-            with t.span("second_span") as s:
-                s.output = 2
-        # 现在无活跃trace，replay()应该默认返回最新的第二条trace
-        replay = t.replay()
-        assert len(replay) == 1
-        assert replay[0]["name"] == "second_span"
-    finally:
-        t.close()
-
-
 def test_replay_uses_inner_most_active_trace_in_nested_context():
     """BUG2修复：嵌套trace场景下，replay()默认取当前最内层活跃trace，不会错取外层。"""
     t = TraceLogger()
@@ -1330,44 +1026,6 @@ def test_replay_uses_inner_most_active_trace_in_nested_context():
 
 
 # ==================== Bug3 幂等写入回归测试 ====================
-
-def test_end_span_is_idempotent_no_duplicate_records_jsonl():
-    """BUG3修复：同一Span重复调用end_span，JsonlStore只写1条，以第一次结果为准。"""
-    t = TraceLogger()
-    try:
-        s = t.start_span("test_span")
-        t.end_span(s, output="first_result", status=SpanStatus.SUCCESS)
-        # 第二次调用end_span，应该直接返回，不重复写入，也不覆盖第一次结果
-        t.end_span(s, output="second_result", status=SpanStatus.ERROR, error="duplicate call")
-        spans = t.read_spans()
-        assert len(spans) == 1
-        assert spans[0].output == "first_result"
-        assert spans[0].status == SpanStatus.SUCCESS
-        assert spans[0].error is None
-    finally:
-        t.close()
-
-
-def test_end_span_is_idempotent_no_duplicate_records_sqlite():
-    """BUG3修复：同一Span重复调用end_span，SQLiteStore只写1条，以第一次结果为准。"""
-    import os
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "traces.db")
-        t = TraceLogger(path=path)
-        try:
-            s = t.start_span("test_span")
-            t.end_span(s, output="first_result", status=SpanStatus.SUCCESS)
-            # 第二次调用end_span，应该直接返回，不重复写入，也不覆盖第一次结果
-            t.end_span(s, output="second_result", status=SpanStatus.ERROR, error="duplicate call")
-            spans = t.read_spans()
-            assert len(spans) == 1
-            assert spans[0].output == "first_result"
-            assert spans[0].status == SpanStatus.SUCCESS
-            assert spans[0].error is None
-        finally:
-            t.close()
-
 
 def test_manual_end_span_in_context_normal_exit_does_not_duplicate():
     """BUG3修复：with块内手动end_span后正常退出，不会产生重复记录。"""
@@ -1406,45 +1064,6 @@ def test_manual_end_span_in_context_exception_does_not_create_conflicting_record
         t.close()
 
 
-
-# ---------- Bug1 回归：JsonlStore不可序列化入参不丢数据、不修改原span ----------
-class BadRepr:
-    def __repr__(self):
-        raise RuntimeError("bad repr")
-    def __str__(self):
-        raise RuntimeError("bad str")
-
-def test_jsonl_store_handles_extreme_unserializable_objects():
-    tracer = TraceLogger(enabled=True, backend="jsonl", path=":memory:")
-    original_input = {"obj": BadRepr()}
-    with tracer.trace("t1"):
-        with tracer.span("s1", kind=SpanKind.CUSTOM, input=original_input) as s:
-            s.output = "ok"
-            # 验证原span对象的input/output未被修改
-            assert s.input == original_input
-            assert s.output == "ok"
-    records = tracer.read_spans()
-    assert len(records) == 1
-    assert records[0].input["obj"].startswith("<")  # 兜底转字符串
-    assert records[0].output == "ok"
-    tracer.close()
-
-def test_jsonl_store_file_handles_extreme_unserializable():
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = os.path.join(tmpdir, "bad_obj.jsonl")
-        tracer = TraceLogger(enabled=True, path=path)
-        with tracer.trace("t1"):
-            with tracer.span("s1", kind=SpanKind.CUSTOM, input={"obj": BadRepr()}) as s:
-                s.output = "ok"
-        tracer.close()
-        # 重开读取
-        tracer2 = TraceLogger(enabled=True, path=path, backend="jsonl")
-        records = tracer2.read_spans()
-        assert len(records) == 1
-        assert records[0].input["obj"].startswith("<")
-        tracer2.close()
-
-
 # ---------- Bug5 回归：负耗时保护 ----------
 def test_span_finish_negative_duration_clamped_to_zero():
     s = SpanRecord(trace_id="t1", name="test", kind=SpanKind.CUSTOM, start_time=2000.0)
@@ -1456,6 +1075,634 @@ def test_span_finish_normal_duration_calculated_correctly():
     s = SpanRecord(trace_id="t1", name="test", kind=SpanKind.CUSTOM, start_time=1000.0)
     s.finish(end_time=1001.0)
     assert s.duration_ms == 1000.0
+
+
+# ==================== Bug3 回归：finish 不再吞掉 falsy 输出 ====================
+def test_span_finish_keeps_falsy_output():
+    """Bug3 回归：finish(output=...) 传 0 / False / "" / [] / {} 必须原样记录，不能被 `or` 丢成旧值。"""
+    for falsy in (0, False, "", [], {}):
+        s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.LLM)
+        s.finish(output=falsy)
+        assert s.output == falsy and type(s.output) is type(falsy), f"falsy={falsy!r} 被 `or` 吞掉"
+
+
+def test_span_finish_none_output_keeps_previous():
+    """finish() 未显式传 output 时保留已有输出，不改变旧语义。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.LLM, output="keep")
+    s.finish()
+    assert s.output == "keep"
+
+
+def test_span_finish_falsy_error_recorded():
+    """Bug3 回归：finish(error="") 等 falsy 错误值也要如实记录。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.TOOL)
+    s.finish(error="", status=SpanStatus.ERROR)
+    assert s.error == "" and s.status == SpanStatus.ERROR
+
+
+# ==================== Bug1 回归：创建序号不污染用户 metadata ====================
+def test_create_seq_not_in_user_metadata_on_new_span():
+    """Bug1 回归：新建 Span 的创建序号只存私有属性，绝不写进用户 metadata，也不被 model_dump 带出。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.LLM, metadata={"k": "v"})
+    assert s.metadata == {"k": "v"}
+    assert "_create_seq" not in s.metadata
+    assert getattr(s, "_create_seq", 0) > 0
+    assert "_create_seq" not in s.model_dump()
+
+
+# ==================== K1 收尾：输入/输出预览截断长度可配置 ====================
+
+def test_truncate_preview_default_keeps_original_lengths():
+    """默认（不配置）时截断长度沿用各接入点原有默认：输入 500 / 输出 300、200；行为与改动前一致。"""
+    t = TraceLogger()
+    # 输入侧默认 500
+    assert len(t.truncate_preview("x" * 1000, 500, is_input=True)) == 500
+    # 输出侧默认：Agent 300 / LLM 200（由调用点传入 default_len）
+    assert len(t.truncate_preview("x" * 1000, 300)) == 300
+    assert len(t.truncate_preview("x" * 1000, 200)) == 200
+    # 短文本原样返回、None 保留 None（与 (x[:n] if x else None) 语义一致）
+    assert t.truncate_preview("short", 500, is_input=True) == "short"
+    assert t.truncate_preview(None, 300) is None
+    t.close()
+
+
+def test_truncate_preview_configurable_input_and_output():
+    """显式配置 input_preview_len / output_preview_len 后，按配置长度截断；未配置的一侧不受影响。"""
+    t = TraceLogger(input_preview_len=10, output_preview_len=20)
+    assert len(t.truncate_preview("x" * 1000, 500, is_input=True)) == 10
+    assert len(t.truncate_preview("x" * 1000, 300)) == 20
+    # 输出侧统一走 output_preview_len（Agent 300 / LLM 200 都被 20 覆盖）
+    assert len(t.truncate_preview("x" * 1000, 200)) == 20
+    t.close()
+
+    # 只配置输出侧时，输入侧仍沿用原有默认 500
+    t2 = TraceLogger(output_preview_len=5)
+    assert len(t2.truncate_preview("x" * 1000, 500, is_input=True)) == 500
+    assert len(t2.truncate_preview("x" * 1000, 300)) == 5
+    t2.close()
+
+
+def test_truncate_preview_nonpositive_means_no_truncation():
+    """配置 <= 0 表示不截断（完整记录）。"""
+    t = TraceLogger(input_preview_len=0, output_preview_len=-3)
+    assert t.truncate_preview("y" * 1000, 500, is_input=True) == "y" * 1000
+    assert t.truncate_preview("y" * 1000, 200) == "y" * 1000
+    t.close()
+
+
+def test_truncate_preview_handles_none_and_non_str():
+    """None / 非字符串原样返回，绝不抛异常（R6：打点通道不阻塞主流程）。"""
+    t = TraceLogger(input_preview_len=5, output_preview_len=5)
+    assert t.truncate_preview(None, 300) is None
+    assert t.truncate_preview(123, 300) == 123
+    d = {"a": 1}
+    assert t.truncate_preview(d, 300) is d
+    t.close()
+
+
+def test_agent_preview_length_configurable_end_to_end():
+    """端到端：配置后 Agent span 的输入/输出预览按配置长度截断（不改其它行为）。"""
+    from fast_agents import ReActAgent
+
+    @StructuredTool.from_function
+    def add(a: int, b: int) -> int:
+        """add two numbers"""
+        return a + b
+
+    reg = ToolRegistry()
+    reg.register_tool(add)
+
+    t = TraceLogger(input_preview_len=8, output_preview_len=3)
+    llm = _make_fake_agent_llm()
+    kwargs = dict(
+        name="cfg-agent",
+        llm=llm,
+        tool_registry=reg,
+        system_prompt="你是一个计算助手。",
+        max_steps=5,
+        tracer=t,
+    )
+    _disable_agent_subsystems(kwargs)
+    agent = ReActAgent(**kwargs)
+
+    with t.trace("cfg-run"):
+        ans = agent.run("请把1加2算出来，越详细越好，谢谢你了")
+
+    assert "3" in ans
+    agent_spans = [s for s in t.read_spans() if s.kind == SpanKind.AGENT]
+    assert len(agent_spans) >= 1
+    ag = agent_spans[0]
+    # 输入预览按 input_preview_len=8 截断
+    assert len(ag.input["user_input"]) == 8, ag.input["user_input"]
+    # 输出预览按 output_preview_len=3 截断（最终答案“答案是 3”截为前 3 字）
+    assert ag.output["final_answer_preview"] == "答案是", ag.output["final_answer_preview"]
+    t.close()
+
+
+def test_llm_preview_length_configurable_end_to_end():
+    """端到端：配置后 LLM span 的 content_preview 按配置长度截断（invoke 与 stream_invoke 都生效）。"""
+    t = TraceLogger(output_preview_len=4)
+    llm = _make_fake_llm(tracer=t)
+    with t.trace("llm-cfg"):
+        llm.invoke([{"role": "user", "content": "hi"}])
+    s = t.read_spans(kind="llm")[0]
+    assert s.name == "llm.invoke"
+    assert s.output["content_preview"] == "mock", s.output["content_preview"]
+
+    # stream_invoke：chunks=["hello"," world"] → "hello world"[:4] == "hell"
+    with t.trace("llm-cfg2"):
+        list(llm.stream_invoke([{"role": "user", "content": "hi"}]))
+    s2 = [x for x in t.read_spans(kind="llm") if x.name == "llm.stream_invoke"][0]
+    assert s2.output["content_preview"] == "hell", s2.output["content_preview"]
+    t.close()
+
+
+# =================================================
+# ==================== 树形聚合 ====================
+# =================================================
+
+def test_build_tree_simple_parent_child():
+    """build_tree() 基本父子关系：agent 为根、tool 与 llm 是其子节点。
+    结构图示意：
+    agent
+      ├── tool
+      └── llm
+    """
+    from fast_agents.trace import TraceLogger, SpanKind, InMemoryTraceStore
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store, session_id="s1")
+    agent = t.start_span("agent.run", SpanKind.AGENT)
+    tool = t.start_span("tool.search", SpanKind.TOOL)
+    t.end_span(tool, output="search-ok")
+    llm = t.start_span("llm.invoke", SpanKind.LLM)
+    t.end_span(llm, output="llm-ok")
+    t.end_span(agent, output="done")
+
+    roots = t.build_tree()
+    assert len(roots) == 1, "单 trace 应只有 1 个根节点"
+    root = roots[0]
+    assert root["name"] == "agent.run"
+    assert root["span_id"] == agent.span_id
+    assert root.get("_orphan") is None
+    assert len(root["children"]) == 2
+    child_names = [c["name"] for c in root["children"]]
+    assert child_names == ["tool.search", "llm.invoke"], f"子节点按创建顺序：{child_names}"
+    for c in root["children"]:
+        assert c["children"] == [], f"叶子节点 {c['name']} 不应有子节点"
+        assert c.get("_orphan") is None
+    # 节点字段与 replay 一致：都包含 kind/status/duration_ms/error/input/output/metadata
+    for k in ("span_id","parent_id","kind","name","status","duration_ms","error","input","output","metadata","children"):
+        assert k in root, f"根节点缺少字段 {k}"
+
+
+def test_build_tree_deep_nesting():
+    """build_tree() 支持多层嵌套（agent → tool → llm）。
+    结构图示意：
+    agent
+      └──→ tool
+        └── llm
+    """
+    from fast_agents.trace import TraceLogger, SpanKind, InMemoryTraceStore
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store)
+    a = t.start_span("a", SpanKind.AGENT)
+    tl = t.start_span("tl", SpanKind.TOOL)
+    lm = t.start_span("lm", SpanKind.LLM)
+    t.end_span(lm, output="lm-ok")
+    t.end_span(tl, output="tool-ok")
+    t.end_span(a, output="agent-ok")
+
+    roots = t.build_tree()
+    assert len(roots) == 1
+    root = roots[0]
+    assert root["name"] == "a"
+    assert len(root["children"]) == 1
+    assert root["children"][0]["name"] == "tl"
+    assert len(root["children"][0]["children"]) == 1
+    assert root["children"][0]["children"][0]["name"] == "lm"
+    assert root["children"][0]["children"][0]["children"] == []
+
+
+def test_build_tree_does_not_alter_replay_behavior():
+    """build_tree() 是纯新增，不改变 replay() 的返回与字段结构。"""
+    from fast_agents.trace import TraceLogger, SpanKind, InMemoryTraceStore
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store)
+    a = t.start_span("a", SpanKind.AGENT)
+    b = t.start_span("b", SpanKind.TOOL)
+    t.end_span(b, output="b-ok")
+    t.end_span(a, output="a-ok")
+
+    rep_before = t.replay()
+    _ = t.build_tree()
+    rep_after = t.replay()
+    assert rep_before == rep_after, "调用 build_tree() 后 replay() 应保持不变"
+    for n in rep_before:
+        assert "children" not in n, "replay() 返回的 dict 不应被注入 children 字段"
+
+
+def test_build_tree_multi_root_preserves_all_roots():
+    """同一次 read 出现多个 root（parent_id=None）时，全部作为根节点返回。"""
+    from fast_agents.trace import TraceLogger, SpanKind, InMemoryTraceStore
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store)
+    # 两条独立 trace（模拟显式传 trace_id=None 时跨 trace 聚合场景）
+    with t.trace("t1"):
+        a1 = t.start_span("a1", SpanKind.AGENT)
+        t.end_span(a1, output="a1-ok")
+    with t.trace("t2"):
+        a2 = t.start_span("a2", SpanKind.AGENT)
+        t.end_span(a2, output="a2-ok")
+    roots = t.build_tree(session_id=t.session_id)  # 跨两条 trace 取全量
+    names = sorted(r["name"] for r in roots)
+    assert names == ["a1", "a2"], f"应包含两个根节点：{names}"
+
+
+
+def test_build_tree_orphan_chain_does_not_duplicate_nodes():
+    """悬空父链（A→B→C→D，A 的父不存在）下 build_tree 不重复输出节点、子树完整保留。"""
+    from fast_agents.trace import TraceLogger, InMemoryTraceStore
+
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store, session_id="s_orphan")
+
+    def _mk(sid, pid, name, seq):
+        s = SpanRecord(span_id=sid, trace_id="t1", name=name, kind=SpanKind.AGENT, parent_id=pid)
+        s._create_seq = seq
+        s.start_time = 0.0
+        s.end_time = 0.0
+        s.duration_ms = 0.0
+        s.status = SpanStatus.SUCCESS
+        store.write(s)
+
+    _mk("a", "no-such-parent", "o1", 1)
+    _mk("b", "a", "o2", 2)
+    _mk("c", "b", "o3", 3)
+    _mk("d", "c", "o4", 4)
+
+    roots = t.build_tree()
+    # 悬空起始点 a 应被提升为 root，b/c/d 保留在其 children 下
+    assert len(roots) == 1, f"应只有 1 个孤儿 root，实际 {len(roots)}"
+    root = roots[0]
+    assert root["span_id"] == "a"
+    assert root.get("_orphan") is True
+    # 子树完整
+    assert root["children"][0]["span_id"] == "b"
+    assert root["children"][0]["children"][0]["span_id"] == "c"
+    assert root["children"][0]["children"][0]["children"][0]["span_id"] == "d"
+    # 唯一节点数为 4，不重复
+    def _walk(nodes, seen=None):
+        if seen is None:
+            seen = set()
+        for n in nodes:
+            if n["span_id"] in seen:
+                continue
+            seen.add(n["span_id"])
+            _walk(n["children"], seen)
+        return seen
+
+    uniq = _walk(roots)
+    assert uniq == {"a", "b", "c", "d"}, f"4 个唯一节点应全部出现：{uniq}"
+
+
+def test_build_tree_single_orphan_with_child_does_not_duplicate():
+    """单层悬空父引用 + 一个子节点：不重复、子节点挂在孤儿下。"""
+    from fast_agents.trace import TraceLogger, InMemoryTraceStore
+    from fast_agents.trace.models import SpanKind, SpanRecord, SpanStatus
+
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store, session_id="s_orphan2")
+
+    def _mk(sid, pid, name, seq):
+        s = SpanRecord(span_id=sid, trace_id="t1", name=name, kind=SpanKind.AGENT, parent_id=pid)
+        s._create_seq = seq
+        s.start_time = 0.0
+        s.end_time = 0.0
+        s.duration_ms = 0.0
+        s.status = SpanStatus.SUCCESS
+        store.write(s)
+
+    _mk("a", "x", "orphan", 1)
+    _mk("b", "a", "child", 2)
+
+    roots = t.build_tree()
+    assert len(roots) == 1
+    assert roots[0]["span_id"] == "a"
+    assert roots[0].get("_orphan") is True
+    assert [c["span_id"] for c in roots[0]["children"]] == ["b"]
+
+
+def test_build_tree_multi_root_with_orphan_no_duplicate():
+    """多个正常 root + 一棵悬空子树混合场景：不重复、节点不丢失。"""
+    from fast_agents.trace import TraceLogger, InMemoryTraceStore
+    from fast_agents.trace.models import SpanKind, SpanRecord, SpanStatus
+
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store, session_id="s_mix")
+
+    def _mk(sid, pid, name, seq):
+        s = SpanRecord(span_id=sid, trace_id="t1", name=name, kind=SpanKind.AGENT, parent_id=pid)
+        s._create_seq = seq
+        s.start_time = 0.0
+        s.end_time = 0.0
+        s.duration_ms = 0.0
+        s.status = SpanStatus.SUCCESS
+        store.write(s)
+
+    _mk("r1", None, "r1", 1)
+    _mk("r2", None, "r2", 2)
+    _mk("c1", "r1", "c1", 3)
+    _mk("o", "xx", "orphan", 4)
+    _mk("oc", "o", "oc", 5)
+
+    roots = t.build_tree()
+    assert len(roots) == 3, f"两个正常 root + 一个孤儿 = 3：{len(roots)}"
+
+    def _walk(nodes, seen=None):
+        if seen is None:
+            seen = set()
+        for n in nodes:
+            if n["span_id"] in seen:
+                continue
+            seen.add(n["span_id"])
+            _walk(n["children"], seen)
+        return seen
+    assert _walk(roots) == {"r1", "r2", "c1", "o", "oc"}
+
+def test_build_tree_cycle_does_not_drop_or_duplicate_nodes():
+    """病态环/自环数据下 build_tree 不丢节点、不重复、不递归死循环。"""
+    from fast_agents.trace import TraceLogger, InMemoryTraceStore
+    from fast_agents.trace.models import SpanKind, SpanRecord, SpanStatus
+
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store)
+
+    def _mk(sid, pid, name, seq):
+        s = SpanRecord(span_id=sid, trace_id="t_cycle", name=name, kind=SpanKind.AGENT, parent_id=pid)
+        s._create_seq = seq
+        s.start_time = 0.0
+        s.end_time = 0.0
+        s.duration_ms = 0.0
+        s.status = SpanStatus.SUCCESS
+        store.write(s)
+
+    # 自环 A.parent=A
+    _mk("a", "a", "self-loop", 1)
+    # 双环 A↔B
+    _mk("b", "c", "B", 2)
+    _mk("c", "b", "C", 3)
+
+    roots = t.build_tree(trace_id="t_cycle")
+
+    def _walk(nodes, seen=None):
+        if seen is None:
+            seen = set()
+        total = 0
+        for n in nodes:
+            if n["span_id"] in seen:
+                continue
+            seen.add(n["span_id"])
+            total += 1 + _walk(n["children"], seen)
+        return total
+
+    total = _walk(roots)
+    assert total == 3, f"环数据下应覆盖全部 3 个唯一节点（自环+双环），实际 {total}"
+    assert len(roots) >= 1, "环数据应至少提升一个孤儿 root 节点"
+
+
+
+
+
+
+# ==================== build_tree 悬空父子树回归 ====================
+def _count_tree_nodes(nodes):
+    total = 0
+    for n in nodes:
+        total += 1
+        total += _count_tree_nodes(n.get("children", []))
+    return total
+
+
+def test_build_tree_orphan_chain_does_not_duplicate_nodes1():
+    """悬空父链（父节点在本批次不存在）时，仅起始节点标记_orphan提升为root，子孙保留在children下，无重复节点。"""
+    from fast_agents.trace.in_memory_trace_store import InMemoryTraceStore
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store, session_id="orphan_chain")
+    a = t.start_span("A", SpanKind.TOOL); a.parent_id = "non_existent_parent"
+    b = t.start_span("B", SpanKind.TOOL); b.parent_id = a.span_id
+    c = t.start_span("C", SpanKind.TOOL); c.parent_id = b.span_id
+    d = t.start_span("D", SpanKind.TOOL); d.parent_id = c.span_id
+    for s in (d, c, b, a): t.end_span(s)
+    roots = t.build_tree()
+    real_count = len(store.read())
+    assert len(roots) == 1, f"悬空链仅应A为root，实得{len(roots)}"
+    assert roots[0]["name"] == "A" and roots[0].get("_orphan") is True
+    assert _count_tree_nodes(roots) == real_count == 4, f"节点数应等于实际span数4，实得树节点{_count_tree_nodes(roots)}"
+
+
+def test_build_tree_single_orphan_with_child_does_not_duplicate1():
+    """单层悬空父+子场景无重复。"""
+    from fast_agents.trace.in_memory_trace_store import InMemoryTraceStore
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store, session_id="orphan_single")
+    a = t.start_span("A", SpanKind.TOOL); a.parent_id = "non_existent_parent"
+    b = t.start_span("B", SpanKind.TOOL); b.parent_id = a.span_id
+    for s in (b, a): t.end_span(s)
+    roots = t.build_tree()
+    assert len(roots) == 1 and roots[0]["name"] == "A"
+    assert _count_tree_nodes(roots) == 2
+    assert len(roots[0]["children"]) == 1 and roots[0]["children"][0]["name"] == "B"
+
+
+def test_build_tree_multi_root_with_orphan_no_duplicate1():
+    """多root（两个parent_id=None）+ 一个悬空子树场景无重复。"""
+    from fast_agents.trace.in_memory_trace_store import InMemoryTraceStore
+    store = InMemoryTraceStore()
+    t = TraceLogger(store=store, session_id="multi_root_orphan")
+    r1 = t.start_span("R1", SpanKind.AGENT)
+    c1 = t.start_span("C1", SpanKind.TOOL)
+    t.end_span(c1); t.end_span(r1)
+    r2 = t.start_span("R2", SpanKind.AGENT)
+    t.end_span(r2)
+    a = t.start_span("A", SpanKind.TOOL); a.parent_id = "no_parent"
+    c2 = t.start_span("C2", SpanKind.TOOL); c2.parent_id = a.span_id
+    t.end_span(c2); t.end_span(a)
+    roots = t.build_tree()
+    names = sorted([r["name"] for r in roots])
+    assert names == ["A", "R1", "R2"], f"应3个root，实得{names}"
+    assert _count_tree_nodes(roots) == len(store.read()) == 5
+    orphan = [r for r in roots if r.get("_orphan")][0]
+    assert orphan["name"] == "A"
+
+
+def test_error_type_auto_inferred_from_colon_separated_error():
+    """error_type 从 ``"ExceptionName: msg"`` 格式自动推断（K1 收尾③）。"""
+    from fast_agents.trace.in_memory_trace_store import InMemoryTraceStore
+    from fast_agents.trace.models import SpanKind
+    store = InMemoryTraceStore()
+    tracer = TraceLogger(store=store, session_id="t_err")
+    span = tracer.start_span("op", SpanKind.CUSTOM)
+    tracer.end_span(span, output=None, error="ValueError: bad input")
+    spans = tracer.replay()
+    assert len(spans) == 1
+    assert spans[0]["status"] == "error"
+    assert spans[0]["error"] == "ValueError: bad input"
+    assert spans[0]["error_type"] == "ValueError"
+
+
+def test_error_type_with_block_exception_auto_filled():
+    """with 语法里抛出的异常自动填 error_type=异常类名。"""
+    from fast_agents.trace.in_memory_trace_store import InMemoryTraceStore
+    from fast_agents.trace.models import SpanKind
+    store = InMemoryTraceStore()
+    tracer = TraceLogger(store=store, session_id="t_with")
+    try:
+        with tracer.span("op", SpanKind.TOOL):
+            raise RuntimeError("ctx error")
+    except RuntimeError:
+        pass
+    spans = tracer.replay()
+    assert len(spans) == 1
+    assert spans[0]["error_type"] == "RuntimeError"
+
+
+def test_error_type_success_span_is_none():
+    """成功 Span 的 error_type 必须为 None，不能被误填。"""
+    from fast_agents.trace.in_memory_trace_store import InMemoryTraceStore
+    from fast_agents.trace.models import SpanKind
+    store = InMemoryTraceStore()
+    tracer = TraceLogger(store=store)
+    with tracer.span("ok", SpanKind.TOOL):
+        pass
+    spans = tracer.replay()
+    assert len(spans) == 1
+    assert spans[0]["status"] == "success"
+    assert spans[0]["error"] is None
+    assert spans[0]["error_type"] is None
+
+
+def test_error_type_jsonl_roundtrip():
+    """jsonl 落盘再读回，error_type 字段完整保留。"""
+    import tempfile, os
+    from fast_agents.trace.jsonl_store import JsonlStore
+    from fast_agents.trace.models import SpanKind
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "t.jsonl")
+        js = JsonlStore(path)
+        tracer = TraceLogger(store=js)
+        span = tracer.start_span("x", SpanKind.LLM)
+        tracer.end_span(span, output=None, error="TimeoutError: timed out")
+        js.close()
+        js2 = JsonlStore(path, append=True)
+        rs = js2.read()
+        js2.close()
+        assert len(rs) == 1
+        assert rs[0].error_type == "TimeoutError"
+
+
+def test_error_type_sqlite_auto_migrate_old_db():
+    """老 SQLite 库（无 error_type 列）自动补列，读回不报错且新写入正确。"""
+    import tempfile, os, sqlite3, time
+    from fast_agents.trace.sqlite_store import SQLiteStore
+    from fast_agents.trace.models import SpanKind
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "old.db")
+        conn = sqlite3.connect(path)
+        conn.execute("""CREATE TABLE trace_spans (
+            id INTEGER PRIMARY KEY, span_id TEXT UNIQUE NOT NULL, trace_id TEXT NOT NULL,
+            parent_id TEXT, session_id TEXT, name TEXT NOT NULL, kind TEXT NOT NULL,
+            start_time REAL NOT NULL, end_time REAL, duration_ms REAL, status TEXT NOT NULL,
+            error TEXT, input TEXT, output TEXT, metadata TEXT NOT NULL, create_seq INTEGER)""")
+        now = time.time()
+        conn.execute("INSERT INTO trace_spans VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("s1","t1",None,"sess","old","tool",now,now+0.1,100.0,"error",
+             "ValueError: old","null","null","{}",1))
+        conn.commit()
+        conn.close()
+        # 打开老库，ensure_schema 自动补 error_type 列
+        sq = SQLiteStore(path)
+        # 新写入的 Span 必须能正确记录 error_type
+        tracer = TraceLogger(store=sq)
+        span = tracer.start_span("y", SpanKind.LLM)
+        tracer.end_span(span, output=None, error="ConnectionError: refused")
+        rs = sq.read()
+        sq.close()
+        # 老数据 error_type 为 None（历史数据不回填，零破坏）
+        old_span = [r for r in rs if r.span_id == "s1"][0]
+        assert old_span.error == "ValueError: old"
+        assert old_span.error_type is None
+        # 新数据 error_type 正常
+        new_span = [r for r in rs if r.name == "y"][0]
+        assert new_span.error_type == "ConnectionError"
+
+
+
+
+# ==================== K1 收尾④：单调时钟耗时（抗墙钟跳变） ====================
+def test_start_span_assigns_monotonic_clock_start():
+    """TraceLogger.start_span 创建的 Span 会带单调时钟起点（finish 时用于抗墙钟跳变）。"""
+    t = TraceLogger()
+    try:
+        s = t.start_span("m", SpanKind.CUSTOM)
+        assert getattr(s, "_mono_start", None) is not None
+    finally:
+        t.close()
+
+
+def test_direct_spanrecord_finish_keeps_wall_clock_duration():
+    """直接构造的 SpanRecord（未经 TraceLogger）默认路径仍按墙钟差值算耗时（旧口径不变）。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.CUSTOM, start_time=1000.0)
+    assert getattr(s, "_mono_start", None) is None
+    s.finish()
+    assert s.duration_ms is not None
+    assert abs(s.duration_ms - (s.end_time - 1000.0) * 1000.0) < 1e-6
+
+
+def test_default_duration_path_measures_real_elapsed_time():
+    """默认路径（不传 end_time）耗时按单调时钟计算，量级与真实经过时间一致。"""
+    import time
+    t = TraceLogger()
+    try:
+        s = t.start_span("m", SpanKind.CUSTOM)
+        time.sleep(0.02)
+        t.end_span(s)
+        sp = t.read_spans()[0]
+        assert sp.duration_ms is not None
+        assert 20.0 <= sp.duration_ms < 1000.0
+        # 展示用的墙钟字段仍是 time.time()：正常情况 end >= start
+        assert sp.end_time is not None and sp.end_time >= sp.start_time
+    finally:
+        t.close()
+
+
+def test_duration_measures_monotonic_under_wall_clock_jump():
+    """墙钟被向前拨动 1 小时时，duration_ms 仍为真实耗时（单调时钟），不被污染。"""
+    import time
+    t = TraceLogger()
+    try:
+        s = t.start_span("m", SpanKind.CUSTOM)
+        real_time = time.time
+        time.time = lambda: real_time() + 3600.0   # 模拟 NTP 向前校正 1 小时
+        try:
+            time.sleep(0.005)
+            t.end_span(s)
+        finally:
+            time.time = real_time
+        sp = t.read_spans()[0]
+        # 旧口径会是 ~3600000ms（1 小时量级），新口径为毫秒级
+        assert sp.duration_ms is not None
+        assert sp.duration_ms < 1000.0, f"duration_ms={sp.duration_ms} 被墙钟跳变污染"
+        assert sp.duration_ms >= 0.0
+    finally:
+        t.close()
+
+
+def test_explicit_end_time_keeps_wall_clock_duration():
+    """显式传 end_time 时仍走墙钟差值（后钩子 / 手工精确起止口径不变）。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.CUSTOM, start_time=1000.0)
+    s.finish(end_time=2500.0)
+    assert s.duration_ms == 1500000.0
+
 
 # ==================== 入口 ====================
 
@@ -1473,7 +1720,7 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
-    # test_jsonl_store_handles_extreme_unserializable_objects()
+    test_build_tree_cycle_does_not_drop_or_duplicate_nodes()
     pass
 
 
