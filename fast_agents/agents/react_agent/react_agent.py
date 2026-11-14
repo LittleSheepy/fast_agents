@@ -138,6 +138,7 @@ class ReActAgent(AgentBase):
         context_budget: Optional[int] = None,
         context_offload_threshold: int = 4_000,
         tracer: Optional["TraceLogger"] = None,
+        parallel_tool_calls: bool = False,
     ):
         """
         初始化ReActAgent
@@ -178,6 +179,7 @@ class ReActAgent(AgentBase):
         super().__init__(name, llm, system_prompt)
         self.tool_registry = tool_registry or ToolRegistry()
         self.max_steps = max_steps
+        self.parallel_tool_calls = parallel_tool_calls
         self.messages: Messages = Messages()
 
         # 设置提示词模板：用户自定义优先，否则使用默认模板
@@ -622,7 +624,7 @@ class ReActAgent(AgentBase):
             _agent_span = _tracer.start_span(
                 name=f"agent.run",
                 kind=SpanKind.AGENT,
-                input={"user_input": input_text[:500], "agent": self.name, "max_steps": self.max_steps},
+                input={"user_input": _tracer.truncate_preview(input_text, 500, is_input=True), "agent": self.name, "max_steps": self.max_steps},
                 metadata={"agent": self.name},
             )
 
@@ -681,29 +683,76 @@ class ReActAgent(AgentBase):
                         if response.tool_calls:
                             tool_names = [tc.name for tc in response.tool_calls]
                             return_direct_answer: Optional[str] = None
-                            for tool_call in response.tool_calls:
-                                # 统一通过 invoke_tool 获取 ToolResult（含参数校验 / 错误捕获 / 截断）
-                                result = self.tool_registry.invoke_tool(
-                                    tool_call.name, tool_call.arguments,
+                            # 分支1：并行开关开启且本轮工具数≥2 → 走并发执行
+                            if self.parallel_tool_calls and len(response.tool_calls) >= 2:
+                                # 组装并发调用入参，hooks回主线程避免trace链路断/跨线程写库问题
+                                call_list = []
+                                for tc in response.tool_calls:
+                                    args = tc.arguments
+                                    if isinstance(args, str):
+                                        import json
+                                        try:
+                                            args = json.loads(args)
+                                        except json.JSONDecodeError:
+                                            args = {}
+                                    call_list.append((tc.name, args or {}))
+                                results = self.tool_registry.invoke_tools_concurrent(
+                                    calls=call_list,
+                                    hooks_in_caller_thread=True,
                                 )
-                                # return_direct：工具标记「结果直接作为最终答案返回」，不再进下一轮推理
-                                tool_obj = self.tool_registry.get_tool(tool_call.name)
-                                if tool_obj is not None and getattr(tool_obj, "return_direct", False) and result.succeeded:
-                                    return_direct_answer = result.output
-                                # 给不同 status 加上显式前缀，帮助模型理解结果性质
-                                observation = _render_observation(result)
-                                # 超长结果先卸载到磁盘：上下文里只留引用，模型可按需 read_offloaded 回读
-                                observation = self._offload_observation(tool_call.name, observation)
-                                # 通知技能中间件：捕获 load_skill 事件，记录已加载技能
-                                if self.skill_middleware is not None:
-                                    observation = self.skill_middleware.after_tool_call(
-                                        tool_call.name, tool_call.arguments or {}, observation,
+                                # 结果顺序与tool_calls严格对齐，逐个处理（和顺序逻辑完全一致）
+                                for idx, tool_call in enumerate(response.tool_calls):
+                                    result = results[idx]
+                                    # return_direct：工具标记「结果直接作为最终答案返回」，不再进下一轮推理
+                                    tool_obj = self.tool_registry.get_tool(tool_call.name)
+                                    if tool_obj is not None and getattr(tool_obj, "return_direct", False) and result.succeeded:
+                                        return_direct_answer = result.output
+                                    # 给不同 status 加上显式前缀，帮助模型理解结果性质
+                                    observation = _render_observation(result)
+                                    # 超长结果先卸载到磁盘：上下文里只留引用，模型可按需 read_offloaded 回读
+                                    observation = self._offload_observation(tool_call.name, observation)
+                                    # 通知技能中间件：捕获 load_skill 事件，记录已加载技能
+                                    if self.skill_middleware is not None:
+                                        tool_args = tool_call.arguments
+                                        if isinstance(tool_args, str):
+                                            import json
+                                            try:
+                                                tool_args = json.loads(tool_args)
+                                            except json.JSONDecodeError:
+                                                tool_args = {}
+                                        observation = self.skill_middleware.after_tool_call(
+                                            tool_call.name, tool_args or {}, observation,
+                                        )
+                                    tool_msg = Message("tool", observation)
+                                    # OpenAI 要求 tool 消息带 tool_call_id；通过 metadata 挂载，
+                                    # to_openai_message 里会用到
+                                    tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
+                                    self.messages.append(tool_msg)
+                            # 分支2：默认/单工具 → 保持原有顺序执行逻辑，零变化
+                            else:
+                                for tool_call in response.tool_calls:
+                                    # 统一通过 invoke_tool 获取 ToolResult（含参数校验 / 错误捕获 / 截断）
+                                    result = self.tool_registry.invoke_tool(
+                                        tool_call.name, tool_call.arguments,
                                     )
-                                tool_msg = Message("tool", observation)
-                                # OpenAI 要求 tool 消息带 tool_call_id；通过 metadata 挂载，
-                                # to_openai_message 里会用到
-                                tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
-                                self.messages.append(tool_msg)
+                                    # return_direct：工具标记「结果直接作为最终答案返回」，不再进下一轮推理
+                                    tool_obj = self.tool_registry.get_tool(tool_call.name)
+                                    if tool_obj is not None and getattr(tool_obj, "return_direct", False) and result.succeeded:
+                                        return_direct_answer = result.output
+                                    # 给不同 status 加上显式前缀，帮助模型理解结果性质
+                                    observation = _render_observation(result)
+                                    # 超长结果先卸载到磁盘：上下文里只留引用，模型可按需 read_offloaded 回读
+                                    observation = self._offload_observation(tool_call.name, observation)
+                                    # 通知技能中间件：捕获 load_skill 事件，记录已加载技能
+                                    if self.skill_middleware is not None:
+                                        observation = self.skill_middleware.after_tool_call(
+                                            tool_call.name, tool_call.arguments or {}, observation,
+                                        )
+                                    tool_msg = Message("tool", observation)
+                                    # OpenAI 要求 tool 消息带 tool_call_id；通过 metadata 挂载，
+                                    # to_openai_message 里会用到
+                                    tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
+                                    self.messages.append(tool_msg)
                             # return_direct 命中：本轮不再把 tool 结果喂给模型，直接作为最终答案返回
                             if return_direct_answer is not None:
                                 final_answer = return_direct_answer
@@ -751,7 +800,7 @@ class ReActAgent(AgentBase):
             if _agent_span is not None and _tracer is not None:
                 _tracer.end_span(
                     _agent_span,
-                    output={"final_answer_preview": (final_answer[:300] if final_answer else None), "steps": current_step},
+                    output={"final_answer_preview": (_tracer.truncate_preview(final_answer, 300) if final_answer else None), "steps": current_step},
                 )
             return final_answer
         except Exception as run_err:
