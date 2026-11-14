@@ -19,8 +19,7 @@ class TraceStoreBase(ABC):
         """写入一条 Span 记录。实现方必须保证异常不向上抛（打点不能阻塞业务）。"""
 
     @abstractmethod
-    def read(
-        self,
+    def read(self,
         session_id: Optional[str] = None,
         trace_id: Optional[str] = None,
         kind: Optional[str] = None,
@@ -46,6 +45,14 @@ class TraceStoreBase(ABC):
 
     def flush(self) -> None:
         """将缓冲刷入持久化介质；默认 no-op，需要 fsync 的后端可覆盖。"""
+
+    def __del__(self) -> None:
+        """析构时尝试关闭连接。"""
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 
 __all__ = ["TraceStoreBase"]

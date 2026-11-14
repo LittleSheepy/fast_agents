@@ -4,7 +4,8 @@
 - **TraceLogger**：核心记录器，借鉴 OpenTelemetry / LangChain Callback 的 Trace/Span 概念，
   默认 JsonlStore 一行一条 JSON 落盘，可切换到内存模式，存储层可替换（SQLiteStore 已交付）；
 - **SpanKind / SpanStatus / SpanRecord**：Span 类型 / 状态 / 数据模型；
-- **JsonlStore / SQLiteStore / TraceStoreBase**：存储后端与抽象基类；
+- **JsonlStore / SQLiteStore / InMemoryTraceStore / TraceStoreBase**：存储后端与抽象基类；
+  纯内存后端 InMemoryTraceStore 是 ``TraceLogger()`` / ``store=":memory:"`` 的默认落点；
 - **TraceEvaluator / TraceMetrics / EvaluationReport**（K3）：离线评估器，
   基于已落盘的 trace 数据批量聚合成本/效率/质量指标，支持 dict / JSON / 文本 / CSV 四种输出；
 - **CostDailyReport / DayCostMetrics / daily_cost_report**（K3 高阶）：按自然日
@@ -16,9 +17,10 @@
 """
 from .models import SpanKind, SpanRecord, SpanStatus
 from .store_base import TraceStoreBase
-from .jsonl_store import JsonlStore, MEMORY_PATH
+from .jsonl_store import JsonlStore
 from .sqlite_store import SQLiteStore
-from .trace_logger import TraceLogger
+from .in_memory_trace_store import InMemoryTraceStore
+from .trace_logger import TraceLogger, MEMORY_PATH
 from .evaluator import (
     TraceEvaluator,
     TraceMetrics,
@@ -40,6 +42,7 @@ __all__ = [
     "JsonlStore",
     "MEMORY_PATH",
     "SQLiteStore",
+    "InMemoryTraceStore",
     # 评估（K3）
     "TraceEvaluator",
     "TraceMetrics",

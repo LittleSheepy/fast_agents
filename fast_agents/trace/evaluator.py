@@ -25,6 +25,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 import statistics
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, Iterable, List, Optional, Union
@@ -70,7 +71,7 @@ class TraceMetrics:
     llm_error_count: int = 0           # LLM 调用错误数
     tool_error_count: int = 0          # 工具调用错误数
     tool_error_rate: Optional[float] = None   # tool_error / tool_calls（无 tool_calls 时 None）
-    success: bool = True               # 整条 trace 是否成功（root Span status=success 且无未捕获异常）
+    success: bool = True               # 整条 trace 是否成功（所有 Span status=success 且无未捕获异常）
     error_messages: List[str] = field(default_factory=list)   # 去重的 error 信息列表
 
     # ---------- 工具分布 ----------
@@ -353,27 +354,53 @@ class TraceEvaluator:
             path: trace 落盘文件路径；支持 ``:memory:``（返回空评估器）。
             backend: 显式指定 ``"jsonl"`` 或 ``"sqlite"``；默认按后缀自动识别。
         """
-        from .jsonl_store import MEMORY_PATH, JsonlStore
+        from .jsonl_store import JsonlStore
         from .sqlite_store import SQLiteStore
+        from .trace_logger import MEMORY_PATH
 
-        if path == MEMORY_PATH:
+        # 解析为文件系统路径；非法类型直接返回空评估器
+        try:
+            fs_path = os.fspath(path)
+        except TypeError:
             return cls([])
-        store: Any
+
+        if fs_path == MEMORY_PATH:
+            return cls([])
+
+        # **只读语义**：目标不存在时直接返回空评估器，**绝不**构造 Store。
+        # JsonlStore / SQLiteStore 的构造函数都会 mkdir / open / ensure_schema，
+        # 对一个只想「读一次」的入参来说，会凭空创建 jsonl / db 文件（以及父目录），
+        # 属于意外副作用。
+        try:
+            if not fs_path or not os.path.exists(fs_path):
+                return cls([])
+        except Exception:
+            return cls([])
+
+        store: Any = None
         try:
             use_sqlite = False
             if backend is not None:
                 use_sqlite = backend.lower() == "sqlite"
             else:
-                ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+                ext = fs_path.rsplit(".", 1)[-1].lower() if "." in fs_path else ""
                 use_sqlite = ext in {"db", "sqlite", "sqlite3"}
             if use_sqlite:
-                store = SQLiteStore(path)
+                store = SQLiteStore(fs_path)
             else:
-                store = JsonlStore(path, append=True)
-            return cls(store)
+                store = JsonlStore(fs_path, append=True)
+            evaluator = cls(store)
         except Exception:
-            # 文件不存在 / 损坏等，返回空评估器
+            # 文件损坏等，返回空评估器
             return cls([])
+
+        # Span 已在构造时全量读入内存，这里及时释放后端句柄，避免离线评估残留打开的文件 / 连接
+        try:
+            if store is not None:
+                store.close()
+        except Exception:
+            pass
+        return evaluator
 
     # ---------- 核心：单 trace 指标计算 ----------
     def _compute_trace_metrics(self, trace_id: str, spans: List[SpanRecord]) -> TraceMetrics:
@@ -385,16 +412,6 @@ class TraceEvaluator:
         try:
             m.session_id = spans[0].session_id
             m.span_count = len(spans)
-
-            # 找 root Span（parent_id 为 None）以判定整条 trace 成功与否
-            root_spans = [s for s in spans if s.parent_id is None]
-            if root_spans:
-                # 取最先创建的 root 作为代表
-                root = min(root_spans, key=lambda s: getattr(s, "_create_seq", 0) or s.start_time)
-                m.success = (root.status == SpanStatus.SUCCESS and not root.error)
-            else:
-                # 没有 root：只要没有 error Span 就算成功（防御性兜底）
-                m.success = all(s.status != SpanStatus.ERROR for s in spans)
 
             min_start: Optional[float] = None
             max_end: Optional[float] = None
@@ -477,9 +494,11 @@ class TraceEvaluator:
                             err_str = str(s.error)
                             if err_str not in m.error_messages:
                                 m.error_messages.append(err_str)
-                        if root_spans is None or s not in root_spans:
-                            # 非 root span 出错也会导致整条 trace 的 success 标记为 False
-                            m.success = False
+                        # 只要「非代表 root」的 span 出错，整条 trace 即视为失败。
+                        # 代表 root 自身的错误已由上方 root 判定覆盖；这里用身份比较
+                        # （is not）而非值比较（not in root_spans）：后者会把另一个
+                        # parent_id=None 的 root 也算作 root，从而漏报它的错误。
+                        m.success = False
                 except Exception:
                     pass
 
@@ -515,7 +534,8 @@ class TraceEvaluator:
         Args:
             session_id: 可选，按会话过滤。
             trace_id:   可选，只评估单条 trace（优先级最高）。
-            limit:      可选，从 store 最多读取多少条 Span（避免大库一次性拉爆内存）。
+            limit:      可选，最多评估「最近 N 条 trace」（按 trace 最近活跃时间倒序，
+                        取该 trace 的全部 span、不截断内部结构）；与 top_n_traces 同口径。
             top_n_traces: 可选，只评估「最近 N 条 trace」（按 root Span 时间倒序），
                           不传则评估全部 trace。
         """
@@ -535,13 +555,6 @@ class TraceEvaluator:
                 spans = [s for s in spans if s.session_id == session_id]
             if trace_id is not None:
                 spans = [s for s in spans if s.trace_id == trace_id]
-            if limit is not None and limit > 0:
-                # 按创建序号/时间倒序取最近 limit 条
-                spans = sorted(
-                    spans,
-                    key=lambda s: (getattr(s, "_create_seq", 0), s.start_time),
-                    reverse=True,
-                )[:limit]
         except Exception:
             pass
 
@@ -556,16 +569,25 @@ class TraceEvaluator:
             except Exception:
                 continue
 
-        # 若指定 top_n_traces，按"最近 root span"的时间倒序取前 N 条 trace
-        if top_n_traces is not None and top_n_traces > 0 and trace_id is None:
-            def _trace_latest_time(tid: str) -> float:
-                t_spans = groups[tid]
-                roots = [x for x in t_spans if x.parent_id is None]
-                pool = roots if roots else t_spans
-                return max((x.end_time or x.start_time or 0.0) for x in pool)
-            sorted_tids = sorted(groups.keys(), key=_trace_latest_time, reverse=True)
-            selected_tids = sorted_tids[:top_n_traces]
-            groups = {tid: groups[tid] for tid in selected_tids}
+        # limit / top_n_traces 一律按「最近 N 条 trace」口径截断，且取整条 trace 的
+        # 全部 span——trace 是评估的最小单位，若按 span 截断会丢掉 root span，从而把
+        # 一条失败的 trace 误判成成功（成功率、错误数一并失真）。故二者统一口径。
+        def _trace_latest_time(tid: str) -> float:
+            t_spans = groups[tid]
+            roots = [x for x in t_spans if x.parent_id is None]
+            pool = roots if roots else t_spans
+            return max((x.end_time or x.start_time or 0.0) for x in pool)
+
+        for _max_traces in (limit, top_n_traces):
+            if _max_traces is not None and _max_traces > 0:
+                try:
+                    sorted_tids = sorted(groups.keys(), key=_trace_latest_time, reverse=True)
+                    groups = {tid: groups[tid] for tid in sorted_tids[:_max_traces]}
+                except Exception:
+                    pass
+
+        if not groups:
+            return report
 
         # 计算每条 trace 指标
         trace_metrics: List[TraceMetrics] = []
@@ -913,24 +935,52 @@ class CostDailyReport:
 # ---------------------------------------------------------------------------
 # 内部工具函数（价格匹配）
 # ---------------------------------------------------------------------------
+# 允许出现在「已登记模型前缀」之后的扩展分隔符：代表同一模型族的不同发行版本
+# （如 ``gpt-4o-2024-08-06`` / ``claude-3-5-sonnet-20241022`` / ``gpt-4-turbo-preview``），
+# 命中后沿用该模型族的价目。
+#
+# 刻意**不含** ``.``：本表按「点分号段代表不同模型」的惯例维护（``gpt-4`` 与 ``gpt-4.1``
+# 是两个不同模型），若把 ``.`` 当作扩展分隔符，未登记的新模型会被误判成前缀老模型
+# （``gpt-4.1`` 命中 ``gpt-4``），从而套用错误价目。
+_PREFIX_EXT_SEPARATORS = frozenset({"-", "_", ":", "/", "@", " "})
+
+
 def _match_price(
     model: Optional[str],
     price_table: Dict[str, tuple],
     default: tuple,
 ) -> tuple:
-    """按"最长前缀优先"匹配模型价目；任何异常都返回 default。"""
+    """按「最长前缀优先」匹配模型价目；任何异常都返回 default。
+
+    匹配规则（避免未登记的新模型被误套老模型价目）：
+
+    1. **精确命中**（忽略大小写与首尾空白）直接返回；
+    2. 否则取最长且**边界合法**的前缀——前缀必须消费整串，或其后紧跟一个扩展分隔符
+       （见 :data:`_PREFIX_EXT_SEPARATORS`）。这样 ``gpt-4o-2024-08-06`` 命中 ``gpt-4o``，
+       而 ``gpt-4.1`` / ``gpt-4.1-nano`` 这类未登记模型不会命中 ``gpt-4``，改走兜底价；
+    3. 无合法前缀命中时返回 ``default``。
+    """
     try:
         if not model:
             return default
         m = str(model).strip().lower()
-        # 收集所有命中前缀，取最长
+        table: Dict[str, tuple] = {}
+        for k, v in price_table.items():
+            table[str(k).strip().lower()] = v
+        # 1) 精确命中
+        if m in table:
+            return table[m]
+        # 2) 最长合法前缀
         matched: Optional[tuple] = None
         matched_len = -1
-        for prefix, price in price_table.items():
-            pl = prefix.lower()
-            if m.startswith(pl) and len(pl) > matched_len:
-                matched = price
-                matched_len = len(pl)
+        for prefix, price in table.items():
+            if len(prefix) <= matched_len or not m.startswith(prefix):
+                continue
+            rest = m[len(prefix):]
+            if rest and rest[0] not in _PREFIX_EXT_SEPARATORS:
+                continue
+            matched = price
+            matched_len = len(prefix)
         return matched if matched is not None else default
     except Exception:
         return default
@@ -1029,7 +1079,7 @@ def _daily_cost_report(
             except Exception:
                 pass
             roots = [x for x in t_spans if x.parent_id is None]
-            root = min(roots, key=lambda s: getattr(s, "_create_seq", 0) or s.start_time) if roots else None
+            root = min(roots, key=lambda s: (getattr(s, "_create_seq", 0), s.start_time)) if roots else None
             # 用 root.start_time 归日；没 root 就用最早的 start
             anchor_ts: Optional[float] = None
             if root is not None:
