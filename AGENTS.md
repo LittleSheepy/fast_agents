@@ -50,6 +50,7 @@ python tests\database\test_database_sqlite.py
 python tests\database\test_database.py
 python tests\database\test_database_mysql.py
 python tests\memory\test_memory.py
+python tests\memory\test_memory_chroma_store.py
 python tests\tools\test_tools.py
 python tests\tools\test_file_tool.py
 python tests\trace\test_trace.py
