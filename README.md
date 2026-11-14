@@ -51,14 +51,14 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 文档 | 内容 |
 |------|------|
 | [`docs/工具模块编写说明.md`](./docs/工具模块编写说明.md) | 工具的四种定义方式、`ToolBase` 全字段、`ToolResult` 协议、schema 导出、内置工具逐行讲解（含文件四件套的乐观锁与原子写入） |
-| [`docs/记忆模块编写说明.md`](./docs/记忆模块编写说明.md) | 短期 vs 长期两层设计、**记忆注入位置**、打分公式、SQLite 表结构、语义检索包装器、结构化用户画像 |
+| [`docs/记忆模块编写说明.md`](./docs/记忆模块编写说明.md) | 短期 vs 长期两层设计、**记忆注入位置**、打分公式、SQLite 表结构、语义检索包装器、结构化用户画像、**冲突检测与消解** |
 | [`docs/Skill模块编写说明.md`](./docs/Skill模块编写说明.md) | `SKILL.md` 标准、三级渐进式加载、`@skill` / `BaseSkill` 两种写法、与 LangChain / Anthropic 的对比 |
 | [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md) | 零依赖 JSON-RPC 实现、**细粒度 vs 粗粒度展开**、`MCPConfig` 声明式配置、Windows 专项 |
 | [`docs/context模块编写说明.md`](./docs/context模块编写说明.md) | Token 预算与三级降级计数、五层拼装顺序、三级压缩策略、工具结果卸载与按需回读、与主流框架的取舍 |
 | [`docs/LLM模块编写说明.md`](./docs/LLM模块编写说明.md) | OpenAI 客户端轻封装、`invoke` / `stream_invoke`、embedding 分片并发与 query/document 语义区分、chat / embedding 模型独立配置、可选 `tracer` 打点与 token 用量元数据 |
 | [`docs/database模块编写说明.md`](./docs/database模块编写说明.md) | 关系型双后端（`SQLiteClient` 零依赖 + `MySQLClient` 可选，接口 100% 对齐）、三种声明式建表、谓词下推（9 种 FilterOp）、统一异常体系、向量后端（Chroma） |
-| [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md) | Span/Trace 模型、`TraceLogger` 门面、`JsonlStore` 与 `SQLiteStore`、`ToolRegistry` 钩子打点、查询与回放 |
-| [`docs/演进路线图.md`](./docs/演进路线图.md) | 按模块（A~G）组织的后续规划，含优先级、依赖、验收标准 |
+| [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md) | Span/Trace 模型、`TraceLogger` 门面、`InMemoryTraceStore` / `JsonlStore` / `SQLiteStore` 三后端、`ToolRegistry` 钩子打点、查询与回放、K3 离线评估器（指标聚合 + Token 成本日报）|
+| [`docs/演进路线图.md`](./docs/演进路线图.md) | 按模块（A~K）组织的后续规划，含优先级、依赖、验收标准 |
 
 > 写新模块文档时，骨架参考 [`docs/xx模块编写说明模版.md`](./docs/xx模块编写说明模版.md)。
 
@@ -72,12 +72,12 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 💬 **消息系统** | `Message` / `Messages` 双层结构，原生支持 function calling（`tool_calls` / `tool_call_id`），可一键转 OpenAI 格式 |
 | 🔧 **工具系统** | `ToolBase` 抽象基类 + `StructuredTool` / `@tool` 装饰器 + `ToolRegistry` 注册表，四种定义方式，schema 自动生成 |
 | 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关 |
-| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5）+ **记忆 TTL 到期回收**（B12，`remember(ttl=...)` 到期自动退出检索并回收）+ **增量抽取**（B10，只抽新增消息段、无新消息不调 LLM）+ **统一北京时间 CST（UTC+8）时间基准**（B8），支持 Agent 主动读写 |
+| 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **可选 Chroma 向量后端**（`ChromaMemoryStore`，阶段 2 已真实接入 `ChromaClient`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5）+ **记忆 TTL 到期回收**（B12，`remember(ttl=...)` 到期自动退出检索并回收）+ **增量抽取**（B10，只抽新增消息段、无新消息不调 LLM）+ **冲突检测与消解**（B13，写入前向量近邻查重、`newest_wins` 去重、词法 Jaccard 与向量通道始终叠加）+ **显式冲突上报**（B13，`remember(raise_on_conflict=True)` 命中有效重复时抛 `MemoryConflictError`；只读 `check_conflict()` 先探测）+ **统一北京时间 CST（UTC+8）时间基准**（B8），支持 Agent 主动读写 |
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
 | 🗄 **持久化基础服务** | `SQLiteClient` 零依赖封装标准库 `sqlite3`（可选 `MySQLClient` / `ChromaClient`），提供连接管理、DDL / CRUD / 事务、三种声明式建表、幂等 migrate 补列、谓词下推（`select_where` / `select_one_where`）、`count` / `batch_insert` / `upsert`；统一异常体系（`DatabaseError` + 7 子类），标识符白名单 + 值参数化双重防注入 |
-| 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，默认 JSONL 一行一条落盘、可选 `SQLiteStore` 结构化后端，支持内存模式与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时（v1.0.1）；状态栈改为实例级 ContextVar，多 tracer 不串扰、async 协程天然隔离（v1.0.2）；新增 `SQLiteStore`，按文件后缀自动识别后端、幂等迁移、同 span_id 幂等覆盖（v1.1.0）|
+| 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，`store` 单入口按文件后缀自动识别后端：不传或 `:memory:` → `InMemoryTraceStore` 纯内存，`.jsonl` → `JsonlStore` 一行一条落盘，`.db` / `.sqlite` / `.sqlite3` → `SQLiteStore` 结构化落盘（幂等迁移、同 span_id 幂等覆盖），支持查询与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时；状态栈为实例级 ContextVar，多 tracer 不串扰、async 协程天然隔离；另含 K3 离线评估器（`TraceEvaluator` 指标聚合 + Token 成本日报）|
 | 📦 **零重型依赖** | 记忆模块只用标准库（`sqlite3` / `json` / `pathlib`）；MCP 模块不用官方 SDK，只用标准库 + 可选 `requests`；Trace 模块零新增依赖（标准库 + pydantic） |
 
 ---
@@ -89,16 +89,20 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 - **Python ≥ 3.10**（仓库用 3.10）
 - Windows / macOS / Linux 均可
 
-### 方式一：uv（推荐，仓库自带三个脚本）
+### 方式一：uv（推荐，仓库自带七个脚本）
 
 Windows 下双击或按顺序执行：
 
 ```powershell
 cd D:\path\to\fast_agents
 
-.\第1步uv_init.bat      # uv init --python 3.10
-.\第2步uv_venv.bat      # uv venv --python 3.10
-.\第3步uv_add.bat       # uv add -r requirements.txt
+.\第0步uv_安装.bat        # 安装 uv（仅首次）
+.\第1步uv_init.bat        # uv init --python 3.10
+.\第2步uv_venv.bat        # uv venv --python 3.10
+.\第3步uv_add.bat         # uv add -r requirements.txt
+.\第4步uv_lock.bat        # uv lock
+.\第5步uv_sync.bat        # uv sync（装核心依赖）
+.\第5_1步uv_sync_all.bat  # uv sync --extra mysql --extra chroma
 ```
 
 ### 方式二：pip
@@ -129,6 +133,15 @@ duckduckgo-search>=8.1.1   # 内置 SearchTool 的默认 provider（免费、无
 tavily-python>=0.8.5       # 内置 SearchTool 的生产级 provider（需要 TAVILY_API_KEY）
 requests                   # 只用 MCP 的 SSE 传输时才需要（stdio 不需要）
 ```
+
+**可选后端（extras，按需安装）**
+
+```text
+pip install fast-agents[mysql]    # MySQL 关系型后端 MySQLClient（需要 pymysql）
+pip install fast-agents[chroma]   # 向量后端 ChromaClient（需要 chromadb）
+```
+
+> `uv` 用户如需可选后端，直接跑 `\第5_1步uv_sync_all.bat`（等价 `uv sync --extra mysql --extra chroma`）。
 
 > ✅ **技能系统依赖 `pyyaml`**：`fast_agents/skills/loader.py` 用 `yaml.safe_load` 解析 `SKILL.md` 的 front matter。它已列入 `requirements.txt`（`PyYAML>=6.0.3`）与 `pyproject.toml`，按依赖清单安装即可，通常无需手动补装（老环境若缺，`pip install pyyaml`）。
 
@@ -237,7 +250,7 @@ fast_agents/
 │   ├── memory/                   # ④ 记忆系统
 │   │   ├── __init__.py
 │   │   │                          # （时间基准统一在 fast_agents/utils/time_utils.py，B8 起本模块不再自维护时钟）
-│   │   ├── models.py             #    MemoryRecord / ContextPacket / MemoryKind / UserProfile
+│   │   ├── models.py             #    MemoryRecord / MemoryVector / ContextPacket / MemoryKind / UserProfile
 │   │   ├── memory_store_base.py               #    MemoryStoreBase 抽象接口
 │   │   ├── scoring.py            #    词法打分 + 时间衰减
 │   │   ├── buffer.py             #    BufferMemory：短期窗口 + 滚动摘要
@@ -245,8 +258,9 @@ fast_agents/
 │   │   ├── in_memory_store.py    #    InMemoryStore：纯内存长期记忆
 │   │   ├── sqlite_store.py       #    SQLiteMemoryStore：持久化长期记忆
 │   │   ├── semantic_store.py     #    SemanticMemoryStore：语义检索包装器（B2，可选）
-│   │   ├── chroma_store.py       #    ChromaMemoryStore：Chroma 向量库包装器（v1.8.0 阶段 1，可选）
+│   │   ├── chroma_store.py       #    ChromaMemoryStore：Chroma 向量库包装器（v1.8.0 阶段 1 / v1.8.3 阶段 2，可选）
 │   │   ├── profile_store.py      #    ProfileStore：结构化用户画像（B3，可选，SQLite / 内存两版）
+│   │   ├── errors.py             #    MemoryError / MemoryConflictError（v1.8.3 定义，v1.9.2 接线上线）
 │   │   └── manager.py            #    MemoryManager：短期 + 长期 + 画像的门面
 │   ├── skills/                   # ⑤ 技能系统
 │   │   ├── __init__.py
@@ -290,12 +304,15 @@ fast_agents/
 │   │   ├── vector_client_base.py     #    VectorClientBase：向量后端抽象
 │   │   ├── vector_query.py           #    VectorFilter / VectorFilterOp
 │   │   └── chroma_client.py          #    ChromaClient：向量后端落地
-│   ├── trace/                    # ⑩ TraceLogger 全链路记录（G1 · jsonl/SQLite 落盘、可回放）
+│   ├── trace/                    # ⑩ TraceLogger 全链路记录（K1 · InMemory/Jsonl/SQLite 落盘、树形回放、error_type 自动分类、单调时钟耗时、可评估）
 │   │   ├── __init__.py
-│   │   ├── models.py             #    SpanRecord / SpanKind / SpanStatus
+│   │   ├── models.py             #    SpanRecord / SpanKind / SpanStatus + 全局自增序号
 │   │   ├── store_base.py         #    TraceStoreBase 抽象基类
-│   │   ├── jsonl_store.py        #    JsonlStore：jsonl 逐行落盘 + 内存模式
-│   │   ├── sqlite_store.py       #    SQLiteStore：结构化 SQLite 落盘（v1.1.0）
+│   │   ├── in_memory_trace_store.py #  InMemoryTraceStore：纯内存后端（默认落点）
+│   │   ├── jsonl_store.py        #    JsonlStore：jsonl 逐行落盘
+│   │   ├── schema.py             #    SQLiteStore 的声明式建表 Schema
+│   │   ├── sqlite_store.py       #    SQLiteStore：结构化 SQLite 落盘
+│   │   ├── evaluator.py          #    K3 TraceEvaluator：指标聚合 + Token 成本日报
 │   │   └── trace_logger.py       #    TraceLogger 门面
 │   └── utils/                    # ⑪ 通用工具（time_utils.py 北京时间 CST 基准 / database_utils.py）
 ├── .skills/                      # 项目级技能目录（默认扫描位置）
@@ -311,8 +328,10 @@ fast_agents/
 │   ├── mcp/                      # MCP 示例（echo_server / quickstart / agent demo）
 │   ├── memory/                   # 记忆示例（会话落盘 / SQLite 长期记忆）
 │   ├── tools/                    # 工具示例（file_tools_demo.py）
-│   └── trace/                    # trace 示例（jsonl / SQLite 落盘 + 回放，离线可跑，不需要 API Key）
-├── test/                         # 测试与示例脚本
+│   └── trace/                    # trace 示例（内存 / jsonl / SQLite 落盘 + 树形回放 + K3 评估/成本日报/CSV 导出，离线可跑，不需要 API Key）
+├── tests/                        # 测试（按模块分目录，配 tests/_runner.py 零依赖运行器，不用 pytest）
+│   ├── _runner.py                #    自研零依赖测试运行器（run_all / run_prefix / raises / importorskip）
+│   └── init/  agents/  context/  database/  mcp/  memory/  tools/  trace/
 ├── pyproject.toml
 ├── requirements.txt
 ├── uv.lock
@@ -688,6 +707,9 @@ store.retract(memory_id)                                  # 软删（幂等）
 store.touch(memory_ids)                                   # B5：命中记账（不刷 updated_at）
 store.archive_stale(max_importance=0.3, stale_days=90)    # B5：衰减归档
 store.merge_similar(threshold=0.85)                       # B5：相似合并
+store.purge_expired()                                     # B12：到期回收（软删为 retracted）
+store.find_similar("内容", limit=5, threshold=0.85)        # B13：向量近邻查重（Chroma ANN 优先 / 语义 cosine 兜底，无向量时返回 []）
+store.vector_meta(memory_id)                              # B14：单条向量的 kind/importance/status 等 meta（SemanticMemoryStore，SQLite / 内存后端通用）
 store.close()
 ```
 
@@ -733,6 +755,9 @@ memory.render_context("查询", limit=5)                # → str
 memory.record(user_input, assistant_output)           # 写短期
 memory.remember("内容", kind="fact", importance=0.8)  # 手动写长期
 memory.remember("明早 9 点前提交 PR", kind="episode", ttl=timedelta(hours=12))  # B12：12 小时后到期
+memory.remember("我在上海做后端开发", kind="fact", conflict_threshold=0.9)     # B13：写入前查重（命中返回已有记录）
+memory.remember("重复的内容", raise_on_conflict=True)      # v1.9.2：命中有效重复抛 MemoryConflictError（默认 False 静默去重）
+conflicts = memory.check_conflict("会不会撞车")             # v1.9.2：只读探测 -> [(MemoryRecord, "duplicate"), ...]
 memory.revise(memory_id, "修订后的内容")               # B11：修订（旧的转 superseded，历史保留）
 memory.extract_and_store()                            # 从 buffer 抽取长期记忆（B10：只抽水位线之后的新增消息段）
 
@@ -802,6 +827,14 @@ report = memory.compact()          # {"archived": 3, "merged": 2, "expired": 1}
 - **显式有效期**：`remember(..., ttl=timedelta(...))` 给单条记忆一个到期时刻（`expires_at`），用于「明早 9 点开会」这类天然有有效期的信息；不传 `ttl` 时 `expires_at=None`，行为与之前**字节级一致**；
 - **两道防线**：`retrieve()` / `search()` 在排序前就过滤掉已到期项（两次 `compact()` 之间也不会把过期记忆注入 prompt）；`compact()` 再把它软删为 `retracted` 并写 `metadata["expired_at"]`（保留审计、不物理删除），返回值新增 `expired` 计数；
 - **幂等**：重复 `compact()` 不会重复清理；`SemanticMemoryStore` / `ChromaMemoryStore` 两个语义后端同样在 `search()` 里过滤。
+
+**冲突检测与消解（B13）**：
+
+- **写入前查重**：`remember(..., conflict_threshold=0.85)` 与 `auto_extract` 抽取入库都会先调 `_find_conflict()`——**向量优先**（`ChromaMemoryStore.find_similar()` 走 Chroma ANN 近邻；无 Chroma 时 `SemanticMemoryStore.find_similar()` 走批量 cosine）、**词法 Jaccard 始终叠加**（不是「无向量才回退」）；命中即返回**已有记录**（`newest_wins`，不重复插入、也不新建 `superseded` 版本），`_is_duplicate()` 仍可作为兼容别名调用；
+- **绝不阻塞写入**：后端不可用、embedding 失败、任何异常都当作「没查到冲突」继续写入，宁可多存一条也不丢数据；
+- **stale 向量不删**：`revise` / `retract` / `archive_stale` / `purge_expired` / `merge_similar` 只把向量与主记录的 `status` 一起翻新，检索侧统一按 `status='active'` 过滤（Chroma `where={"status":"active"}`、SQLite `memory_embeddings.status`），保留审计与回溯能力；
+- **零破坏**：不传 `conflict_threshold`、不配向量后端时与 v1.8.2 行为完全一致（默认阈值 0.85）。详见 `docs/记忆模块编写说明.md` §6.4 / §7.8 / §7.9 / §7.10 / §10.17。
+- **显式冲突上报（v1.9.2）**：默认仍是静默 `newest_wins` 去重；传 `remember(..., raise_on_conflict=True)` 命中有效重复时改抛 `MemoryConflictError`（携带未入库的 `new_record` 与 `conflicts`），也可先用只读的 `check_conflict()` 探测；过期但仍 active 的记忆按「过期 ≠ 删除」续期 / 取代，不丢新内容。
 
 **增量抽取（B10）**：
 
@@ -1020,7 +1053,7 @@ agent = ReActAgent(
 
 ### 9. Trace（可观测性 / TraceLogger 全链路记录）
 
-> **状态说明**：本模块已并入主分支（`fast_agents/trace/`），对应演进路线图 **G1**。完整说明见 [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md)。
+> **状态说明**：本模块已并入主分支（`fast_agents/trace/`），对应演进路线图 **K1**。完整说明见 [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md)。
 
 默认**不收集**（不构造 `TraceLogger`、或不把它传给 LLM/Agent 即零开销），构造出实例即启用、可用 `enabled=False` 显式关闭；零新增依赖（标准库 + 仓库已有的 pydantic）。借鉴 OpenTelemetry 的 Trace/Span 模型、LangChain callback、OpenAI Agents SDK tracing 的核心概念，但不引入这些依赖。
 
@@ -1028,18 +1061,18 @@ agent = ReActAgent(
 |------|----|------|
 | 记录模型 | `SpanRecord` / `SpanKind` / `SpanStatus` | 每条 Span 记录 trace_id/span_id/parent_id/session_id/name/kind/input/output/起止时间/耗时/状态/metadata |
 | 记录器 | `TraceLogger` | 手动 span、with 上下文、trace() 开新 Trace、失败安全（打点异常不阻塞主业务）|
-| 默认落盘 | `JsonlStore` | jsonl 逐行追加写，路径可配置；支持 `:memory:` 内存模式；为切 SQLite 预留抽象位 |
+| 默认落点 | `InMemoryTraceStore` / `JsonlStore` / `SQLiteStore` | `store` 单入口：不传或传 `:memory:` → 纯内存；`.jsonl` 等 → jsonl 逐行追加写；`.db` / `.sqlite` / `.sqlite3` → SQLite 结构化落盘（按文件后缀自动识别）|
 | 工具打点 | `tracer.attach_to_tool_registry(registry)` | 走 `ToolRegistry.add_hook`，不改注册表逻辑，一行接入所有工具调用 |
 | 查询 | `tracer.read_spans(session_id/trace_id/kind/limit)` | 按条件过滤，按 store 原始（写入）顺序返回 |
-| 回放 | `tracer.replay(trace_id)` | 返回按时间排序、字段稳定的可打印 dict 列表 |
-| token 元数据 | LLM span 的 `metadata` | **v1.0.1**：invoke/embed 记录 `model` + `usage`/`prompt_tokens`/`completion_tokens`/`total_tokens`（成本分析用） |
-| tool 耗时 | tool span 的 `duration_ms` | **v1.0.1**：取 `ToolResult.metadata["duration_ms"]` 实测值并回推 start_time |
-| 状态隔离 | `TraceLogger` 实例 | **v1.0.2**：改为每个实例自持一对 ContextVar，多 tracer 同时使用不串扰父链；天然支持 asyncio 多协程并发隔离（为 G2 异步铺路）|
+| 回放 | `tracer.replay(trace_id)` | 返回按 `(_create_seq, start_time, span_id)` 排序、字段稳定的可打印 dict 列表 |
+| token 元数据 | LLM span 的 `metadata` | invoke/embed 记录 `model` + `usage`/`prompt_tokens`/`completion_tokens`/`total_tokens`（成本分析用）|
+| tool 耗时 | tool span 的 `duration_ms` | 取 `ToolResult.metadata["duration_ms"]` 实测值并回推 start_time |
+| 状态隔离 | `TraceLogger` 实例 | 每个实例自持一对 ContextVar，多 tracer 同时使用不串扰父链；天然支持 asyncio 多协程并发隔离（为 K2 异步铺路）|
 
 ```python
 from fast_agents import LLM, ReActAgent, ToolRegistry, TraceLogger
 
-tracer = TraceLogger(path="logs/agent_run.jsonl", enabled=True, session_id="chat-001")
+tracer = TraceLogger(store="logs/agent_run.jsonl", enabled=True, session_id="chat-001")
 agent = ReActAgent(name="助手", llm=LLM(), tool_registry=registry, tracer=tracer)
 
 result = agent.run("3 的平方是多少？")  # 自动记录 agent / decision / tool span
@@ -1228,30 +1261,41 @@ registry.register_tool(builtin.SearchTool(provider="tavily"))
 
 ```powershell
 # 测试已迁到 tests/<模块>/ 子目录，直接执行即可
+python tests\init\test_init.py
 python tests\agents\test_react_agent.py
 python tests\tools\test_tools.py
 python tests\tools\test_file_tool.py
 python tests\memory\test_memory.py
+python tests\memory\test_memory_chroma_store.py
 python tests\context\test_context.py
 python tests\mcp\test_mcp.py
 python tests\database\test_database.py
+python tests\database\test_database_sqlite.py
+python tests\database\test_database_mysql.py
+python tests\database\test_database_chroma.py
 python tests\trace\test_trace.py
+python tests\trace\test_trace_jsonl_store.py
+python tests\trace\test_trace_sqlite_store.py
+python tests\trace\test_trace_eval.py
+python tests\trace\test_trace_cost.py
 ```
 
-> 也可以直接 `pytest tests/memory/test_memory.py` 等；因 `tests/` 下没有 `__init__.py`，请按脚本「直接执行」（或交给 pytest），不要用 `python -m tests.xxx`。
+> 项目自带零依赖运行器 `tests/_runner.py`（提供 `run_all` / `run_prefix` / `raises` / `importorskip` 等），**测试不依赖 pytest**；因 `tests/` 下没有 `__init__.py`，请按脚本「直接执行」，不要用 `python -m tests.xxx`。
 
 ### 当前状态
 
 | 测试文件 | 状态 | 说明 |
 |---------|------|------|
+| `tests/init/test_init.py` | ✅ 6/6 + 1 跳过 | 包级自检：`__all__` 完整、符号可导入、子模块可导入、版本一致；第 7 项「安装元数据版本」在未以 `fast-agents` 安装时自动跳过 |
 | `tests/agents/test_react_agent.py` | ✅ 17/17 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
-| `tests/tools/test_tools.py` | ✅ 61/61 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
-| `tests/memory/test_memory.py` | ✅ 37/37 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B10 增量抽取水位线（含窗口写满后仍持续抽取的回归）、B12 TTL 与到期回收 |
+| `tests/tools/test_tools.py` | ✅ 66/66 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
+| `tests/memory/test_memory.py` | ✅ 51/51 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B10 增量抽取水位线（含窗口写满后仍持续抽取的回归）、B12 TTL 与到期回收、v1.8.3 向量通道批量缓存与 Chroma 阶段 2、B13 冲突检测与消解（含 v1.9.1 过期续期 / 取代、v1.9.2 显式冲突上报与只读 check_conflict）、B14 向量 meta 三端对齐（含 InMemory 值语义 / 批量向量落盘 / rebuild 复用三项修复） |
+| `tests/memory/test_memory_chroma_store.py` | ✅ 8/8 | ChromaMemoryStore 专项（含 2 项需真实 `chromadb`，未安装时自动跳过）：阶段 1 纯词法降级 CRUD/search、B5 方法代理、Manager 集成零感知、v1.8.3 集合名归一化与真实 `ChromaClient` 语义通道、B13 ANN 近邻冲突检测、stale 向量 `status` 过滤、update 内容变更 delete-then-add |
 | `tests/tools/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
 | `tests/context/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
 | `tests/mcp/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
-| `tests/database/test_database.py` | ✅ 122 项（105 通过 + 17 跳过） | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系、向量后端；17 项向量端到端用例在未装 `chromadb` 时自动跳过（`tests/database/test_database_mysql.py` 另有 18 项 MySQL 用例，需本地 MySQL） |
-| `tests/trace/test_trace.py` | ✅ 59/59 | Span 模型、TraceLogger、JsonlStore / SQLiteStore（写入读回 / 谓词过滤 / 跨 reopen 持久化 / 幂等迁移 / 流式遍历 / upsert 幂等）、LLM/Agent 打点、token 元数据、tool 真实耗时、查询与回放 |
+| `tests/database/test_database.py` | ✅ 94/94 | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系；另有 `test_database_sqlite.py` 24 项、`test_database_mysql.py` 31 项（30 离线 + 1 真实 MySQL）、`test_database_chroma.py` 32 项（需 `pip install fast-agents[chroma]`），模块合计 182 项 |
+| `tests/trace/test_trace.py` | ✅ 74/74 | Span 模型、TraceLogger、LLM/Agent 打点、token 元数据、tool 真实耗时、生命周期与查询回放、预览截断可配置、replay/build_tree 树形聚合、error_type 自动分类、单调时钟耗时（抗墙钟跳变）、内存后端生命周期（close 不清空 / clear 主动清空）；同目录另有 `test_trace_jsonl_store.py` 12 项、`test_trace_sqlite_store.py` 11 项（老库自动迁移）、`test_trace_eval.py` 33 项（K3 评估）、`test_trace_cost.py` 19 项（K3 成本日报），模块合计 **149 项** |
 
 `examples/demo.py` / `examples/memory/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
 
@@ -1290,16 +1334,16 @@ python tests\trace\test_trace.py
 
 | 模块 | 状态 | 下一步重点 |
 |------|------|-----------|
-| 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A20 计算器 AST 迁移） | **P0：A15 补 A8/A9/A10 测试护栏（并发 / 审批 / 超时 / `append` / `duration_ms` 当前零覆盖）**；**P1**：A16 并发与超时语义加固、A17 装饰器透出 `metadata`、A18 `return_direct` 落地、RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：异步 `arun`、跨平台 Shell、`ToolRegistry` 清理、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
+| 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A15 测试护栏、A16 并发语义加固、A17 装饰器透出 `metadata`、A18 `return_direct`、A20 计算器 AST 迁移、A33 入参解析统一） | **P1**：RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：A26 主循环多 `tool_calls` 走并发入口、异步 `arun`、跨平台 Shell、`ToolRegistry` 清理、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
 | 🧩 **skill** | ✅ 已实现 | 脚本沙箱（C6）、默认扫描路径统一（C7）、技能依赖 / 版本管理（C8）、技能市场（C9）、`allowed_tools` 生效（C10） |
 | 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输（D6）、`resources` / `prompts`（D7）、图片透传（D8）、断线自动重连（D9）、stderr 消费（D10） |
-| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；「**记忆 v2**」：B8 时间统一为北京时间 CST、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线（v1.8.2 修复窗口写满停摆）、B11 `revise()` 转发、B12 记忆 TTL 与到期回收均已落地，仅余 B13 冲突检测与消解 |
+| 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；「**记忆 v2**」已全部收口：B8 时间统一为北京时间 CST、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线（v1.8.2 修复窗口写满停摆）、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解（v1.9.0，v1.9.1 补过期场景、v1.9.2 接显式冲突上报）均已落地；另 B14 `ChromaMemoryStore` 阶段 1（v1.8.0）/ 阶段 2（v1.8.3 真实接入 `ChromaClient`）已完成 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
 | 🪟 **context** | ✅ 已实现（v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、embedding 召回扩展位 |
 | 🗄 **database** | ✅ v1.1.0（关系型双后端 + 统一异常体系 + 向量后端） | 连接池 / 线程安全（J2）、Postgres 后端（J4 续）、多租户；memory / trace 后端已迁入（J3） |
-| 🛠 **infra / trace** | ✅ G1 已实现（TraceLogger v1.1.0，含 SQLiteStore）；其余 ⏳ 规划中 | 评估工具（G3）、异步并发（G2）、Web UI / 上报（G4）、打包发布（G5）、CI（G6） |
+| 🛠 **trace** | ✅ K1 已实现并完成收尾（TraceLogger v1.0.0，含 InMemory / Jsonl / SQLite 三后端 + 预览截断可配置 / 树形回放 / error_type 分类 / 单调时钟耗时）、K3 评估器已落地；其余 ⏳ 规划中 | 异步并发（K2）、Web UI 可视化（K4）、外部上报 OTLP / Langfuse（K5）|
 
-**当前 P0 已清零**（A15 测试护栏、A16 并发语义加固均已归档）。**当前 P1 重点**：RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）；记忆侧 B 系列主体已收尾，只余 B6 多租户与「记忆 v2」（B8 / B9 / B10 / B11 / B12 已落地，仅 B13 冲突检测与消解待推进）。
+**当前 P0 已清零**（A15 测试护栏、A16 并发语义加固均已归档）。**当前 P1 重点**：RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）；记忆侧 B 系列主体已收尾，「记忆 v2」（B8–B13）已全部收口，只余 B6 多租户。
 
 ---
 
