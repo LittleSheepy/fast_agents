@@ -101,7 +101,7 @@ class LLM:
                 "role": response.role,
                 "has_content": bool(response.content),
                 "tool_calls_count": len(response.tool_calls) if response.tool_calls else 0,
-                "content_preview": (response.content[:200] if response.content else None),
+                "content_preview": (effective_tracer.truncate_preview(response.content, 200) if response.content else None),
             }
             _merge_usage_metadata(s.metadata, usage_sink)
             return response
@@ -138,7 +138,7 @@ class LLM:
         except Exception as e:
             effective_tracer.end_span(
                 span,
-                output={"chunks": len(chunks), "content_preview": "".join(chunks)[:200]},
+                output={"chunks": len(chunks), "content_preview": effective_tracer.truncate_preview("".join(chunks), 200)},
                 error=f"{type(e).__name__}: {e}",
             )
             raise
@@ -147,7 +147,7 @@ class LLM:
                 span,
                 output={
                     "chunks": len(chunks),
-                    "content_preview": "".join(chunks)[:200],
+                    "content_preview": effective_tracer.truncate_preview("".join(chunks), 200),
                     "length": sum(len(c) for c in chunks),
                 },
             )
