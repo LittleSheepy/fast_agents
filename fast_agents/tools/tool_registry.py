@@ -161,6 +161,7 @@ class ToolRegistry:
         calls: List[Tuple[str, Union[str, Dict[str, Any], None]]],
         *,
         timeout: Optional[float] = None,
+        hooks_in_caller_thread: bool = False,
     ) -> List[ToolResult]:
         """并发执行多个无依赖工具，**返回结果与 calls 一一对应（顺序严格匹配）**。
 
@@ -178,6 +179,18 @@ class ToolRegistry:
                 超时返回后底层 ``run()`` 仍可能在后台继续执行并产生副作用。
                 未完成的子任务结果会在 ``metadata['timeout_abandoned']`` 上
                 标记为 ``True``。
+
+            hooks_in_caller_thread: 是否把 hook 收回「调用方线程」触发，默认 ``False``
+                （保持改动前行为：hook 在各子线程内执行）。传 ``True`` 时子线程不再触发
+                hook，改由本方法在全部子任务收敛后、在**调用方线程**按 ``calls`` 顺序
+                对「真正执行完成」的子任务依次触发一次。
+
+                为什么需要它：hook 的典型使用方是 trace 打点，而 tracer 有两条
+                「同线程」语义——① 实例级 ``contextvars`` 栈是与线程绑定的，子线程里
+                栈为空，``tool_hook`` 会丢失父 Span 链并懒启动一条新 trace；
+                ② 底层 SQLite 连接默认禁止跨线程使用（``check_same_thread``），
+                子线程写库会抛 ``ProgrammingError``，被 trace 的写库兜底静默吞掉，
+                结果是工具 Span 整体不落库。把 hook 收回调用方线程可同时规避这两点。
 
         Returns:
             ``List[ToolResult]``，**长度与 calls 严格相等**，第 i 个结果对应 calls[i]。
@@ -235,16 +248,19 @@ class ToolRegistry:
                 r = tool.invoke(**kwargs)
             except Exception as e:
                 r = ToolResult.fail(f"工具 '{tool.name}' 并发执行失败：{e}")
-            # hooks（每个结果触发一次）
-            for hook in self._hooks:
-                try:
-                    hook(tool.name, kwargs, r)
-                except Exception as e:
-                    logger.exception("工具 hook 失败: %s", e)
+            # hooks（每个结果触发一次）；hooks_in_caller_thread=True 时子线程跳过，
+            # 改由调用方线程在全部子任务收敛后统一按序触发（见方法 docstring 的原因说明）。
+            if not hooks_in_caller_thread:
+                for hook in self._hooks:
+                    try:
+                        hook(tool.name, kwargs, r)
+                    except Exception as e:
+                        logger.exception("工具 hook 失败: %s", e)
             return idx, r
 
         max_workers = min(self.max_workers, len(pending))
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        completed: set = set()  # 真正拿到结果的子任务索引（超时被放弃的不计入）
         try:
             futures = {executor.submit(_run_one, i, t, k): i for i, t, k in pending}
             try:
@@ -252,6 +268,7 @@ class ToolRegistry:
                     try:
                         i, r = future.result()
                         results[i] = r
+                        completed.add(i)
                     except Exception as e:
                         i = futures[future]
                         results[i] = ToolResult.fail(f"并发执行内部异常：{e}")
@@ -268,6 +285,17 @@ class ToolRegistry:
         finally:
             # 关键：wait=False → 超时立即返回，不在 __exit__ 处等所有子线程跑完
             executor.shutdown(wait=False, cancel_futures=True)
+
+        # ── hooks 回调用方线程：按 calls 顺序、只对已完成的子任务各触发一次 ──
+        if hooks_in_caller_thread:
+            for i, tool, kwargs in pending:
+                if i not in completed:
+                    continue
+                for hook in self._hooks:
+                    try:
+                        hook(tool.name, kwargs, results[i])
+                    except Exception as e:
+                        logger.exception("工具 hook 失败: %s", e)
 
         return results  # type: ignore[return-value]
 

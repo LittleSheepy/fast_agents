@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import enum
-import functools
 import inspect
 import json
 import logging
@@ -200,8 +199,10 @@ class ToolBase(ABC):
         """执行工具（子类必须实现）"""
 
     async def arun(self, **kwargs: Any) -> Union[str, ToolResult]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, functools.partial(self._run_safe, **kwargs))
+        # A19：改用 asyncio.to_thread —— 内部走 get_running_loop()，
+        # 避免 Python 3.10+ 中 asyncio.get_event_loop() 的 DeprecationWarning；
+        # 仍在事件循环托管的默认线程池中执行 run()，语义与原先一致。
+        return await asyncio.to_thread(self._run_safe, **kwargs)
 
     def _run_safe(self, **kwargs):
         return self.run(**kwargs)
