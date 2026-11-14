@@ -22,7 +22,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
-from .schema import Schema
+from .errors import DatabaseValidationError
+from .schema import check_ident, Column, Schema
 
 
 class DatabaseClientBase(ABC):
@@ -31,6 +32,7 @@ class DatabaseClientBase(ABC):
     def __init__(self, timeout: float = 5.0):
         self._conn = None
         self.timeout = timeout
+        self._tx_depth = 0
 
     # ---------- 连接管理 ----------
     @abstractmethod
@@ -49,18 +51,42 @@ class DatabaseClientBase(ABC):
             self._close()
             self._conn = None
 
+    @property
+    def _in_transaction(self) -> bool:
+        """当前是否处于显式事务中（``_tx_depth`` 的只读派生）。
+
+        唯一真实来源是 ``_tx_depth`` —— ``with db:`` 的事务嵌套深度计数器。
+        本属性不保存任何独立状态，因此不可能出现"标志与底层真实状态失同步"。
+        """
+        return self._tx_depth > 0
+
+    # ---------- 基础执行 ----------
+    def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> dict[str, Any]:
+        """执行写 SQL（INSERT/UPDATE/DELETE/CREATE/DROP）。"""
+
+    # ------------ 方言 ------------
+    @abstractmethod
+    def _quote_ident(self, name: str) -> str:
+        """方言标识符渲染钩子：SQLite 返回 "name"，MySQL 返回 `name`。"""
+
+    @abstractmethod
+    def _parse_columns(self, table: str, columns: list[Column]) -> tuple[list[str], list[str]]:
+        """方言列解析钩子：把 list[Column] 解析为 (列定义SQL列表, 建索引SQL列表)。"""
+
     # ---------- DDL：建表 / 删表 / 查表 ----------
     @abstractmethod
     def table_exists(self, table: str) -> bool:
         """判断表是否已存在。"""
 
     @abstractmethod
-    def create_table(
-        self,
-        table: str,
-        columns: dict[str, str] | list[Any] | Schema,
-        if_not_exists: bool = True,
-    ) -> None:
+    def _create_table_raw(self, table: str, col_defs: list[str], if_not_exists: bool) -> None:
+        """执行原始 CREATE TABLE 语句的方言实现。"""
+
+    @abstractmethod
+    def _create_table_from_schema(self, schema: Schema, if_not_exists: bool) -> None:
+        """从 Schema 建表+索引的方言实现。"""
+
+    def create_table(self, table: str, columns: dict[str, str] | list[Column] | Schema, if_not_exists: bool = True) -> None:
         """建表。
 
         Args:
@@ -71,6 +97,39 @@ class DatabaseClientBase(ABC):
                 3. ``Schema`` 对象 —— 一次性声明列 + 索引（推荐工程化使用）。
             if_not_exists: 是否加上 ``IF NOT EXISTS``（默认 True，幂等）。
         """
+        check_ident(table, "表名")
+
+        # 1) Schema 对象
+        if isinstance(columns, Schema):
+            if table and columns.table_name != table:
+                raise DatabaseValidationError(f"Schema.table_name={columns.table_name!r} 与传入 table={table!r} 不一致")
+            self._create_table_from_schema(columns, if_not_exists=if_not_exists)
+            return
+
+        # 2) list[Column]
+        if isinstance(columns, list):
+            if not columns:
+                raise DatabaseValidationError("create_table 的 columns 不能为空")
+            col_defs, index_stmts = self._parse_columns(table, columns)
+            self._create_table_raw(table, col_defs, if_not_exists=if_not_exists)
+            for stmt in index_stmts:
+                self.execute(stmt)
+            return
+
+        # 3) dict[str, str] —— 最宽松，直接信任调用方写的列类型片段
+        if isinstance(columns, dict):
+            if not columns:
+                raise DatabaseValidationError("create_table 的 columns 不能为空")
+            col_defs = []
+            for col_name, col_def in columns.items():
+                check_ident(col_name, "列名")
+                if not isinstance(col_def, str) or not col_def.strip():
+                    raise DatabaseValidationError(f"列 {col_name!r} 的类型定义必须是非空字符串")
+                col_defs.append(f"{self._quote_ident(col_name)} {col_def.strip()}")
+            self._create_table_raw(table, col_defs, if_not_exists=if_not_exists)
+            return
+
+        raise TypeError(f"columns 参数只支持 dict[str,str] / list[Column] / Schema 三种形式，收到 {type(columns)}")
 
     @abstractmethod
     def ensure_table(self, table: str, columns: dict[str, str] | list[Any] | Schema) -> None:
@@ -142,3 +201,10 @@ class DatabaseClientBase(ABC):
         返回值 False 表示异常继续向外抛出（不吞异常）；实现必须保证无论 commit /
         rollback 自身是否抛错，都复位内部事务状态，避免留下悬挂事务。
         """
+
+    def __del__(self) -> None:
+        """析构时尝试关闭连接。"""
+        try:
+            self.close()
+        except Exception:
+            pass

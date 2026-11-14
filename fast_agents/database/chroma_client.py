@@ -455,8 +455,9 @@ class ChromaClient(VectorClientBase):
         ids: list[str] | None = None,
         where: VectorWhere = None,
     ) -> int:
-        if not ids and where is None:
+        if not ids and not where:
             # 安全约定：禁止空条件删全量
+            # 与 SQLiteClient.delete / delete_where 同口径的 `not where`：where 为 None 或空 dict 均视为空条件
             raise DatabaseValidationError("delete 的 ids 和 where 不能同时为空（防止误删全量）")
         col = self._get_collection(collection)
 

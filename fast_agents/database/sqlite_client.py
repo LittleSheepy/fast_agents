@@ -54,15 +54,101 @@ from .errors import (
 from .query import Filter, FilterOp, Query, SortOrder
 from .schema import (
     Column,
-    Index,
     Schema,
     check_ident as _check_ident,
     column_sql as _column_sql,
-    index_stmt as _index_stmt,
     parse_column_list,
     parse_schema,
     quote_ident as _quote_ident,
 )
+
+
+def _split_sql_statements(sql: str) -> list[str]:
+    """把一段多语句 SQL 按顶层分号切分为单条语句（已 strip、已过滤空串）。
+
+    比 ``sql.split(";")`` 更稳：只有出现在「语句正文」里的分号才切分，出现在字符串
+    字面量 / 标识符引用 / 注释里的分号不会被误切。覆盖 SQLite 常见写法：
+
+    - 单引号字符串 ``'a;b'``（内部单引号用两个单引号转义）；
+    - 双引号标识符 ``"a;b"``（内部双引号用两个双引号转义）；
+    - 反引号标识符（兼容 MySQL 风格反引号，SQLite 遇到也安全跳过）；
+    - 行注释 ``-- ...`` 到行尾结束（SQLite 规则：``--`` 后不要求紧跟空白，
+      例如 ``--1;`` 整行都是注释，与 MySQL 的 ``-- ` 后需空白规则不同）；
+    - 块注释 ``/* ... */``，可跨行。
+
+    关键原因：``sqlite3.Connection.executescript`` 会在执行前隐式 ``COMMIT`` 当前
+    事务（标准库官方文档明确说明），导致 ``with db:`` 事务中的脚本无法被外层
+    ``__exit__`` 正确回滚。本函数让 SQLite 端也走「逐条 ``conn.execute``」路径，
+    与 MySQL 端 ``executescript`` 语义一致：事务中不自动提交，异常可回滚；
+    但 SQLite / MySQL 各自的方言规则（如行注释判定）严格按各自引擎实现，
+    不混用。
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(sql)
+    state = "normal"
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if state == "normal":
+            if ch == "'":
+                state = "single"
+            elif ch == '"':
+                state = "double"
+            elif ch == "`":
+                state = "backtick"
+            elif ch == "-" and nxt == "-":
+                # SQLite 规则：-- 后立即进入行注释，不要求空白（与 MySQL 不同）
+                state = "line_comment"
+            elif ch == "/" and nxt == "*":
+                state = "block_comment"
+            elif ch == ";":
+                stmt = "".join(buf).strip()
+                if stmt:
+                    statements.append(stmt)
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+        elif state == "single":
+            buf.append(ch)
+            if ch == "'":
+                if nxt == "'":
+                    buf.append(nxt)
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "double":
+            buf.append(ch)
+            if ch == '"':
+                if nxt == '"':
+                    buf.append(nxt)
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "backtick":
+            buf.append(ch)
+            if ch == "`":
+                if nxt == "`":
+                    buf.append(nxt)
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "line_comment":
+            buf.append(ch)
+            if ch == "\n":
+                state = "normal"
+        else:  # block_comment
+            buf.append(ch)
+            if ch == "*" and nxt == "/":
+                buf.append(nxt)
+                i += 1
+                state = "normal"
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
 class SqlExpr:
@@ -136,23 +222,6 @@ class SQLiteClient(DatabaseClientBase):
         except sqlite3.Error as e:
             raise DatabaseConnectionError(f"连接 SQLite 失败: {e}") from e
 
-    @property
-    def conn(self) -> sqlite3.Connection:
-        """获取底层连接（如果关闭则自动重连）。"""
-        if self._conn is None:
-            self._connect()
-        assert self._conn is not None
-        return self._conn
-
-    @property
-    def _in_transaction(self) -> bool:
-        """当前是否处于显式事务中（``_tx_depth`` 的只读派生）。
-
-        唯一真实来源是 ``_tx_depth`` —— ``with db:`` 的事务嵌套深度计数器。
-        本属性不保存任何独立状态，因此不可能出现"标志与底层真实状态失同步"。
-        """
-        return self._tx_depth > 0
-
     def _close(self) -> None:
         """关闭连接。若仍残留未结束事务，先尝试回滚避免悬空事务。"""
         if self._conn is not None:
@@ -167,6 +236,14 @@ class SQLiteClient(DatabaseClientBase):
                 self._tx_must_rollback = False
             self._conn.close()
             self._conn = None
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """获取底层连接（如果关闭则自动重连）。"""
+        if self._conn is None:
+            self._connect()
+        assert self._conn is not None
+        return self._conn
 
     # ---------- 基础执行 ----------
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> dict[str, Any]:
@@ -203,9 +280,20 @@ class SQLiteClient(DatabaseClientBase):
             raise DatabaseOperationalError(f"批量执行SQL失败: {e}") from e
 
     def executescript(self, sql: str) -> None:
-        """执行一段脚本（多条 SQL，以 ; 分隔），不在事务中时自动提交。"""
+        """执行一段脚本（多条 SQL，以 ; 分隔），不在事务中时自动提交。
+
+        实现说明：不使用标准库 ``conn.executescript``（它会在执行前隐式 COMMIT
+        当前事务，导致 ``with db:`` 内脚本被提前提交、外层异常无法回滚）。
+        改走 ``_split_sql_statements`` 逐条 ``conn.execute``，切分器会跳过字符串
+        字面量 / 双引号标识符 / 行注释 / 块注释里的分号，不会误切；事务中不
+        自动 commit，与 MySQLClient.executescript 语义一致。
+        """
+        if not isinstance(sql, str):
+            raise DatabaseValidationError("executescript 的 sql 必须是字符串")
         try:
-            self.conn.executescript(sql)
+            statements = _split_sql_statements(sql)
+            for stmt in statements:
+                self.conn.execute(stmt)
             if not self._in_transaction:
                 self.conn.commit()
         except sqlite3.Error as e:
@@ -234,12 +322,8 @@ class SQLiteClient(DatabaseClientBase):
             except sqlite3.Error:
                 pass
 
-    def query(
-        self,
-        sql: str,
-        params: tuple[Any, ...] | dict[str, Any] = (),
-        fetch_one: bool = False,
-    ) -> list[dict[str, Any]] | dict[str, Any] | None:
+    def query(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = (), fetch_one: bool = False,
+        ) -> list[dict[str, Any]] | dict[str, Any] | None:
         """执行读 SQL（SELECT / PRAGMA），返回字典列表。"""
         try:
             cur = self.conn.execute(sql, params)
@@ -249,6 +333,15 @@ class SQLiteClient(DatabaseClientBase):
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
             raise DatabaseOperationalError(f"查询失败: {e}\nSQL: {sql}") from e
+
+    # ------------ 方言 ------------
+    def _quote_ident(self, name: str) -> str:
+        """SQLite 双引号标识符。"""
+        return _quote_ident(name, '"')
+
+    def _parse_columns(self, table: str, columns: list[Column]) -> tuple[list[str], list[str]]:
+        """SQLite 方言列解析，直接复用 schema.parse_column_list。"""
+        return parse_column_list(table, columns)
 
     # ---------- DDL：建表 / 查表 / 删表 / 索引 ----------
     def table_exists(self, table: str) -> bool:
@@ -276,52 +369,10 @@ class SQLiteClient(DatabaseClientBase):
         )
         return {r["name"] for r in rows}  # type: ignore[index]
 
-    def create_table(
-        self,
-        table: str,
-        columns: dict[str, str] | list[Column] | Schema,
-        if_not_exists: bool = True,
-    ) -> None:
-        """建表。三种 columns 写法见基类说明。"""
-        _check_ident(table, "表名")
-
-        # 1) Schema 对象
-        if isinstance(columns, Schema):
-            if table and columns.table_name != table:
-                raise DatabaseValidationError(f"Schema.table_name={columns.table_name!r} 与传入 table={table!r} 不一致")
-            self._create_table_from_schema(columns, if_not_exists=if_not_exists)
-            return
-
-        # 2) list[Column] —— 解析逻辑统一在 schema.parse_column_list
-        if isinstance(columns, list):
-            col_defs, index_stmts = parse_column_list(table, columns)
-            self._create_table_raw(table, col_defs, if_not_exists=if_not_exists)
-            for stmt in index_stmts:
-                self.execute(stmt)
-            return
-
-        # 3) dict[str, str] —— 最宽松，直接信任调用方写的列类型片段
-        if isinstance(columns, dict):
-            if not columns:
-                raise DatabaseValidationError("create_table 的 columns 不能为空")
-            col_defs = []
-            for col_name, col_def in columns.items():
-                _check_ident(col_name, "列名")
-                if not isinstance(col_def, str) or not col_def.strip():
-                    raise DatabaseValidationError(f"列 {col_name!r} 的类型定义必须是非空字符串")
-                col_defs.append(f"{_quote_ident(col_name)} {col_def.strip()}")
-            self._create_table_raw(table, col_defs, if_not_exists=if_not_exists)
-            return
-
-        raise TypeError(
-            "columns 参数只支持 dict[str,str] / list[Column] / Schema 三种形式，"
-            f"收到 {type(columns)}"
-        )
-
     def _create_table_raw(self, table: str, col_defs: list[str], if_not_exists: bool) -> None:
         """执行原始 CREATE TABLE 语句。"""
         if_not = "IF NOT EXISTS " if if_not_exists else ""
-        sql = f"""CREATE TABLE {if_not}{_quote_ident(table)} ({",".join(col_defs)})"""
+        sql = f"""CREATE TABLE {if_not}{self._quote_ident(table)} ({",".join(col_defs)})"""
         self.execute(sql)
 
     def _create_table_from_schema(self, schema: Schema, if_not_exists: bool) -> None:
@@ -376,6 +427,8 @@ class SQLiteClient(DatabaseClientBase):
         if not data:
             raise DatabaseValidationError("insert 数据不能为空")
         _check_ident(table, "表名")
+        for k in data.keys():
+            _check_ident(k, "字段名")
         columns = ", ".join(_quote_ident(k) for k in data.keys())
         placeholders = ", ".join([f":{k}" for k in data.keys()])
         sql = f"INSERT INTO {_quote_ident(table)} ({columns}) VALUES ({placeholders})"
@@ -408,7 +461,12 @@ class SQLiteClient(DatabaseClientBase):
                 raise DatabaseValidationError(f"非法 order_by: {order_by!r}")
             sql += f" ORDER BY {order_by}"
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
+            # 与 _compile_query 同口径：limit 强制非负 int，负数直接报错——
+            # SQLite 会把 LIMIT -1 当成"无上限"而静默返回全表，与调用方预期不符。
+            n = int(limit)
+            if n < 0:
+                raise DatabaseValidationError(f"limit 不能为负数: {n}")
+            sql += f" LIMIT {n}"
         return self.query(sql, params)  # type: ignore
 
     # ---------- 谓词下推：Query / Filter → 参数化 SQL ----------
@@ -469,7 +527,16 @@ class SQLiteClient(DatabaseClientBase):
         - LIKE 的通配符由调用方在 value 里自带，不替用户加 %，避免"隐式模糊"。
         """
         _check_ident(q.table_name, "表名")
-        sql_parts: list[str] = [f"SELECT * FROM {_quote_ident(q.table_name)}"]
+        # 列投影：columns=None 保持 SELECT *；显式指定时逐列过标识符白名单，杜绝拼接注入
+        if q.columns is None:
+            col_clause = "*"
+        else:
+            if not q.columns:
+                raise DatabaseValidationError("columns 不能是空列表")
+            for c in q.columns:
+                _check_ident(c, "列名")
+            col_clause = ", ".join(_quote_ident(c) for c in q.columns)
+        sql_parts: list[str] = [f"SELECT {col_clause} FROM {_quote_ident(q.table_name)}"]
         params: dict[str, Any] = {}
 
         if q.filters:
@@ -812,9 +879,3 @@ class SQLiteClient(DatabaseClientBase):
         sql = f"DELETE FROM {_quote_ident(table)} WHERE {where_sql}"
         return self.execute(sql, params)["rowcount"]
 
-    def __del__(self) -> None:
-        """析构时尝试关闭连接。"""
-        try:
-            self.close()
-        except Exception:
-            pass

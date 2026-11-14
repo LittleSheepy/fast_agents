@@ -37,6 +37,7 @@ class Filter(BaseModel):
 class Query(BaseModel):
     """查询对象，封装过滤/排序/分页参数。"""
     table_name: str = Field(..., description="表名")
+    columns: Optional[list[str]] = Field(default=None, description="要返回的列名列表；None 表示 SELECT *（全部列）")
     filters: Optional[list[Filter]] = Field(default=None, description="过滤条件列表，AND关系")
     sort_by: Optional[str | list[str]] = Field(default=None, description="排序字段名；单字段传 str，多字段传 list[str]")
     sort_order: SortOrder = Field(default=SortOrder.ASC, description="排序方向")

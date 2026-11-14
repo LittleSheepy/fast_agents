@@ -47,16 +47,24 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Optional, TYPE_CHECKING
+from typing import Any
 
 from .database_client_base import DatabaseClientBase
 from .query import Filter, FilterOp, Query, SortOrder
 from .schema import (
     Column,
     ColumnType,
-    Index,
     Schema,
     check_ident as _check_ident,
+    check_ident,
+    sql_literal,
+    column_index_stmt,
+    index_stmt,
+    column_sql,
+    parse_column_list,
+    parse_schema,
+    quote_ident as _quote_ident,
+
 )
 # SqlExpr 是「写侧 SQL 片段包装」，与具体后端无关，直接复用 SQLiteClient 的实现：
 # 两个后端拿到的是同一个类，`isinstance(value, SqlExpr)` 跨后端可识别，
@@ -78,10 +86,126 @@ logger = logging.getLogger(__name__)
 
 # 合法标识符校验同 SQLite（复用 schema 中的 check_ident，保证防注入逻辑统一）
 # MySQL 标识符用反引号包裹
-def _quote_ident_mysql(name: str) -> str:
+def quote_ident(name: str) -> str:
     """给标识符加反引号（MySQL 方言），内部反引号转义为两个反引号。调用前必须过 check_ident。"""
-    escaped_name = name.replace("`", "``")
-    return f"`{escaped_name}`"
+    return _quote_ident(name, "`")
+
+
+def _server_supports_row_alias(conn: Any) -> bool:
+    """判断 MySQL 服务端是否支持 ``INSERT ... VALUES (...) AS new`` 行别名语法。
+
+    8.0.20 起 ``ON DUPLICATE KEY UPDATE ... VALUES(col)`` 被标记弃用，官方推荐改用行别名
+    （``INSERT ... AS new ON DUPLICATE KEY UPDATE col = new.col``）；但行别名是 8.0.19 才引入
+    的语法，**5.7 及更早不支持**，MariaDB 各版本也不支持。这里按服务端版本自适应：
+
+    - MySQL >= 8.0.19 → 用行别名（摆脱已弃用的 VALUES()）；
+    - MySQL <= 8.0.18 / 5.7、MariaDB、或取不到版本信息 → 回退到兼容性最广的 ``VALUES(col)``。
+
+    版本取自 pymysql 连接握手阶段已缓存的 ``get_server_info()``，不额外往返。
+    """
+    getter = getattr(conn, "get_server_info", None)
+    if getter is None:
+        return False
+    try:
+        info = str(getter() or "")
+    except Exception:  # pragma: no cover - 驱动取版本异常一律回退
+        return False
+    if "mariadb" in info.lower():
+        return False
+    match = re.match(r"\s*(\d+)\.(\d+)\.(\d+)", info)
+    if match is None:
+        return False
+    return tuple(int(g) for g in match.groups()) >= (8, 0, 19)
+
+
+def _split_sql_statements(sql: str) -> list[str]:
+    """把一段多语句 SQL 按顶层分号切分为单条语句（已 strip、已过滤空串）。
+
+    比 ``sql.split(";")`` 更稳：只有出现在「语句正文」里的分号才切分，出现在字符串
+    字面量 / 反引号标识符 / 注释里的分号不会被误切。覆盖 MySQL 常见写法：
+
+    - 单引号字符串 ``'a;b'``（含 ``''`` 与 ``\'`` 两种转义）；
+    - 双引号字符串 ``"a;b"``（MySQL 默认非 ANSI_QUOTES 下即字符串）；
+    - 反引号标识符（内部反引号用两个反引号转义）；
+    - 行注释 ``-- ...``（MySQL 要求 ``--`` 后接空白）与 ``# ...``，都到行尾结束；
+    - 块注释 ``/* ... */``，可跨行。
+
+    这不是完整 SQL 词法分析（那是依赖级的活儿），只保证「分号切分」这一件事正确，
+    与 sqlite3 原生 ``executescript`` 的切分行为对齐。
+    """
+    statements: list[str] = []
+    buf: list[str] = []
+    i, n = 0, len(sql)
+    state = "normal"
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1] if i + 1 < n else ""
+        if state == "normal":
+            if ch == "'":
+                state = "single"
+            elif ch == '"':
+                state = "double"
+            elif ch == "`":
+                state = "backtick"
+            elif ch == "#":
+                state = "line_comment"
+            elif ch == "-" and nxt == "-" and (i + 2 >= n or sql[i + 2] in " \t\r\n"):
+                state = "line_comment"
+            elif ch == "/" and nxt == "*":
+                state = "block_comment"
+            elif ch == ";":
+                stmt = "".join(buf).strip()
+                if stmt:
+                    statements.append(stmt)
+                buf = []
+                i += 1
+                continue
+            buf.append(ch)
+        elif state == "single":
+            buf.append(ch)
+            if ch == "\\" and nxt:
+                buf.append(nxt)
+                i += 1
+            elif ch == "'":
+                if nxt == "'":
+                    buf.append(nxt)
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "double":
+            buf.append(ch)
+            if ch == "\\" and nxt:
+                buf.append(nxt)
+                i += 1
+            elif ch == '"':
+                if nxt == '"':
+                    buf.append(nxt)
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "backtick":
+            buf.append(ch)
+            if ch == "`":
+                if nxt == "`":
+                    buf.append(nxt)
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "line_comment":
+            buf.append(ch)
+            if ch == "\n":
+                state = "normal"
+        else:  # block_comment
+            buf.append(ch)
+            if ch == "*" and nxt == "/":
+                buf.append(nxt)
+                i += 1
+                state = "normal"
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
 # ColumnType 到 MySQL 类型的映射
@@ -96,93 +220,15 @@ TYPE_TO_MYSQL: dict[ColumnType, str] = {
 }
 
 
-def _sql_literal_mysql(value: Any, ctype: ColumnType) -> str:
-    """把 Python 默认值转成 MySQL 字面量，和 SQLite 版本行为一致。"""
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if value is None:
-        return "NULL"
-    # 字符串：转义单引号
-    s = str(value).replace("'", "''")
-    return f"'{s}'"
-
-
-def _column_sql_mysql(col: Column) -> str:
-    """把一个 Column 模型转成 MySQL 列定义片段。"""
-    _check_ident(col.name, "列名")
-    # VARCHAR 显式指定 length 时使用用户指定的长度
-    if col.type is ColumnType.VARCHAR and col.length is not None:
-        type_sql = f"VARCHAR({int(col.length)})"
-    else:
-        type_sql = TYPE_TO_MYSQL[col.type]
-    parts: list[str] = [_quote_ident_mysql(col.name), type_sql]
-
-    if col.primary_key:
-        parts.append("PRIMARY KEY")
-        if col.type is ColumnType.INTEGER and col.name.lower() == "id":
-            parts.append("AUTO_INCREMENT")
-
-    if not col.nullable and not col.primary_key:
-        parts.append("NOT NULL")
-
-    if col.unique and not col.primary_key:
-        parts.append("UNIQUE KEY")
-
-    if col.default is not None:
-        parts.append("DEFAULT " + _sql_literal_mysql(col.default, col.type))
-
-    return " ".join(parts)
-
-
-def _column_index_stmt_mysql(table: str, col: Column) -> Optional[str]:
-    """为声明了 index=True 的普通列生成 MySQL CREATE INDEX 语句。"""
-    if not (col.index and not col.primary_key and not col.unique):
-        return None
-    _check_ident(col.name, "列名")
-    idx_name = f"idx_{table}_{col.name}"
-    return (
-        f"CREATE INDEX {_quote_ident_mysql(idx_name)} "
-        f"ON {_quote_ident_mysql(table)} ({_quote_ident_mysql(col.name)})"
-    )
-
-
-def _index_stmt_mysql(table: str, idx: Index) -> str:
-    """把一个显式 Index 模型转成 MySQL CREATE INDEX 语句。"""
-    _check_ident(idx.name, "索引名")
-    for c in idx.columns:
-        _check_ident(c, "索引列名")
-    cols_sql = ", ".join(_quote_ident_mysql(c) for c in idx.columns)
-    unique = "UNIQUE " if idx.unique else ""
-    return (
-        f"CREATE {unique}INDEX {_quote_ident_mysql(idx.name)} "
-        f"ON {_quote_ident_mysql(table)} ({cols_sql})"
-    )
-
-
-def _parse_column_list_mysql(table: str, columns: list[Column]) -> tuple[list[str], list[str]]:
-    """解析 list[Column]，返回 MySQL 方言的 (col_defs, index_stmts)。"""
-    _check_ident(table, "表名")
-    col_defs: list[str] = []
-    index_stmts: list[str] = []
-    for c in columns:
-        if not isinstance(c, Column):
-            raise TypeError(f"columns 列表元素必须是 Column，收到 {type(c)}")
-        col_defs.append(_column_sql_mysql(c))
-        stmt = _column_index_stmt_mysql(table, c)
-        if stmt is not None:
-            index_stmts.append(stmt)
-    return col_defs, index_stmts
-
-
-def _parse_schema_mysql(schema: Schema) -> tuple[list[str], list[str]]:
-    """解析 Schema，返回 MySQL 方言的 (col_defs, index_stmts)。"""
-    col_defs, index_stmts = _parse_column_list_mysql(schema.table_name, schema.columns)
-    if schema.indexes:
-        for idx in schema.indexes:
-            index_stmts.append(_index_stmt_mysql(schema.table_name, idx))
-    return col_defs, index_stmts
+# MySQL 列定义方言参数（与 schema.column_sql 的注入点一一对应）
+_MYSQL_COLUMN_KW: dict[str, Any] = dict(
+    type_map=TYPE_TO_MYSQL,
+    quote="`",
+    unique_keyword="UNIQUE KEY",
+    auto_increment=True,
+    varchar_length=True,
+    if_not_exists=False,
+)
 
 
 class MySQLClient(DatabaseClientBase):
@@ -240,6 +286,8 @@ class MySQLClient(DatabaseClientBase):
         # 事务状态：与 SQLiteClient 完全一致的嵌套深度计数方案，从根源消除状态失同步
         self._tx_depth = 0
         self._tx_must_rollback = False
+        # 服务端是否支持 INSERT ... AS new 行别名（None=未探测；惰性探测一次后缓存，重连时重置）
+        self._row_alias_supported: bool | None = None
         self._connect()
 
     # ---------- 连接管理 ----------
@@ -262,6 +310,21 @@ class MySQLClient(DatabaseClientBase):
             )
         except self._pymysql.MySQLError as e:
             raise DatabaseConnectionError(f"连接 MySQL 失败: {e}") from e
+        # 重连后服务端可能变化，行别名支持标记重新探测
+        self._row_alias_supported = None
+
+    def _close(self) -> None:
+        """关闭连接，残留事务先尝试回滚。"""
+        if self._conn is not None:
+            if self._tx_depth > 0:
+                try:
+                    self._conn.rollback()
+                except self._pymysql.MySQLError:
+                    pass
+                self._tx_depth = 0
+                self._tx_must_rollback = False
+            self._conn.close()
+            self._conn = None
 
     @property
     def conn(self) -> Any:
@@ -291,22 +354,14 @@ class MySQLClient(DatabaseClientBase):
         return self._conn
 
     @property
-    def _in_transaction(self) -> bool:
-        """当前是否处于显式事务中（_tx_depth 的只读派生，与 SQLite 语义一致）。"""
-        return self._tx_depth > 0
+    def _supports_row_alias(self) -> bool:
+        """当前服务端是否支持 ``INSERT ... AS new`` 行别名语法（MySQL 8.0.19+），结果缓存。
 
-    def _close(self) -> None:
-        """关闭连接，残留事务先尝试回滚。"""
-        if self._conn is not None:
-            if self._tx_depth > 0:
-                try:
-                    self._conn.rollback()
-                except self._pymysql.MySQLError:
-                    pass
-                self._tx_depth = 0
-                self._tx_must_rollback = False
-            self._conn.close()
-            self._conn = None
+        无法确定服务端版本时保守返回 False，即继续用兼容性最广的 ``VALUES(col)`` 语法。
+        """
+        if self._row_alias_supported is None:
+            self._row_alias_supported = _server_supports_row_alias(self.conn)
+        return self._row_alias_supported
 
     # ---------- 基础执行 ----------
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> dict[str, Any]:
@@ -346,11 +401,13 @@ class MySQLClient(DatabaseClientBase):
     def executescript(self, sql: str) -> None:
         """执行一段脚本（多条 SQL 以 ; 分隔），不在事务中时自动提交。
 
-        注意：MySQL 中 execute 本身支持多语句，这里做简单封装，语义与 SQLite 对齐。
+        切分交给 ``_split_sql_statements``：只在「语句正文」遇到分号才切分，不会误切
+        字符串字面量 / 反引号标识符 / 注释里的分号（``sql.split(";")`` 会）；语义与
+        SQLite 对齐（sqlite3 原生 executescript 同样能识别字面量内的分号）。
         """
         try:
             with self.conn.cursor() as cur:
-                for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
+                for stmt in _split_sql_statements(sql):
                     cur.execute(stmt)
             if not self._in_transaction:
                 self.conn.commit()
@@ -368,12 +425,8 @@ class MySQLClient(DatabaseClientBase):
             except self._pymysql.MySQLError:
                 pass
 
-    def query(
-        self,
-        sql: str,
-        params: tuple[Any, ...] | dict[str, Any] = (),
-        fetch_one: bool = False,
-    ) -> list[dict[str, Any]] | dict[str, Any] | None:
+    def query(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = (), fetch_one: bool = False
+              ) -> list[dict[str, Any]] | dict[str, Any] | None:
         """执行读 SQL（SELECT / SHOW），返回字典列表。"""
         try:
             with self.conn.cursor() as cur:
@@ -384,8 +437,17 @@ class MySQLClient(DatabaseClientBase):
             return list(rows)
         except self._pymysql.MySQLError as e:
             raise DatabaseOperationalError(f"查询失败: {e}\nSQL: {sql}") from e
+    # ------------ 方言 ------------
+    def _quote_ident(self, name: str) -> str:
+        """MySQL 反引号标识符。"""
+        return _quote_ident(name, "`")
+
+    def _parse_columns(self, table: str, columns: list[Column]) -> tuple[list[str], list[str]]:
+        """MySQL 方言列解析，带 MySQL 列关键字参数。"""
+        return parse_column_list(table, columns, **_MYSQL_COLUMN_KW)
 
     # ---------- DDL：建表 / 查表 / 删表 / 索引 ----------
+
     def table_exists(self, table: str) -> bool:
         """判断表是否已存在（MySQL 方言，查 information_schema）。"""
         _check_ident(table, "表名")
@@ -399,69 +461,27 @@ class MySQLClient(DatabaseClientBase):
     def _list_columns(self, table: str) -> set[str]:
         """列出已存在表的列名集合（小写），用于迁移补列。"""
         _check_ident(table, "表名")
-        rows = self.query(f"SHOW COLUMNS FROM {_quote_ident_mysql(table)}")
+        rows = self.query(f"SHOW COLUMNS FROM {quote_ident(table)}")
         return {r["Field"].lower() for r in rows}  # type: ignore[index]
 
     def _list_indexes(self, table: str) -> set[str]:
         """列出已存在表的索引名集合，用于幂等建索引。"""
         _check_ident(table, "表名")
-        rows = self.query(f"SHOW INDEX FROM {_quote_ident_mysql(table)}")
+        rows = self.query(f"SHOW INDEX FROM {quote_ident(table)}")
         return {r["Key_name"] for r in rows}  # type: ignore[index]
-
-    def create_table(
-        self,
-        table: str,
-        columns: dict[str, str] | list[Column] | Schema,
-        if_not_exists: bool = True,
-    ) -> None:
-        """建表，三种 columns 写法与 SQLiteClient 完全一致。"""
-        _check_ident(table, "表名")
-
-        # 1) Schema 对象
-        if isinstance(columns, Schema):
-            if table and columns.table_name != table:
-                raise DatabaseValidationError(f"Schema.table_name={columns.table_name!r} 与传入 table={table!r} 不一致")
-            self._create_table_from_schema(columns, if_not_exists=if_not_exists)
-            return
-
-        # 2) list[Column]
-        if isinstance(columns, list):
-            col_defs, index_stmts = _parse_column_list_mysql(table, columns)
-            self._create_table_raw(table, col_defs, if_not_exists=if_not_exists)
-            for stmt in index_stmts:
-                self.execute(stmt)
-            return
-
-        # 3) dict[str, str]
-        if isinstance(columns, dict):
-            if not columns:
-                raise DatabaseValidationError("create_table 的 columns 不能为空")
-            col_defs = []
-            for col_name, col_def in columns.items():
-                _check_ident(col_name, "列名")
-                if not isinstance(col_def, str) or not col_def.strip():
-                    raise DatabaseValidationError(f"列 {col_name!r} 的类型定义必须是非空字符串")
-                col_defs.append(f"{_quote_ident_mysql(col_name)} {col_def.strip()}")
-            self._create_table_raw(table, col_defs, if_not_exists=if_not_exists)
-            return
-
-        raise TypeError(
-            "columns 参数只支持 dict[str,str] / list[Column] / Schema 三种形式，"
-            f"收到 {type(columns)}"
-        )
 
     def _create_table_raw(self, table: str, col_defs: list[str], if_not_exists: bool) -> None:
         """执行原始 MySQL CREATE TABLE 语句，默认 InnoDB 引擎、utf8mb4 字符集。"""
         if_not = "IF NOT EXISTS " if if_not_exists else ""
         sql = (
-            f"CREATE TABLE {if_not}{_quote_ident_mysql(table)} ({','.join(col_defs)}) "
+            f"CREATE TABLE {if_not}{self._quote_ident(table)} ({','.join(col_defs)}) "
             f"ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
         )
         self.execute(sql)
 
     def _create_table_from_schema(self, schema: Schema, if_not_exists: bool) -> None:
         """从 Schema 对象建表 + 索引（MySQL 方言解析）。"""
-        col_defs, index_stmts = _parse_schema_mysql(schema)
+        col_defs, index_stmts = parse_schema(schema, **_MYSQL_COLUMN_KW)
         self._create_table_raw(schema.table_name, col_defs, if_not_exists=if_not_exists)
         # 索引幂等创建：MySQL CREATE INDEX 不支持 IF NOT EXISTS，先查已有索引避免报错
         existing_indexes = self._list_indexes(schema.table_name)
@@ -496,11 +516,11 @@ class MySQLClient(DatabaseClientBase):
                 if c.name.lower() in existing_cols:
                     continue
                 # MySQL ADD COLUMN 语法与 SQLite 一致，但不支持加 PRIMARY KEY
-                col_sql = _column_sql_mysql(c)
-                self.execute(f"ALTER TABLE {_quote_ident_mysql(schema.table_name)} ADD COLUMN {col_sql}")
+                col_sql = column_sql(c, **_MYSQL_COLUMN_KW)
+                self.execute(f"ALTER TABLE {quote_ident(schema.table_name)} ADD COLUMN {col_sql}")
 
         # 索引幂等创建
-        _, index_stmts = _parse_schema_mysql(schema)
+        _, index_stmts = parse_schema(schema, **_MYSQL_COLUMN_KW)
         existing_indexes = self._list_indexes(schema.table_name)
         for stmt in index_stmts:
             idx_name_match = re.search(r"CREATE (?:UNIQUE )?INDEX `([^`]+)`", stmt)
@@ -512,7 +532,7 @@ class MySQLClient(DatabaseClientBase):
         """删表。"""
         _check_ident(table, "表名")
         if_ex = "IF EXISTS " if if_exists else ""
-        self.execute(f"DROP TABLE {if_ex}{_quote_ident_mysql(table)}")
+        self.execute(f"DROP TABLE {if_ex}{quote_ident(table)}")
 
     # ---------- 便捷 CRUD ----------
     def insert(self, table: str, data: dict[str, Any]) -> int:
@@ -520,9 +540,11 @@ class MySQLClient(DatabaseClientBase):
         if not data:
             raise DatabaseValidationError("insert 数据不能为空")
         _check_ident(table, "表名")
-        columns = ", ".join(_quote_ident_mysql(k) for k in data.keys())
+        for k in data.keys():
+            _check_ident(k, "字段名")
+        columns = ", ".join(quote_ident(k) for k in data.keys())
         placeholders = ", ".join(["%s"] * len(data))
-        sql = f"INSERT INTO {_quote_ident_mysql(table)} ({columns}) VALUES ({placeholders})"
+        sql = f"INSERT INTO {quote_ident(table)} ({columns}) VALUES ({placeholders})"
         return self.execute(sql, tuple(data.values()))["lastrowid"]
 
     def select(
@@ -534,16 +556,16 @@ class MySQLClient(DatabaseClientBase):
     ) -> list[dict[str, Any]]:
         """查询多行，where 做等值匹配。"""
         _check_ident(table, "表名")
-        sql = f"SELECT * FROM {_quote_ident_mysql(table)}"
+        sql = f"SELECT * FROM {quote_ident(table)}"
         params: list[Any] = []
         if where:
             conditions = []
             for k, v in where.items():
                 _check_ident(k, "字段名")
                 if v is None:
-                    conditions.append(f"{_quote_ident_mysql(k)} IS NULL")
+                    conditions.append(f"{quote_ident(k)} IS NULL")
                 else:
-                    conditions.append(f"{_quote_ident_mysql(k)} = %s")
+                    conditions.append(f"{quote_ident(k)} = %s")
                     params.append(v)
             sql += f" WHERE {' AND '.join(conditions)}"
         if order_by:
@@ -551,7 +573,12 @@ class MySQLClient(DatabaseClientBase):
                 raise DatabaseValidationError(f"非法 order_by: {order_by!r}")
             sql += f" ORDER BY {order_by}"
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
+            # 与 _compile_query 同口径：limit 强制非负 int，负数直接报错——
+            # MySQL 下 LIMIT -1 是语法错误，提前拦下给出统一的中文异常。
+            n = int(limit)
+            if n < 0:
+                raise DatabaseValidationError(f"limit 不能为负数: {n}")
+            sql += f" LIMIT {n}"
         return self.query(sql, tuple(params))  # type: ignore
 
     # ---------- 谓词下推：Query / Filter → 参数化 SQL（MySQL 方言，用 %s 占位符） ----------
@@ -561,7 +588,7 @@ class MySQLClient(DatabaseClientBase):
         if not isinstance(f, Filter):
             raise TypeError(f"filters 列表元素必须是 Filter，收到 {type(f)}")
         _check_ident(f.field, "字段名")
-        col = _quote_ident_mysql(f.field)
+        col = quote_ident(f.field)
         op = f.op
 
         # IS NULL / IS NOT NULL：无参
@@ -592,7 +619,16 @@ class MySQLClient(DatabaseClientBase):
     def _compile_query(q: Query) -> tuple[str, list[Any]]:
         """把 Query 对象编译成 (SQL 语句, 参数列表)，MySQL 方言。"""
         _check_ident(q.table_name, "表名")
-        sql_parts: list[str] = [f"SELECT * FROM {_quote_ident_mysql(q.table_name)}"]
+        # 列投影：columns=None 保持 SELECT *；显式指定时逐列过标识符白名单，杜绝拼接注入
+        if q.columns is None:
+            col_clause = "*"
+        else:
+            if not q.columns:
+                raise DatabaseValidationError("columns 不能是空列表")
+            for c in q.columns:
+                _check_ident(c, "列名")
+            col_clause = ", ".join(quote_ident(c) for c in q.columns)
+        sql_parts: list[str] = [f"SELECT {col_clause} FROM {quote_ident(q.table_name)}"]
         params: list[Any] = []
 
         if q.filters:
@@ -610,7 +646,7 @@ class MySQLClient(DatabaseClientBase):
             for col in sort_cols:
                 _check_ident(col, "排序字段名")
             direction = "ASC" if q.sort_order is SortOrder.ASC else "DESC"
-            order_by = ", ".join(f"{_quote_ident_mysql(c)} {direction}" for c in sort_cols)
+            order_by = ", ".join(f"{quote_ident(c)} {direction}" for c in sort_cols)
             sql_parts.append(f"ORDER BY {order_by}")
 
         if q.limit is not None:
@@ -645,12 +681,7 @@ class MySQLClient(DatabaseClientBase):
         rows = self.select_where(limited)
         return rows[0] if rows else None
 
-    def select_one(
-        self,
-        table: str,
-        where: dict[str, Any] | None = None,
-        order_by: str | None = None,
-    ) -> dict[str, Any] | None:
+    def select_one(self, table: str, where: dict[str, Any] | None = None, order_by: str | None = None,) -> dict[str, Any] | None:
         """查询单行，不存在返回 None。"""
         rows = self.select(table, where=where, order_by=order_by, limit=1)
         return rows[0] if rows else None
@@ -660,17 +691,17 @@ class MySQLClient(DatabaseClientBase):
         if not data or not where:
             raise DatabaseValidationError("update 需要 data 和 where")
         _check_ident(table, "表名")
-        set_clause = ", ".join([f"{_quote_ident_mysql(k)} = %s" for k in data.keys()])
+        set_clause = ", ".join([f"{quote_ident(k)} = %s" for k in data.keys()])
         where_parts: list[str] = []
         params: list[Any] = list(data.values())
         for k, v in where.items():
             _check_ident(k, "字段名")
             if v is None:
-                where_parts.append(f"{_quote_ident_mysql(k)} IS NULL")
+                where_parts.append(f"{quote_ident(k)} IS NULL")
             else:
-                where_parts.append(f"{_quote_ident_mysql(k)} = %s")
+                where_parts.append(f"{quote_ident(k)} = %s")
                 params.append(v)
-        sql = f"UPDATE {_quote_ident_mysql(table)} SET {set_clause} WHERE {' AND '.join(where_parts)}"
+        sql = f"UPDATE {quote_ident(table)} SET {set_clause} WHERE {' AND '.join(where_parts)}"
         return self.execute(sql, tuple(params))["rowcount"]
 
     def delete(self, table: str, where: dict[str, Any]) -> int:
@@ -683,11 +714,11 @@ class MySQLClient(DatabaseClientBase):
         for k, v in where.items():
             _check_ident(k, "字段名")
             if v is None:
-                where_parts.append(f"{_quote_ident_mysql(k)} IS NULL")
+                where_parts.append(f"{quote_ident(k)} IS NULL")
             else:
-                where_parts.append(f"{_quote_ident_mysql(k)} = %s")
+                where_parts.append(f"{quote_ident(k)} = %s")
                 params.append(v)
-        sql = f"DELETE FROM {_quote_ident_mysql(table)} WHERE {' AND '.join(where_parts)}"
+        sql = f"DELETE FROM {quote_ident(table)} WHERE {' AND '.join(where_parts)}"
         return self.execute(sql, tuple(params))["rowcount"]
 
     # ---------- 事务上下文管理（与 SQLiteClient 行为完全一致，支持嵌套） ----------
@@ -739,16 +770,16 @@ class MySQLClient(DatabaseClientBase):
     def count(self, table: str, where: dict[str, Any] | None = None) -> int:
         """按等值条件统计行数，where=None 返回表总行数。"""
         _check_ident(table, "表名")
-        sql = f"SELECT COUNT(*) AS cnt FROM {_quote_ident_mysql(table)}"
+        sql = f"SELECT COUNT(*) AS cnt FROM {quote_ident(table)}"
         params: list[Any] = []
         conditions: list[str] = []
         if where:
             for k, v in where.items():
                 _check_ident(k, "字段名")
                 if v is None:
-                    conditions.append(f"{_quote_ident_mysql(k)} IS NULL")
+                    conditions.append(f"{quote_ident(k)} IS NULL")
                 else:
-                    conditions.append(f"{_quote_ident_mysql(k)} = %s")
+                    conditions.append(f"{quote_ident(k)} = %s")
                     params.append(v)
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
@@ -775,9 +806,9 @@ class MySQLClient(DatabaseClientBase):
                 if extra:
                     msg += f"，多余字段: {sorted(extra)}"
                 raise DatabaseValidationError(msg)
-        col_sql_str = ", ".join(_quote_ident_mysql(c) for c in columns)
+        col_sql_str = ", ".join(quote_ident(c) for c in columns)
         placeholders = ", ".join("%s" for _ in columns)
-        sql = f"INSERT INTO {_quote_ident_mysql(table)} ({col_sql_str}) VALUES ({placeholders})"
+        sql = f"INSERT INTO {quote_ident(table)} ({col_sql_str}) VALUES ({placeholders})"
         params_list = [tuple(row[c] for c in columns) for row in rows]
         self.executemany(sql, params_list)
         return len(rows)
@@ -831,19 +862,28 @@ class MySQLClient(DatabaseClientBase):
         for c in update_columns:
             _check_ident(c, "字段名")
 
-        col_sql = ", ".join(_quote_ident_mysql(c) for c in columns)
+        col_sql = ", ".join(quote_ident(c) for c in columns)
         placeholders = ", ".join("%s" for _ in columns)
+        # MySQL 8.0.19+ 用行别名 AS new（VALUES(col) 自 8.0.20 起弃用）；5.7 / MariaDB 回退 VALUES(col)。
         if update_columns:
-            assigned = ", ".join(
-                f"{_quote_ident_mysql(c)} = VALUES({_quote_ident_mysql(c)})" for c in update_columns
-            )
+            if self._supports_row_alias:
+                assigned = ", ".join(
+                    f"{quote_ident(c)} = new.{quote_ident(c)}" for c in update_columns
+                )
+                alias = " AS new"
+            else:
+                assigned = ", ".join(
+                    f"{quote_ident(c)} = VALUES({quote_ident(c)})" for c in update_columns
+                )
+                alias = ""
             on_duplicate = f"ON DUPLICATE KEY UPDATE {assigned}"
         else:
-            # 冲突时忽略：MySQL 没有 DO NOTHING，用更新一个无意义列的方式实现，或直接用 INSERT IGNORE？
-            # 为严格对齐语义，update_columns 为空时用 ON DUPLICATE KEY UPDATE id=id（无操作）
-            on_duplicate = "ON DUPLICATE KEY UPDATE " + f"{_quote_ident_mysql(keys[0])} = {_quote_ident_mysql(keys[0])}"
+            # 冲突时忽略：MySQL 没有 DO NOTHING，用 ON DUPLICATE KEY UPDATE id=id（自赋值即无操作）。
+            # 该分支不引用新值，行别名无意义，故不追加 AS new。
+            alias = ""
+            on_duplicate = "ON DUPLICATE KEY UPDATE " + f"{quote_ident(keys[0])} = {quote_ident(keys[0])}"
 
-        sql = f"INSERT INTO {_quote_ident_mysql(table)} ({col_sql}) VALUES ({placeholders}) {on_duplicate}"
+        sql = f"INSERT INTO {quote_ident(table)} ({col_sql}) VALUES ({placeholders}){alias} {on_duplicate}"
         return self.execute(sql, tuple(data.values()))["rowcount"]
 
     def update_where(self, table: str, values: dict[str, Any], query: Query) -> int:
@@ -861,14 +901,14 @@ class MySQLClient(DatabaseClientBase):
         for col, val in values.items():
             _check_ident(col, "字段名")
             if isinstance(val, SqlExpr):
-                set_parts.append(f"{_quote_ident_mysql(col)} = {val.sql}")
+                set_parts.append(f"{quote_ident(col)} = {val.sql}")
             else:
-                set_parts.append(f"{_quote_ident_mysql(col)} = %s")
+                set_parts.append(f"{quote_ident(col)} = %s")
                 params.append(val)
 
         where_sql, where_params = self._compile_filters(query.filters)
         params.extend(where_params)
-        sql = f"UPDATE {_quote_ident_mysql(table)} SET {', '.join(set_parts)} WHERE {where_sql}"
+        sql = f"UPDATE {quote_ident(table)} SET {', '.join(set_parts)} WHERE {where_sql}"
         return self.execute(sql, tuple(params))["rowcount"]
 
     def delete_where(self, table: str, query: Query) -> int:
@@ -879,12 +919,6 @@ class MySQLClient(DatabaseClientBase):
             raise DatabaseValidationError("delete_where 的 query.filters 不能为空（防止误删全表）")
         _check_ident(table, "表名")
         where_sql, params = self._compile_filters(query.filters)
-        sql = f"DELETE FROM {_quote_ident_mysql(table)} WHERE {where_sql}"
+        sql = f"DELETE FROM {quote_ident(table)} WHERE {where_sql}"
         return self.execute(sql, tuple(params))["rowcount"]
 
-    def __del__(self) -> None:
-        """析构时尝试关闭连接。"""
-        try:
-            self.close()
-        except Exception:
-            pass

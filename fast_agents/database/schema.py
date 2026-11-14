@@ -67,13 +67,25 @@ def check_ident(name: str, kind: str = "标识符") -> None:
     if not isinstance(name, str) or not _IDENT_RE.match(name):
         raise DatabaseIdentifierError(f"非法{kind}: {name!r}（只允许字母/数字/下划线，且不以数字开头）")
 
+def sql_literal(value: Any, ctype: ColumnType) -> str:
+    """把 Python 默认值转成 SQLite / MySQL 字面量。"""
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if value is None:
+        return "NULL"
+    # 字符串：转义单引号
+    s = str(value).replace("'", "''")
+    return f"'{s}'"
 
-def quote_ident(name: str) -> str:
-    """给标识符加双引号（SQLite 允许用双引号引关键字）。调用前必须先过 check_ident。"""
-    # 将内部的双引号转义为两个双引号
-    escaped_name = name.replace('"', '""')
-    return f'"{escaped_name}"'
+def quote_ident(name: str, quote: str = '"', **kwargs) -> str:
+    """给标识符加引用符（默认双引号 " ＝SQLite 方言, mysql 方言是反引号 `）。调用前必须先过 check_ident。"""
+    return f"{quote}{name.replace(quote, quote * 2)}{quote}"
 
+def check_and_quote_ident(name: str, kind: str = "标识符", quote: str = '"', **kwargs) -> str:
+    check_ident(name, kind)
+    return quote_ident(name, quote)
 
 # ---------------------------------------------------------------------------
 # Column / Schema -> SQL 片段解析（纯函数，不依赖数据库连接）
@@ -91,48 +103,54 @@ TYPE_TO_SQLITE: dict[ColumnType, str] = {
 }
 
 
-def sql_literal(value: Any, ctype: ColumnType) -> str:
-    """把 Python 默认值转成 SQLite 字面量。"""
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if value is None:
-        return "NULL"
-    # 字符串：转义单引号
-    s = str(value).replace("'", "''")
-    return f"'{s}'"
+def column_sql(col: Column,
+    type_map: Optional[dict[ColumnType, str]] = None,
+    quote: str = '"',
+    varchar_length: bool = False,
+    auto_increment: bool = False,
+    unique_keyword: str = "UNIQUE",
+    **kwargs
+) -> str:
+    """把一个 Column 模型转成列定义片段（默认 SQLite 方言）。
 
+    方言点全部由关键字参数注入，默认值保证 SQLite 侧行为逐字节不变：
 
-def column_sql(col: Column) -> str:
-    """把一个 Column 模型转成 SQLite 列定义片段。"""
+    - ``type_map``：类型映射表（默认 ``TYPE_TO_SQLITE``）；
+    - ``quote``：标识符引用符（默认双引号 ``"`` ＝SQLite 方言，MySQL 是反引号）；
+    - ``unique_keyword``：唯一约束关键字（SQLite ``UNIQUE`` / MySQL ``UNIQUE KEY``）；
+    - ``auto_increment``：主键整型列是否追加 ``AUTO_INCREMENT``（MySQL 需显式声明；
+      SQLite 不追加，其 ``INTEGER PRIMARY KEY`` 已是 ROWID 别名）；
+    - ``varchar_length``：``VARCHAR`` 指定 ``length`` 时是否展开成 ``VARCHAR(n)``
+      （MySQL 需要；SQLite 无 VARCHAR，统一映射 TEXT，length 仅作校验/文档）。
+    """
     check_ident(col.name, "列名")
-    type_sql = TYPE_TO_SQLITE[col.type]
-    parts: list[str] = [quote_ident(col.name), type_sql]
+    if type_map is None:
+        type_map = TYPE_TO_SQLITE
+    if varchar_length and col.type is ColumnType.VARCHAR and col.length is not None:
+        type_sql = f"VARCHAR({int(col.length)})"
+    else:
+        type_sql = type_map[col.type]
+    parts: list[str] = [quote_ident(col.name, quote), type_sql]
 
     if col.primary_key:
         parts.append("PRIMARY KEY")
-        # INTEGER PRIMARY KEY 在 SQLite 里默认就是 AUTOINCREMENT 的别名（ROWID），
-        # 这里显式补 AUTOINCREMENT 仅在显式声明时才加，避免改变默认行为。
-        if col.type is ColumnType.INTEGER and col.name.lower() == "id":
-            # 保守起见不自动追加 AUTOINCREMENT：SQLite 的 INTEGER PRIMARY KEY 已自动 ROWID 别名，
-            # 真要严格自增不回填由调用方自己写在 default 之外——这里保持最小惊讶。
-            pass
+        if auto_increment and col.type is ColumnType.INTEGER and col.name.lower() == "id":
+            parts.append("AUTO_INCREMENT")
 
     if not col.nullable and not col.primary_key:
         parts.append("NOT NULL")
 
     if col.unique and not col.primary_key:
-        parts.append("UNIQUE")
+        parts.append(unique_keyword)
 
     if col.default is not None:
-        # 默认值按类型做 SQL 字面量转换
         parts.append("DEFAULT " + sql_literal(col.default, col.type))
 
     return " ".join(parts)
 
 
-def column_index_stmt(table: str, col: Column) -> Optional[str]:
+def column_index_stmt(table: str, col: Column,
+                      if_not_exists: bool = True, quote: str = '"', **kwargs) -> Optional[str]:
     """为声明了 ``index=True`` 的普通列生成 CREATE INDEX 语句；不需要建索引时返回 None。
 
     主键列 / UNIQUE 列 SQLite 已自动建索引，跳过避免冗余。
@@ -141,26 +159,24 @@ def column_index_stmt(table: str, col: Column) -> Optional[str]:
         return None
     check_ident(col.name, "列名")
     idx_name = f"idx_{table}_{col.name}"
-    return (
-        f"CREATE INDEX IF NOT EXISTS {quote_ident(idx_name)} "
-        f"ON {quote_ident(table)} ({quote_ident(col.name)})"
-    )
+    if_not = "IF NOT EXISTS " if if_not_exists else ""
+    return (f"CREATE INDEX {if_not}{quote_ident(idx_name, quote)} "
+            f"ON {quote_ident(table, quote)} ({quote_ident(col.name, quote)})")
 
 
-def index_stmt(table: str, idx: Index) -> str:
+def index_stmt(table: str, idx: Index, if_not_exists: bool = True, quote: str = '"', **kwargs) -> str:
     """把一个显式 Index 模型转成 CREATE INDEX 语句。"""
     check_ident(idx.name, "索引名")
     for c in idx.columns:
         check_ident(c, "索引列名")
-    cols_sql = ", ".join(quote_ident(c) for c in idx.columns)
+    cols_sql = ", ".join(quote_ident(c, quote) for c in idx.columns)
     unique = "UNIQUE " if idx.unique else ""
-    return (
-        f"CREATE {unique}INDEX IF NOT EXISTS {quote_ident(idx.name)} "
-        f"ON {quote_ident(table)} ({cols_sql})"
-    )
+    ine = "IF NOT EXISTS " if if_not_exists else ""
+    return (f"CREATE {unique}INDEX {ine}{quote_ident(idx.name, quote)} "
+            f"ON {quote_ident(table, quote)} ({cols_sql})")
 
 
-def parse_column_list(table: str, columns: list[Column]) -> tuple[list[str], list[str]]:
+def parse_column_list(table: str, columns: list[Column], if_not_exists: bool = True, **kwargs) -> tuple[list[str], list[str]]:
     """解析 ``list[Column]``，返回 ``(col_defs, index_stmts)``。
 
     Args:
@@ -177,22 +193,22 @@ def parse_column_list(table: str, columns: list[Column]) -> tuple[list[str], lis
     for c in columns:
         if not isinstance(c, Column):
             raise TypeError(f"columns 列表元素必须是 Column，收到 {type(c)}")
-        col_defs.append(column_sql(c))
-        stmt = column_index_stmt(table, c)
+        col_defs.append(column_sql(c, **kwargs))
+        stmt = column_index_stmt(table, c, if_not_exists=if_not_exists, **kwargs)
         if stmt is not None:
             index_stmts.append(stmt)
     return col_defs, index_stmts
 
 
-def parse_schema(schema: Schema) -> tuple[list[str], list[str]]:
+def parse_schema(schema: Schema, if_not_exists: bool = True, **kwargs) -> tuple[list[str], list[str]]:
     """解析 ``Schema``，返回 ``(col_defs, index_stmts)``。
 
     index_stmts 同时包含两部分（顺序：先列级、后显式）：
     1. ``schema.columns`` 中 ``index=True`` 的普通列生成的索引语句；
     2. ``schema.indexes`` 中显式声明的索引语句。
     """
-    col_defs, index_stmts = parse_column_list(schema.table_name, schema.columns)
+    col_defs, index_stmts = parse_column_list(schema.table_name, schema.columns, if_not_exists=if_not_exists, **kwargs)
     if schema.indexes:
         for idx in schema.indexes:
-            index_stmts.append(index_stmt(schema.table_name, idx))
+            index_stmts.append(index_stmt(schema.table_name, idx, if_not_exists=if_not_exists, **kwargs))
     return col_defs, index_stmts
