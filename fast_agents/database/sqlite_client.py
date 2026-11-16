@@ -151,32 +151,6 @@ def _split_sql_statements(sql: str) -> list[str]:
     return statements
 
 
-class SqlExpr:
-    """SQL 表达式包装：标记某个「值」应作为 SQL 片段原样拼入，而不是走参数化。
-
-    只在 ``update_where`` 的 SET 子句里使用，用于「自增 / 函数计算」这类无法用
-    参数表达的写法，例如::
-
-        db.update_where("memories", {"access_count": SqlExpr("access_count + 1")}, query)
-
-    安全约定（重要）：
-        - 表达式会被**原样拼进 SQL**，不做任何转义，因此**只能传程序里写死的固定片段**；
-        - 严禁把任何外部输入（用户消息、工具返回值、HTTP 响应）拼进 ``SqlExpr``，
-          否则等于把 SQL 注入的口子重新打开；
-        - 只是普通值（数字 / 字符串 / None）请直接传，走参数化，不要用 ``SqlExpr`` 包。
-    """
-
-    __slots__ = ("sql",)
-
-    def __init__(self, sql: str):
-        if not isinstance(sql, str) or not sql.strip():
-            raise DatabaseValidationError("SqlExpr 的表达式必须是非空字符串")
-        self.sql = sql
-
-    def __repr__(self) -> str:
-        return f"SqlExpr({self.sql!r})"
-
-
 class SQLiteClient(DatabaseClientBase):
     """SQLite 客户端，单连接、字典行结果、参数化查询、声明式建表。"""
 
@@ -335,9 +309,16 @@ class SQLiteClient(DatabaseClientBase):
             raise DatabaseOperationalError(f"查询失败: {e}\nSQL: {sql}") from e
 
     # ------------ 方言 ------------
+    def _placeholder(self, name: str) -> str:
+        """把参数名渲染成 SQLite 占位符文本。例：f: "f0" -> ":f0" """
+        return f":{name}"  #
+
     def _quote_ident(self, name: str) -> str:
         """SQLite 双引号标识符。"""
         return _quote_ident(name, '"')
+
+    # OFFSET 单独出现时的 LIMIT 兜底（SQLite 原生支持 -1 表示"无上限"）
+    _OFFSET_NO_LIMIT_SQL: str = "LIMIT -1"
 
     def _parse_columns(self, table: str, columns: list[Column]) -> tuple[list[str], list[str]]:
         """SQLite 方言列解析，直接复用 schema.parse_column_list。"""
@@ -384,10 +365,6 @@ class SQLiteClient(DatabaseClientBase):
         for stmt in index_stmts:
             self.execute(stmt)
 
-    def ensure_table(self, table: str, columns: dict[str, str] | list[Column] | Schema) -> None:
-        """幂等建表（等价 create_table(..., if_not_exists=True)）。"""
-        self.create_table(table, columns, if_not_exists=True)
-
     def ensure_schema(self, schema: Schema, migrate: bool = False) -> None:
         """按 Schema 幂等建表 + 建索引；migrate=True 时尝试补齐缺失列（ADD COLUMN）。"""
         if not isinstance(schema, Schema):
@@ -414,229 +391,6 @@ class SQLiteClient(DatabaseClientBase):
         _, index_stmts = parse_schema(schema)
         for stmt in index_stmts:
             self.execute(stmt)
-
-    def drop_table(self, table: str, if_exists: bool = True) -> None:
-        """删表。"""
-        _check_ident(table, "表名")
-        if_ex = "IF EXISTS " if if_exists else ""
-        self.execute(f"DROP TABLE {if_ex}{_quote_ident(table)}")
-
-    # ---------- 便捷 CRUD ----------
-    def insert(self, table: str, data: dict[str, Any]) -> int:
-        """插入一行，返回新行 id。"""
-        if not data:
-            raise DatabaseValidationError("insert 数据不能为空")
-        _check_ident(table, "表名")
-        for k in data.keys():
-            _check_ident(k, "字段名")
-        columns = ", ".join(_quote_ident(k) for k in data.keys())
-        placeholders = ", ".join([f":{k}" for k in data.keys()])
-        sql = f"INSERT INTO {_quote_ident(table)} ({columns}) VALUES ({placeholders})"
-        return self.execute(sql, data)["lastrowid"]
-
-    def select(
-        self,
-        table: str,
-        where: dict[str, Any] | None = None,
-        order_by: str | None = None,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """查询多行，where 做等值匹配；值为 None 时自动编译为 IS NULL。"""
-        _check_ident(table, "表名")
-        sql = f"SELECT * FROM {_quote_ident(table)}"
-        params: dict = {}
-        if where:
-            conditions: list[str] = []
-            for k, v in where.items():
-                _check_ident(k, "字段名")
-                if v is None:
-                    conditions.append(f"{_quote_ident(k)} IS NULL")
-                else:
-                    conditions.append(f"{_quote_ident(k)} = :w_{k}")
-                    params[f"w_{k}"] = v
-            sql += f" WHERE {' AND '.join(conditions)}"
-        if order_by:
-            # order_by 允许形如 "id DESC"，由调用方保证合法；仅作基本字符集校验
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\s+(ASC|DESC))?$", order_by.strip()):
-                raise DatabaseValidationError(f"非法 order_by: {order_by!r}")
-            sql += f" ORDER BY {order_by}"
-        if limit is not None:
-            # 与 _compile_query 同口径：limit 强制非负 int，负数直接报错——
-            # SQLite 会把 LIMIT -1 当成"无上限"而静默返回全表，与调用方预期不符。
-            n = int(limit)
-            if n < 0:
-                raise DatabaseValidationError(f"limit 不能为负数: {n}")
-            sql += f" LIMIT {n}"
-        return self.query(sql, params)  # type: ignore
-
-    # ---------- 谓词下推：Query / Filter → 参数化 SQL ----------
-    @staticmethod
-    def _compile_filter(f: Filter, idx: int) -> tuple[str, dict[str, Any]]:
-        """把单个 Filter 编译成 (SQL 片段, 参数字典)。
-
-        - 列名必须过 _check_ident 白名单；
-        - 值一律通过命名参数 ``:f{idx}...`` 传入，杜绝拼接注入；
-        - 每个参数名用 idx 后缀唯一名，避免同列多条件时参数名冲突。
-        """
-        if not isinstance(f, Filter):
-            raise TypeError(f"filters 列表元素必须是 Filter，收到 {type(f)}")
-        _check_ident(f.field, "字段名")
-        col = _quote_ident(f.field)
-        op = f.op
-        p_name = f"f{idx}"
-
-        # IS NULL / IS NOT NULL：无参
-        if op is FilterOp.IS_NULL:
-            return f"{col} IS NULL", {}
-        if op is FilterOp.NOT_NULL:
-            return f"{col} IS NOT NULL", {}
-
-        # IN：需要列表值，展开成 (:f0_0, :f0_1, ...)
-        if op is FilterOp.IN:
-            if not isinstance(f.value, (list, tuple)) or len(f.value) == 0:
-                raise DatabaseValidationError(
-                    f"Filter(field={f.field!r}, op=IN) 的 value 必须是非空 list/tuple，"
-                    f"收到 {type(f.value).__name__}"
-                )
-            keys: list[str] = []
-            params: dict[str, Any] = {}
-            for i, v in enumerate(f.value):
-                k = f"{p_name}_{i}"
-                keys.append(f":{k}")
-                params[k] = v
-            return f"{col} IN ({', '.join(keys)})", params
-
-        # 其它二元操作符（= != > >= < <= LIKE）：需要一个 value
-        if f.value is None:
-            raise DatabaseValidationError(
-                f"Filter(field={f.field!r}, op={op.value}) 必须提供 value；"
-                f"判空请用 IS_NULL / NOT_NULL"
-            )
-        # 允许 LIKE 的 value 带 % / _，不替用户补，保持最小惊讶
-        return f"{col} {op.value} :{p_name}", {p_name: f.value}
-
-    @staticmethod
-    def _compile_query(q: Query) -> tuple[str, dict[str, Any]]:
-        """把 Query 对象编译成 (SQL 语句, 命名参数字典)。
-
-        编译规则（严格保守、不做 OR / JOIN / 子查询，保持最小可用）：
-        - 表名 / sort_by 字段名全部走 _check_ident 白名单；
-        - 多个 Filter 之间固定 AND；
-        - sort_by 支持单字段 str 或 多字段 list[str]，方向对每列统一应用（ASC/DESC 枚举）；
-        - limit / offset 强制 int 并校验非负；
-        - LIKE 的通配符由调用方在 value 里自带，不替用户加 %，避免"隐式模糊"。
-        """
-        _check_ident(q.table_name, "表名")
-        # 列投影：columns=None 保持 SELECT *；显式指定时逐列过标识符白名单，杜绝拼接注入
-        if q.columns is None:
-            col_clause = "*"
-        else:
-            if not q.columns:
-                raise DatabaseValidationError("columns 不能是空列表")
-            for c in q.columns:
-                _check_ident(c, "列名")
-            col_clause = ", ".join(_quote_ident(c) for c in q.columns)
-        sql_parts: list[str] = [f"SELECT {col_clause} FROM {_quote_ident(q.table_name)}"]
-        params: dict[str, Any] = {}
-
-        if q.filters:
-            conds: list[str] = []
-            for i, f in enumerate(q.filters):
-                frag, p = SQLiteClient._compile_filter(f, i)
-                conds.append(frag)
-                params.update(p)
-            sql_parts.append("WHERE " + " AND ".join(conds))
-
-        if q.sort_by is not None:
-            # 兼容单字段 str 与多字段 list[str] 两种写法；排序方向对每一列统一应用
-            sort_cols = [q.sort_by] if isinstance(q.sort_by, str) else list(q.sort_by)
-            if not sort_cols:
-                raise DatabaseValidationError("sort_by 不能是空列表")
-            for col in sort_cols:
-                _check_ident(col, "排序字段名")
-            direction = "ASC" if q.sort_order is SortOrder.ASC else "DESC"
-            order_by = ", ".join(f"{_quote_ident(c)} {direction}" for c in sort_cols)
-            sql_parts.append(f"ORDER BY {order_by}")
-
-        if q.limit is not None:
-            n = int(q.limit)
-            if n < 0:
-                raise DatabaseValidationError(f"limit 不能为负数: {n}")
-            sql_parts.append(f"LIMIT {n}")
-
-        if q.offset is not None:
-            m = int(q.offset)
-            if m < 0:
-                raise DatabaseValidationError(f"offset 不能为负数: {m}")
-            # SQLite 里 OFFSET 必须先有 LIMIT；为最小惊讶，没 LIMIT 时自动补一个大数兜底
-            if q.limit is None:
-                sql_parts.append("LIMIT -1")  # SQLite 支持 LIMIT -1 表示"无上限"
-            sql_parts.append(f"OFFSET {m}")
-
-        return " ".join(sql_parts), params
-
-    def select_where(self, query: Query) -> list[dict[str, Any]]:
-        """按声明式 Query 查询（谓词下推入口）。"""
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        sql, params = self._compile_query(query)
-        return self.query(sql, params)  # type: ignore[return-value]
-
-    def select_one_where(self, query: Query) -> dict[str, Any] | None:
-        """按声明式 Query 查询单行（自动 LIMIT 1）。"""
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        # 不修改传入对象，构造一个只带 limit=1 的副本用于 SQL 生成
-        limited = query.model_copy(update={"limit": 1, "offset": None})
-        rows = self.select_where(limited)
-        return rows[0] if rows else None
-
-    def select_one(
-        self,
-        table: str,
-        where: dict[str, Any] | None = None,
-        order_by: str | None = None,
-    ) -> dict[str, Any] | None:
-        """查询单行，不存在返回 None。"""
-        rows = self.select(table, where=where, order_by=order_by, limit=1)
-        return rows[0] if rows else None
-
-    def update(self, table: str, data: dict[str, Any], where: dict[str, Any]) -> int:
-        """更新行，返回影响行数；where 值为 None 时编译为 IS NULL。"""
-        if not data or not where:
-            raise DatabaseValidationError("update 需要 data 和 where")
-        _check_ident(table, "表名")
-        for k in data.keys():
-            _check_ident(k, "字段名")
-        set_clause = ", ".join([f"{_quote_ident(k)} = :set_{k}" for k in data.keys()])
-        where_conds: list[str] = []
-        params: dict[str, Any] = {f"set_{k}": v for k, v in data.items()}
-        for k, v in where.items():
-            _check_ident(k, "字段名")
-            if v is None:
-                where_conds.append(f"{_quote_ident(k)} IS NULL")
-            else:
-                where_conds.append(f"{_quote_ident(k)} = :w_{k}")
-                params[f"w_{k}"] = v
-        sql = f"UPDATE {_quote_ident(table)} SET {set_clause} WHERE {' AND '.join(where_conds)}"
-        return self.execute(sql, params)["rowcount"]
-
-    def delete(self, table: str, where: dict[str, Any]) -> int:
-        """删除行，返回影响行数；where 值为 None 时编译为 IS NULL。"""
-        if not where:
-            raise DatabaseValidationError("delete 必须传 where 防止误删全表")
-        _check_ident(table, "表名")
-        where_conds: list[str] = []
-        params: dict[str, Any] = {}
-        for k, v in where.items():
-            _check_ident(k, "字段名")
-            if v is None:
-                where_conds.append(f"{_quote_ident(k)} IS NULL")
-            else:
-                where_conds.append(f"{_quote_ident(k)} = :w_{k}")
-                params[f"w_{k}"] = v
-        sql = f"DELETE FROM {_quote_ident(table)} WHERE {' AND '.join(where_conds)}"
-        return self.execute(sql, params)["rowcount"]
 
     # ---------- 事务上下文管理 ----------
     def __enter__(self) -> "SQLiteClient":
@@ -693,79 +447,6 @@ class SQLiteClient(DatabaseClientBase):
             self._tx_depth = 0
             self._tx_must_rollback = False
         return False
-
-
-    # ---------- 统计与批量写入：count / batch_insert ----------
-    def count(self, table: str, where: dict[str, Any] | None = None) -> int:
-        """按等值条件统计行数，where=None 返回表总行数。"""
-        _check_ident(table, "表名")
-        sql = f"SELECT COUNT(*) AS cnt FROM {_quote_ident(table)}"
-        params: list[Any] = []
-        conditions: list[str] = []
-        if where:
-            for k, v in where.items():
-                _check_ident(k, "字段名")
-                if v is None:
-                    conditions.append(f"{_quote_ident(k)} IS NULL")
-                else:
-                    conditions.append(f"{_quote_ident(k)} = ?")
-                    params.append(v)
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
-        row = self.query(sql, tuple(params), fetch_one=True)
-        return int(row["cnt"]) if row else 0
-
-    def batch_insert(self, table: str, rows: list[dict[str, Any]]) -> int:
-        """批量插入多行，返回插入行数；空列表直接返回0。
-
-        事务语义同 ``execute``/``executemany``：单独调用时自动提交，
-        在 ``with db:`` 内由外层事务统一提交/回滚。
-        """
-        if not rows:
-            return 0
-        _check_ident(table, "表名")
-        columns = list(rows[0].keys())
-        for col in columns:
-            _check_ident(col, "字段名")
-        expected_cols = set(columns)
-        for i, row in enumerate(rows):
-            row_cols = set(row.keys())
-            if row_cols != expected_cols:
-                missing = expected_cols - row_cols
-                extra = row_cols - expected_cols
-                msg = f"第 {i} 行字段与首行不一致"
-                if missing:
-                    msg += f"，缺少字段: {sorted(missing)}"
-                if extra:
-                    msg += f"，多余字段: {sorted(extra)}"
-                raise DatabaseValidationError(msg)
-        col_sql_str = ", ".join(_quote_ident(c) for c in columns)
-        placeholders = ", ".join("?" for _ in columns)
-        sql = f"INSERT INTO {_quote_ident(table)} ({col_sql_str}) VALUES ({placeholders})"
-        params_list = [tuple(row[c] for c in columns) for row in rows]
-        # 走 self.executemany 封装（而非 self.conn.executemany），
-        # 复用其「不在事务中时自动 commit、异常自动 rollback」的逻辑——
-        # 修复：单独调用 batch_insert 后 close，Python sqlite3 隐式事务被回滚导致数据静默丢失。
-        self.executemany(sql, params_list)
-        return len(rows)
-
-    # ---------- 条件写入：upsert / update_where / delete_where ----------
-    @staticmethod
-    def _compile_filters(filters: list[Filter] | None) -> tuple[str, dict[str, Any]]:
-        """把 Filter 列表编译成 (WHERE 片段, 命名参数字典)；无过滤条件返回 ("", {})。
-
-        与 ``_compile_query`` 里的过滤编译同源（都调用 ``_compile_filter``），
-        供 ``update_where`` / ``delete_where`` 复用，保证读写两侧谓词语义一致。
-        """
-        if not filters:
-            return "", {}
-        conds: list[str] = []
-        params: dict[str, Any] = {}
-        for i, f in enumerate(filters):
-            frag, p = SQLiteClient._compile_filter(f, i)
-            conds.append(frag)
-            params.update(p)
-        return " AND ".join(conds), params
 
     def upsert(
         self,
@@ -825,57 +506,4 @@ class SQLiteClient(DatabaseClientBase):
         )
         return self.execute(sql, data)["rowcount"]
 
-    def update_where(self, table: str, values: dict[str, Any], query: Query) -> int:
-        """按声明式 ``Query`` 条件批量更新，返回影响行数。
-
-        与 ``update(table, data, where)`` 的区别：``where`` 只能等值匹配，这里走 Filter
-        谓词（支持 ``> / < / >= / <= / != / LIKE / IN / IS NULL``）。
-
-        Args:
-            values: 要更新的列；普通值走参数化，需要「自增 / 函数计算」时用
-                ``SqlExpr("access_count + 1")`` 显式包裹（内容原样拼入 SQL，只传固定片段）。
-            query: 过滤条件来源；**``filters`` 必须非空**，防止误更新全表。
-
-        安全约定：``values`` 的键、``query`` 的过滤字段都走标识符白名单；只有 ``SqlExpr``
-        包装的内容才原样拼入，其它值一律参数化。
-        """
-        if not values:
-            raise DatabaseValidationError("update_where 需要 values")
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        if not query.filters:
-            raise DatabaseValidationError("update_where 的 query.filters 不能为空（防止误更新全表）")
-        _check_ident(table, "表名")
-
-        set_parts: list[str] = []
-        params: dict[str, Any] = {}
-        for i, (col, val) in enumerate(values.items()):
-            _check_ident(col, "字段名")
-            if isinstance(val, SqlExpr):
-                set_parts.append(f"{_quote_ident(col)} = {val.sql}")
-            else:
-                p_name = f"s{i}"
-                set_parts.append(f"{_quote_ident(col)} = :{p_name}")
-                params[p_name] = val
-
-        where_sql, where_params = self._compile_filters(query.filters)
-        params.update(where_params)
-        sql = f"UPDATE {_quote_ident(table)} SET {', '.join(set_parts)} WHERE {where_sql}"
-        return self.execute(sql, params)["rowcount"]
-
-    def delete_where(self, table: str, query: Query) -> int:
-        """按声明式 ``Query`` 条件批量删除，返回影响行数。
-
-        与 ``delete(table, where)`` 的区别：``where`` 只能等值，这里走 Filter 谓词。
-        与 ``delete`` 保持一致的安全约定：**``query.filters`` 必须非空**，防止误删全表；
-        真要删全表请显式 ``db.execute("DELETE FROM ...")``。
-        """
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        if not query.filters:
-            raise DatabaseValidationError("delete_where 的 query.filters 不能为空（防止误删全表）")
-        _check_ident(table, "表名")
-        where_sql, params = self._compile_filters(query.filters)
-        sql = f"DELETE FROM {_quote_ident(table)} WHERE {where_sql}"
-        return self.execute(sql, params)["rowcount"]
 

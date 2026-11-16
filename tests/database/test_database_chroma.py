@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 from tests._runner import raises, importorskip
 
+from fast_agents.database import DatabaseError
+
 # ===========================================================================
 # 向量后端：VectorClientBase 抽象层 + 编译层
 # ===========================================================================
@@ -69,7 +71,7 @@ def test_vector_filter_and_needs_two_subfilters():
     """AND/OR 组合至少 2 个子条件。"""
     from fast_agents.database import VectorFilter, VectorFilterOp
     from fast_agents.database.chroma_client import _compile_vector_filter
-    with raises(ValueError):
+    with raises(DatabaseError):
         _compile_vector_filter(VectorFilter(op=VectorFilterOp.AND, filters=[
             VectorFilter(field="a", op=VectorFilterOp.EQ, value=1),
         ]))
@@ -79,9 +81,9 @@ def test_chroma_client_requires_path_or_host():
     """path 和 host 二选一，都不给/都给都报错。"""
     importorskip("chromadb")
     from fast_agents.database import ChromaClient
-    with raises(ValueError):
+    with raises(DatabaseError):
         ChromaClient()
-    with raises(ValueError):
+    with raises(DatabaseError):
         ChromaClient(path="/tmp/x", host="127.0.0.1")
 
 
@@ -93,7 +95,7 @@ def test_chroma_client_invalid_collection_name():
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     db = ChromaClient(path=tmp)
     for bad in ["ab", "_abc", "a" * 64, "abc!", "a b", "abc_"]:
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.create_collection(bad)
     db.close()
 
@@ -152,7 +154,7 @@ def test_chroma_client_lifecycle_local_persistent():
                                   where=VectorFilter(field="kind", op=VectorFilterOp.EQ, value="preference"))
         assert [h["id"] for h in hits_filtered] == ["m3"]
         # delete 空条件拒绝
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.delete("mem_v1")
         # 按 metadata 条件删除：删 score >= 0.9 的 → m1(0.9) 会被保留？不，m1=0.9 >=0.9 删，m3=1.0 删，剩 m2
         removed = db.delete("mem_v1", where=VectorFilter(field="score", op=VectorFilterOp.GTE, value=0.9))
@@ -180,11 +182,11 @@ def test_chroma_client_add_requires_consistent_lengths():
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("tt1")
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.add("tt1", ids=["a"], embeddings=[[1.0, 0.0], [0.0, 1.0]])
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.add("tt1", ids=["a"])  # 内容字段全空
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.add("tt1", ids=[])   # ids 空
         db.close()
     finally:
@@ -201,9 +203,9 @@ def test_chroma_client_search_rejects_bad_query_vector():
         db = ChromaClient(path=tmp)
         db.create_collection("tt1")
         db.add("tt1", ids=["a"], embeddings=[[1.0, 0.0]])
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.search("tt1", [])
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.search("tt1", [1.0, 0.0], n_results=0)
         db.close()
     finally:
@@ -238,7 +240,7 @@ def test_chroma_client_invalid_metric_rejected():
     tmp = tempfile.mkdtemp(prefix="chroma_test_")
     try:
         db = ChromaClient(path=tmp)
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.create_collection("tt1", metric="euclidean")
         db.close()
     finally:
@@ -270,7 +272,7 @@ def test_chroma_create_collection_persists_dimension_and_rejects_duplicate():
         db.create_collection("opt1", dimension=4, metric="cosine")
         # 维度写进了 metadata，可跨进程读回
         assert db._client.get_collection("opt1").metadata.get("dimension") == 4
-        with raises(ValueError, match="已存在"):
+        with raises(DatabaseError, match="已存在"):
             db.create_collection("opt1")
         db.close()
     finally:
@@ -302,7 +304,7 @@ def test_chroma_add_rejects_duplicate_ids():
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt3")
-        with raises(ValueError, match="重复"):
+        with raises(DatabaseError, match="重复"):
             db.add("opt3", ids=["a", "a"], embeddings=[[1.0, 0.0], [0.0, 1.0]])
         db.close()
     finally:
@@ -318,7 +320,7 @@ def test_chroma_add_rejects_inconsistent_batch_dimension():
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt4")
-        with raises(ValueError, match="维度不一致"):
+        with raises(DatabaseError, match="维度不一致"):
             db.add("opt4", ids=["a", "b"], embeddings=[[1.0, 0.0], [0.0, 1.0, 2.0]])
         db.close()
     finally:
@@ -334,7 +336,7 @@ def test_chroma_add_rejects_dimension_mismatch_with_declared():
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt5", dimension=3)
-        with raises(ValueError, match="声明的维度"):
+        with raises(DatabaseError, match="声明的维度"):
             db.add("opt5", ids=["a"], embeddings=[[1.0, 0.0]])
         db.close()
     finally:
@@ -350,7 +352,7 @@ def test_chroma_search_rejects_dimension_mismatch():
     try:
         db = ChromaClient(path=tmp)
         db.create_collection("opt6", dimension=3)
-        with raises(ValueError, match="维度"):
+        with raises(DatabaseError, match="维度"):
             db.search("opt6", [1.0, 0.0])
         db.close()
     finally:
@@ -385,9 +387,9 @@ def test_chroma_get_limit_validation_and_include_switches():
         db = ChromaClient(path=tmp)
         db.create_collection("opt8", dimension=2)
         db.add("opt8", ids=["a"], embeddings=[[1.0, 0.0]], documents=["doc"], metadatas=[{"v": 1}])
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.get("opt8", limit=0)
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.get("opt8", limit=-3)
         rows = db.get("opt8", include_documents=False, include_metadatas=False)
         assert rows[0]["id"] == "a"
@@ -639,7 +641,7 @@ def test_chroma_add_reports_all_duplicated_ids_sorted():
         try:
             db.add("dup_scan", ids=ids, embeddings=[[1.0, 0.0]] * len(ids))
             assert False, "重复 ids 应当报错"
-        except ValueError as e:
+        except DatabaseError as e:
             msg = str(e)
             assert "['a', 'c']" in msg, f"应升序去重列出 ['a', 'c']，实际：{msg}"
         db.close()
@@ -672,11 +674,11 @@ def test_chroma_delete_empty_where_dict_rejected_like_none():
     db._get_collection = lambda name: fake
 
     # 三种「空条件」都必须拦截
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.delete("mem_v1")
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.delete("mem_v1", where={})
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.delete("mem_v1", ids=[], where={})
     # 校验先于集合访问：假集合一次都不该被触达
     assert fake.calls == [], f"空条件校验应先于集合访问，实际触达：{fake.calls}"

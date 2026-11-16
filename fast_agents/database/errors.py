@@ -8,11 +8,12 @@
   集中放在模块自己的 errors.py」的组织方式。
 
 设计要点：
-- :class:`DatabaseError` **刻意继承 ``ValueError``**：历史上 SQLiteClient 把底层
-  ``sqlite3.Error`` 一律包成 ``ValueError`` 抛出，既有调用方（如 memory 层
-  ``except (ValueError, TypeError)``）与测试断言（``pytest.raises(ValueError)``）
-  都依赖 ``ValueError`` 谱系。沿用该谱系可做到**零破坏**——上层既可用新的具体类型
-  精确分流，也可继续用 ``except ValueError`` 兜底。
+- :class:`DatabaseError` **继承 ``Exception``**（而非 ``ValueError``）：数据库错误涵盖
+  连接失败、锁等待超时、SQL 语法/约束冲突、驱动缺失等，语义上并非「值不合法」，只有
+  校验类错误才贴近 ``ValueError``。独立谱系对齐 SQLAlchemy（``SQLAlchemyError(Exception)``）
+  与 Django（``DatabaseError(Exception)``）的做法，可避免与无关的 ``except ValueError``
+  （如 ``int()`` 转换、``datetime.fromisoformat`` 解析）相互误捕。上层统一用
+  ``except DatabaseError`` 或其具体子类分流；``ValueError`` 兜底不再适用。
 - 本模块的异常是「把底层驱动异常 + 入参校验错误统一收口」的结果，**不是**把底层库
   原生异常直接抛给上层（那样上层就得 ``import sqlite3``，破坏分层）。
 - 只覆盖「数据库自身 / 底层驱动 / 入参」产生的错误；调用方把类型传错（如把 int 当
@@ -21,11 +22,12 @@
 from __future__ import annotations
 
 
-class DatabaseError(ValueError):
+class DatabaseError(Exception):
     """Database 模块异常基类。
 
-    刻意继承 ``ValueError`` 以兼容既有的 ``except ValueError`` 与
-    ``pytest.raises(ValueError)``；新代码建议直接捕获本类或其具体子类。
+    继承 ``Exception``（不挂 ``ValueError``）：数据库错误多为连接 / 执行 / 驱动类问题，
+    语义上不是「值不合法」，独立谱系可避免与无关的 ``except ValueError`` 相互误捕。
+    上层统一捕获本类或其具体子类来分流。
     """
 
 

@@ -543,6 +543,7 @@ def main_of_new_add():
     # 人工添加测针对测试：AI不要删除覆盖
 
     # AI新添加的测试(AI可以删除覆盖)
+    test_query_columns_with_filters_and_sort()
     pass
 
 

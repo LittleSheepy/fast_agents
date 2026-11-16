@@ -3,7 +3,7 @@
 覆盖点：
 - 接口对齐：MySQLClient 与 SQLiteClient 对外公开方法集完全一致，且 DatabaseClientBase 抽象方法全部实现；
 - 可选依赖降级：未装 pymysql 时给出明确安装提示（不影响 SQLite / Chroma 等其他后端导入）；
-- MySQL 方言：标识符反引号 / 占位符 %s / 类型映射（BOOLEAN→TINYINT(1)、TIMESTAMP→DATETIME…）/
+- MySQL 方言：标识符反引号 / 占位符 %(name)s / 类型映射（BOOLEAN→TINYINT(1)、TIMESTAMP→DATETIME…）/
   声明式建表 SQL 生成 / Query 谓词编译；
 - executescript 的多语句切分：只认「语句正文」里的分号，字符串 / 反引号 / 注释内的分号不误切；
 - SqlExpr 跨后端共用一个类（上层从 SQLite 切到 MySQL 时 SqlExpr 无需换类）；
@@ -42,6 +42,23 @@ from fast_agents.database import mysql_client as _mc
 from fast_agents.database import sqlite_client as _sc
 
 
+def _fake_mysql_client():
+    """构造一个最小可用的 MySQLClient 实例（不连库），用于调用实例方法编译 SQL。
+
+    _compile_query / _compile_filter / _compile_filters 是实例方法（依赖 self._quote_ident
+    / self._placeholder / self._OFFSET_NO_LIMIT_SQL 等钩子），测试中以假实例调用即可，
+    不需要真实连接。
+    """
+    client = MySQLClient.__new__(MySQLClient)
+    client._conn = None
+    client._tx_depth = 0
+    client._pymysql = None
+    client.autocommit = True
+    client.__dict__["_supports_row_alias"] = True
+    return client
+
+
+
 def _public_methods(cls) -> set:
     return {name for name in dir(cls) if not name.startswith("_") and callable(getattr(cls, name))}
 
@@ -59,11 +76,13 @@ def test_public_api_matches_sqlite_exactly():
 
 
 def test_sqlexpr_is_shared_class():
-    """SqlExpr 两个后端共用一个类，跨后端 isinstance 均可识别（上层零改动切换后端）。"""
+    """SqlExpr 统一定义在 query.py；基类 update_where（两后端共用同一实现）与顶层导出引用同一个类，跨后端 isinstance 一致。"""
+    from fast_agents.database import database_client_base as _base
+    from fast_agents.database import query as _query
     expr = SqlExpr("score + 1")
-    assert _mc.SqlExpr is _sc.SqlExpr is SqlExpr
-    assert isinstance(expr, _mc.SqlExpr)
-    assert isinstance(expr, _sc.SqlExpr)
+    assert _query.SqlExpr is SqlExpr        # 定义处 == 顶层导出（from fast_agents.database import SqlExpr）
+    assert _base.SqlExpr is SqlExpr         # 基类 update_where 的 isinstance 判定用的就是它，两后端继承同一实现
+    assert isinstance(expr, SqlExpr)
 
 
 # ---------- 可选依赖降级：未装 pymysql 时的行为（R2：延迟 import + 缺失报错 + 不阻塞顶层导入） ----------
@@ -144,8 +163,8 @@ def test_parse_schema_mysql_generates_ddl():
     assert not any("IF NOT EXISTS" in s for s in index_stmts)  # MySQL 不支持 CREATE INDEX IF NOT EXISTS
 
 
-def test_query_compile_uses_percent_placeholder():
-    """MySQL 方言用 %s 位置占位符，而非 SQLite 的 :name 命名参数。"""
+def test_query_compile_uses_named_placeholder():
+    """MySQL 方言用 %(name)s 命名占位符，与 SQLite 的 :name 命名参数逐字对应。"""
     q = Query(
         table_name="users",
         filters=[
@@ -157,14 +176,14 @@ def test_query_compile_uses_percent_placeholder():
         limit=10,
         offset=0,
     )
-    sql, params = MySQLClient._compile_query(q)
+    sql, params = _fake_mysql_client()._compile_query(q)
     assert "SELECT * FROM `users`" in sql
-    assert "`age` >= %s" in sql
-    assert "`name` LIKE %s" in sql
+    assert "`age` >= %(f0)s" in sql
+    assert "`name` LIKE %(f1)s" in sql
     assert "ORDER BY `id` DESC" in sql
     assert "LIMIT 10" in sql
     assert "OFFSET 0" in sql
-    assert params == [18, "%张%"]
+    assert params == {"f0": 18, "f1": "%张%"}
 
 
 # ---------- 真实 MySQL 端到端（默认 skip） ----------
@@ -350,29 +369,31 @@ def test_mysql_uses_same_error_classes_as_sqlite():
     assert _sc.DatabaseValidationError is _errors.DatabaseValidationError
 
 
-def test_mysql_error_classes_stay_in_valueerror_lineage():
-    """三类异常仍在 ValueError 谱系下，保证既有 except ValueError / raises(ValueError) 零破坏。"""
+def test_mysql_error_classes_stay_in_database_error_lineage():
+    """三类异常统一挂在 DatabaseError 下（已迁移为继承 Exception，脱离 ValueError 谱系）。"""
+    from fast_agents.database import errors as _errors
     for cls in (_mc.DatabaseConnectionError, _mc.DatabaseOperationalError, _mc.DatabaseValidationError):
-        assert issubclass(cls, ValueError)
+        assert issubclass(cls, _errors.DatabaseError)
+        assert not issubclass(cls, ValueError)
 
 
 def test_mysql_compile_validations_raise_validation_error():
     """编译期入参校验抛 DatabaseValidationError（与 SQLite 行为一致）。"""
     from fast_agents.database import DatabaseValidationError
     with raises(DatabaseValidationError):
-        MySQLClient._compile_query(Query(table_name="t", limit=-1))
+        _fake_mysql_client()._compile_query(Query(table_name="t", limit=-1))
     with raises(DatabaseValidationError):
-        MySQLClient._compile_query(Query(table_name="t", sort_by=[]))
+        _fake_mysql_client()._compile_query(Query(table_name="t", sort_by=[]))
     with raises(DatabaseValidationError):
-        MySQLClient._compile_query(Query(table_name="t", offset=-1))
+        _fake_mysql_client()._compile_query(Query(table_name="t", offset=-1))
     with raises(DatabaseValidationError):
-        MySQLClient._compile_filter(Filter(field="a", op=FilterOp.IN, value=[]), 0)
+        _fake_mysql_client()._compile_filter(Filter(field="a", op=FilterOp.IN, value=[]), 0)
 
 
 def test_mysql_type_errors_stay_native_typeerror():
     """调用方把类型传错仍抛原生 TypeError，不纳入异常体系（与 SQLite 一致）。"""
     with raises(TypeError):
-        MySQLClient._compile_filter(object(), 0)
+        _fake_mysql_client()._compile_filter(object(), 0)
 
 
 def test_mysql_connect_failure_maps_to_connection_error(monkeypatch):
@@ -483,7 +504,7 @@ def test_server_supports_row_alias_version_matrix():
 
 
 def test_mysql_upsert_row_alias_sql_shape(monkeypatch):
-    """MySQL 8 生成的 upsert SQL 形如 ... VALUES (%s, %s) AS new ON DUPLICATE KEY UPDATE `v` = new.`v`。"""
+    """MySQL 8 生成的 upsert SQL 形如 ... VALUES (%(k)s, %(v)s) AS new ON DUPLICATE KEY UPDATE `v` = new.`v`。"""
     MySQLError, state = _install_fake_pymysql(monkeypatch)
     state["server_version"] = "8.0.36"
     from fast_agents.database import MySQLClient as _MC
@@ -581,21 +602,44 @@ def test_mysql_executescript_splits_on_statement_semicolons(monkeypatch):
     db.close()
 
 
-# ==================== 入口 ====================
+def test_mysql_compile_uses_named_placeholders_like_sqlite():
+    """MySQL 编译层改用 %(name)s 命名占位符后，参数键名与 SQLite 逐字一致（f0/f1/f0_0…）。"""
+    from fast_agents.database.sqlite_client import SQLiteClient as _SQL
+    q = Query(
+        table_name="t",
+        filters=[
+            Filter(field="age", op=FilterOp.GTE, value=18),
+            Filter(field="name", op=FilterOp.IN, value=["a", "b"]),
+        ],
+        sort_by="id",
+        limit=10,
+    )
+    sq = _SQL(":memory:")
+    sql_s, params_s = sq._compile_query(q)
+    sql_m, params_m = _fake_mysql_client()._compile_query(q)
+    # 键名集合逐字相同
+    assert set(params_s.keys()) == set(params_m.keys()), f"键名不一致: sqlite={set(params_s.keys())} mysql={set(params_m.keys())}"
+    # 值顺序/内容也相同
+    for k in params_s:
+        assert params_s[k] == params_m[k], f"参数值不一致 key={k}"
+    # SQL 片段各自使用正确方言占位符
+    assert ":f0" in sql_s and "%(f0)s" in sql_m
+    assert ":f1_0" in sql_s and "%(f1_0)s" in sql_m
+
 
 def test_mysql_query_columns_projects_specified_columns():
     """MySQL 方言同样按 Query.columns 投影：反引号包裹、逐列白名单；默认仍为 SELECT *。"""
-    sql, params = MySQLClient._compile_query(Query(table_name="t", columns=["v", "k"]))
+    sql, params = _fake_mysql_client()._compile_query(Query(table_name="t", columns=["v", "k"]))
     assert sql == "SELECT `v`, `k` FROM `t`", f"投影 SQL 错误: {sql}"
-    assert params == []
+    assert params == {}
 
-    sql2, _ = MySQLClient._compile_query(Query(table_name="t"))
+    sql2, _ = _fake_mysql_client()._compile_query(Query(table_name="t"))
     assert sql2 == "SELECT * FROM `t`", f"默认应保持 SELECT *，实际: {sql2}"
 
     with raises(DatabaseIdentifierError):
-        MySQLClient._compile_query(Query(table_name="t", columns=["v; DROP TABLE t"]))
+        _fake_mysql_client()._compile_query(Query(table_name="t", columns=["v; DROP TABLE t"]))
     with raises(DatabaseValidationError):
-        MySQLClient._compile_query(Query(table_name="t", columns=[]))
+        _fake_mysql_client()._compile_query(Query(table_name="t", columns=[]))
 
 
 def test_mysql_select_negative_limit_raises_validation_error(monkeypatch):
@@ -639,7 +683,7 @@ def test_mysql_insert_data_keys_are_ident_checked(monkeypatch):
 
     # 合法列名照常生成 MySQL 方言 SQL
     db.insert("t_ik", {"id": 1, "v": 10})
-    assert state["executed_sql"][-1] == "INSERT INTO `t_ik` (`id`, `v`) VALUES (%s, %s)", state["executed_sql"][-1]
+    assert state["executed_sql"][-1] == "INSERT INTO `t_ik` (`id`, `v`) VALUES (%(id)s, %(v)s)", state["executed_sql"][-1]
     db.close()
 
 
@@ -668,6 +712,45 @@ def test_mysql_create_table_empty_list_raises_validation_error(monkeypatch):
     db.close()
 
 
+
+def test_mysql_handcrafted_sql_uses_named_placeholders_like_sqlite(monkeypatch):
+    """回归：MySQL 手工 CRUD 的参数名必须与 SQLite 逐字对应（列名 / w_列名 / set_列名），
+    而不是序号（v0 / w0）。dict 传参自带 key，用 key 作参数名是两端统一的口径。
+
+    对应 SQLite：insert 用 :{k}、select/delete 的 where 用 :w_{k}、update 的 SET 用 :set_{k}；
+    count / batch_insert 两端同为匿名位置占位符（SQLite '?' / MySQL %s），故不在本用例范围。
+    """
+    MySQLError, state = _install_fake_pymysql(monkeypatch)
+    from fast_agents.database import MySQLClient as _MC
+    db = _MC(host="127.0.0.1", database="x")
+
+    db.insert("t_np", {"id": 1, "name": "a"})
+    assert state["executed_sql"][-1] == (
+        "INSERT INTO `t_np` (`id`, `name`) VALUES (%(id)s, %(name)s)"
+    ), state["executed_sql"][-1]
+
+    db.select("t_np", {"name": "a"})
+    assert "`name` = %(w_name)s" in state["executed_sql"][-1], state["executed_sql"][-1]
+
+    db.update("t_np", {"name": "b"}, {"id": 1})
+    sql = state["executed_sql"][-1]
+    assert "`name` = %(set_name)s" in sql, sql
+    assert "`id` = %(w_id)s" in sql, sql
+
+    db.delete("t_np", {"id": 1})
+    assert "`id` = %(w_id)s" in state["executed_sql"][-1], state["executed_sql"][-1]
+
+    db.upsert("t_np", {"id": 1, "name": "c"}, conflict_keys="id")
+    assert "VALUES (%(id)s, %(name)s)" in state["executed_sql"][-1], state["executed_sql"][-1]
+
+    db.table_exists("t_np")
+    assert state["executed_sql"][-1].endswith("AND TABLE_NAME = %(t)s"), state["executed_sql"][-1]
+    db.close()
+
+
+
+# ==================== 入口 ====================
+
 def main():
     from tests._runner import run_all
     raise SystemExit(run_all(globals()))
@@ -692,6 +775,9 @@ def main_of_new_add():
         test_mysql_insert_data_keys_are_ident_checked(_mp)
     with monkeypatch() as _mp:
         test_mysql_create_table_empty_list_raises_validation_error(_mp)
+    test_mysql_compile_uses_named_placeholders_like_sqlite()
+    with monkeypatch() as _mp:
+        test_mysql_handcrafted_sql_uses_named_placeholders_like_sqlite(_mp)
 
 
 if __name__ == "__main__":

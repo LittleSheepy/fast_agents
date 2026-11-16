@@ -78,8 +78,8 @@ def test_insert_and_lastrowid(db):
 
 
 def test_insert_empty_raises(db):
-    """空数据插入抛 ValueError。"""
-    with raises(ValueError):
+    """空数据插入抛 DatabaseValidationError。"""
+    with raises(DatabaseError):
         db.insert("test_users", {})
 
 
@@ -137,7 +137,7 @@ def test_update(db):
 
 
 def test_update_without_where_raises(db):
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.update("test_users", {"score": 0}, where={})
 
 
@@ -150,7 +150,7 @@ def test_delete(db):
 
 
 def test_delete_without_where_raises(db):
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.delete("test_users", where={})
 
 
@@ -163,13 +163,13 @@ def test_transaction_commit(db):
 
 
 def test_transaction_rollback_on_error(db):
-    # execute 会把 sqlite3.Error 包成 ValueError 抛出（见 SQLiteClient.execute 实现），
+    # execute 会把 sqlite3.Error 包成 DatabaseError（DatabaseOperationalError）抛出（见 SQLiteClient.execute 实现），
     # 事务 __exit__ 里检测到异常会自动 rollback，第一条 insert 也不会写入。
     try:
         with db:
             db.insert("test_users", {"name": "committed"})
             db.insert("test_users", {"name": None})  # NOT NULL 约束失败
-    except ValueError:
+    except DatabaseError:
         pass
     rows = db.select("test_users")
     assert len(rows) == 0
@@ -183,7 +183,7 @@ def test_transaction_flag_reset_after_error_in_with(db):
         db.insert("test_users", {"name": "a"})
         try:
             db.insert("test_users", {"name": None})  # NOT NULL 失败
-        except ValueError:
+        except DatabaseError:
             pass
         assert db._in_transaction is True  # 约束错误不自动回滚，标志仍为 True
         db.insert("test_users", {"name": "b"})
@@ -214,7 +214,7 @@ def test_transaction_state_single_source_of_truth(db):
     assert db._in_transaction is False
     assert db._tx_depth == 0
     # 事务外出错不残留状态，后续 autocommit 正常工作
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.execute("THIS IS NOT VALID SQL")
     assert db._in_transaction is False  # 标志始终派生自 _tx_depth，稳定为 False
     db.insert("test_users", {"name": "ok"})
@@ -224,7 +224,7 @@ def test_transaction_state_single_source_of_truth(db):
 def test_transaction_flag_kept_false_after_error_outside_with(db):
     """问题 C：事务外单条 execute 出错后标志必须保持 False，后续写操作能正常 autocommit。"""
     assert db._in_transaction is False
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.execute("INSERT INTO test_users (name) VALUES (?)", (None,))
     assert db._in_transaction is False
     db.insert("test_users", {"name": "ok"})
@@ -254,14 +254,15 @@ def test_close_with_pending_transaction_rolls_back(tmp_path):
 
 # ==================== 异常 ====================
 def test_invalid_sql_raises(db):
-    with raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, DatabaseError)):
         db.execute("THIS IS NOT SQL")
 
 
 # ==================== 异常体系（errors.py） ====================
 def test_exception_hierarchy():
-    """异常体系：DatabaseError 继承 ValueError，三个具体子类都挂在它下面。"""
-    assert issubclass(DatabaseError, ValueError)
+    """异常体系：DatabaseError 继承 Exception（已脱离 ValueError 谱系），三个具体子类都挂在它下面。"""
+    assert issubclass(DatabaseError, Exception)
+    assert not issubclass(DatabaseError, ValueError)  # 迁移后刻意不再落入 ValueError 谱系
     for cls in (DatabaseConnectionError, DatabaseOperationalError, DatabaseValidationError):
         assert issubclass(cls, DatabaseError)
 
@@ -298,14 +299,12 @@ def test_connection_error_maps():
         SQLiteClient("/no/such/dir_xyz_zz/db.sqlite")
 
 
-def test_exception_still_caught_by_valueerror(db):
-    """向后兼容：新异常全部继承 ValueError，既有 except ValueError 通吃。"""
-    with raises(ValueError):
+def test_exception_caught_by_database_error(db):
+    """迁移后：数据库错误统一由 DatabaseError 基类兜底（不再依赖 ValueError 谱系）。"""
+    with raises(DatabaseError):
         db.execute("THIS IS NOT SQL")
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.insert("test_users", {})
-    with raises(DatabaseError):  # 基类可统一兜底
-        db.execute("THIS IS NOT SQL")
 
 
 def test_exceptions_exported_from_top_level():
@@ -355,7 +354,7 @@ def test_create_table_if_not_exists_idempotent():
     db.create_table("t", {"id": "INTEGER PRIMARY KEY"})
     db.create_table("t", {"id": "INTEGER PRIMARY KEY"}, if_not_exists=True)
     # 不带 if_not_exists 重复建表应报错
-    with raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, DatabaseError)):
         db.create_table("t", {"id": "INTEGER PRIMARY KEY"}, if_not_exists=False)
     db.close()
 
@@ -395,7 +394,7 @@ def test_create_table_list_columns():
     idx_names = {r["name"] for r in idx}
     assert "idx_users_dept_id" in idx_names
     # UNIQUE 约束生效：重复 email 应报错
-    with raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, DatabaseError)):
         db.insert("users", {"name": "B", "email": "a@x.com", "dept_id": 1})
     db.close()
 
@@ -494,7 +493,7 @@ def test_table_exists_and_drop_table():
     assert not db.table_exists("ghost")
     # drop_table(if_exists=True) 对不存在的表不报错
     db.drop_table("ghost", if_exists=True)
-    with raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, DatabaseError)):
         db.drop_table("ghost", if_exists=False)
     db.close()
 
@@ -535,7 +534,7 @@ def test_unique_index():
         )
     )
     db.insert("accounts", {"name": "alice"})
-    with raises((sqlite3.Error, ValueError)):
+    with raises((sqlite3.Error, DatabaseError)):
         db.insert("accounts", {"name": "alice"})
     db.close()
 
@@ -552,7 +551,7 @@ def test_illegal_ident_rejected():
         "x'y",
     ]:
         db = SQLiteClient(":memory:")
-        with raises(ValueError):
+        with raises(DatabaseError):
             db.ensure_table(bad_name, {"id": "INTEGER PRIMARY KEY"})
         db.close()
 
@@ -564,8 +563,8 @@ def test_columns_type_validation():
         db.create_table("t", "not a dict or list")  # type: ignore[arg-type]
     with raises(TypeError):
         db.create_table("t", ["not a column"])  # type: ignore[list-item]
-    # Schema 表名不一致应抛 ValueError
-    with raises(ValueError):
+    # Schema 表名不一致应抛 DatabaseValidationError
+    with raises(DatabaseError):
         db.create_table(
             "other",
             Schema(table_name="orders", columns=[
@@ -576,9 +575,9 @@ def test_columns_type_validation():
 
 
 def test_create_table_empty_columns_dict_rejected():
-    """空 dict columns 抛 ValueError。"""
+    """空 dict columns 抛 DatabaseValidationError。"""
     db = SQLiteClient(":memory:")
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.create_table("t", {})
     db.close()
 
@@ -682,10 +681,10 @@ def test_select_where_in(db):
 def test_select_where_in_empty_list_rejected(db):
     """IN 的 value 必须是非空 list/tuple，空值/非列表必须报错。"""
     _seed_users_for_query(db)
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="name", op=FilterOp.IN, value=[])]))
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="name", op=FilterOp.IN, value="Alice")]))  # type: ignore[arg-type]
 
@@ -711,7 +710,7 @@ def test_select_where_is_null_is_not_null(db):
 
 def test_select_where_binary_op_without_value_rejected(db):
     """EQ/NEQ/... 等二元操作符漏传 value 必须报错。"""
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="age", op=FilterOp.EQ)]))
 
@@ -762,19 +761,19 @@ def test_select_where_sort_limit_offset(db):
 
 def test_select_where_limit_offset_negative_rejected(db):
     """limit/offset 为负数必须报错。"""
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="test_users", limit=-1))
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="test_users", offset=-1))
 
 
 def test_select_where_invalid_field_rejected(db):
     """字段名非法（含特殊字符、数字开头）必须被白名单拦截。"""
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="age; DROP TABLE test_users;--",
                                           op=FilterOp.EQ, value=1)]))
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="test_users",
                           filters=[Filter(field="1bad", op=FilterOp.EQ, value=1)]))
 
@@ -876,7 +875,7 @@ def test_count_invalid_table():
     try:
         db.count("t; DROP TABLE t--")
         assert False, "应该抛错"
-    except ValueError:
+    except DatabaseError:
         pass
 
 def test_batch_insert_empty():
@@ -904,7 +903,7 @@ def test_batch_insert_inconsistent_fields():
     try:
         db.batch_insert("t", rows)
         assert False, "应该抛错"
-    except ValueError as e:
+    except DatabaseError as e:
         assert "age" in str(e)
 
 def test_batch_insert_invalid_table():
@@ -912,7 +911,7 @@ def test_batch_insert_invalid_table():
     try:
         db.batch_insert("t; DROP TABLE t--", [{"x": 1}])
         assert False, "应该抛错"
-    except ValueError:
+    except DatabaseError:
         pass
 
 
@@ -966,9 +965,9 @@ def test_upsert_partial_update_columns():
 
 
 def test_upsert_conflict_key_missing_in_data():
-    """conflict_keys 必须出现在 data 中，否则报 ValueError。"""
+    """conflict_keys 必须出现在 data 中，否则报 DatabaseValidationError。"""
     db = _make_kv_db()
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.upsert("kv", {"v": "x", "n": 1}, conflict_keys="k")
     db.close()
 
@@ -976,7 +975,7 @@ def test_upsert_conflict_key_missing_in_data():
 def test_upsert_invalid_ident_rejected():
     """非法表名被白名单拦截。"""
     db = _make_kv_db()
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.upsert("kv; DROP TABLE kv--", {"k": "a"}, conflict_keys="k")
     db.close()
 
@@ -1020,7 +1019,7 @@ def test_update_where_expression():
 def test_update_where_requires_filters():
     """空 filters 直接报错，防止误更新全表。"""
     db = _make_kv_db()
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.update_where("kv", {"v": "x"}, Query(table_name="kv"))
     db.close()
 
@@ -1061,7 +1060,7 @@ def test_delete_where_requires_filters():
     """空 filters 直接报错，且不会误删数据。"""
     db = _make_kv_db()
     db.insert("kv", {"k": "a", "v": "1", "n": 1})
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.delete_where("kv", Query(table_name="kv"))
     assert db.count("kv") == 1
     db.close()
@@ -1094,16 +1093,16 @@ def test_sort_by_single_str_still_works():
 def test_sort_by_empty_list_rejected():
     """空 sort_by 列表直接报错。"""
     db = _make_kv_db()
-    with raises(ValueError):
+    with raises(DatabaseError):
         db.select_where(Query(table_name="kv", sort_by=[]))
     db.close()
 
 
 def test_sql_expr_empty_rejected():
     """SqlExpr 不接受空表达式。"""
-    with raises(ValueError):
+    with raises(DatabaseError):
         SqlExpr("")
-    with raises(ValueError):
+    with raises(DatabaseError):
         SqlExpr("   ")
 
 

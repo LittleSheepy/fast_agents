@@ -153,7 +153,7 @@ class ChromaClient(VectorClientBase):
         DatabaseValidationError: path 与 host 同时传或都不传、维度 / ids / limit 等入参非法时。
         DatabaseQueryError: 集合不存在、创建或写入失败时。
         DatabaseIntegrityError: create_collection 时集合已存在。
-        （以上异常均继承 DatabaseError，而 DatabaseError 继承 ValueError，兼容原 ``except ValueError`` 写法。）
+        （以上异常均继承 DatabaseError，而 DatabaseError 继承 Exception；上层用 ``except DatabaseError`` 分流。）
     """
 
     def __init__(
@@ -276,7 +276,7 @@ class ChromaClient(VectorClientBase):
         try:
             col = self._client.get_collection(name)
         except Exception as e:
-            # Chroma 不同版本抛的异常类型不一致，统一用 ValueError
+            # Chroma 不同版本抛的异常类型不一致，统一收口成 DatabaseQueryError
             raise DatabaseQueryError(f"集合 {name!r} 不存在") from e
         return self._cache_collection(name, col)
 

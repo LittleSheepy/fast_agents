@@ -2,7 +2,7 @@
 
 设计参考主流框架的 MySQL 方言层：**SQLAlchemy**（方言与模型分离——Schema 声明与具体后端
 无关，占位符 / 类型映射 / 自增 / Upsert 语法各自适配）、**Peewee**（单文件轻量客户端 + 上下文
-事务）、**PyMySQL**（DB-API 2.0 驱动，参数化统一用 ``%s``）。只借鉴「方言适配 + 统一契约」
+事务）、**PyMySQL**（DB-API 2.0 驱动，参数化统一用 ``%(name)s`` 命名占位符）。只借鉴「方言适配 + 统一契约」
 的思路，**不引入任何 ORM 或重型依赖**：本模块只用可选驱动 ``pymysql`` + 全框架已有的 ``pydantic``。
 
 可选依赖：使用前需安装 pymysql：``pip install pymysql``（或 ``pip install fast-agents[mysql]``）。
@@ -66,10 +66,6 @@ from .schema import (
     quote_ident as _quote_ident,
 
 )
-# SqlExpr 是「写侧 SQL 片段包装」，与具体后端无关，直接复用 SQLiteClient 的实现：
-# 两个后端拿到的是同一个类，`isinstance(value, SqlExpr)` 跨后端可识别，
-# 上层从 SQLite 切到 MySQL 时 SqlExpr 无需换类。
-from .sqlite_client import SqlExpr
 
 from .errors import (
     DatabaseConnectionError,
@@ -438,22 +434,28 @@ class MySQLClient(DatabaseClientBase):
         except self._pymysql.MySQLError as e:
             raise DatabaseOperationalError(f"查询失败: {e}\nSQL: {sql}") from e
     # ------------ 方言 ------------
+    def _placeholder(self, name: str) -> str:
+        """把参数名渲染成 MySQL 占位符文本。 例：f0 -> "%(f0)s" """
+        return f"%({name})s"  # 例：f0 -> "%(f0)s"
+
     def _quote_ident(self, name: str) -> str:
         """MySQL 反引号标识符。"""
         return _quote_ident(name, "`")
+
+    # OFFSET 单独出现时的 LIMIT 兜底（MySQL 官方文档推荐"无上限"值）
+    _OFFSET_NO_LIMIT_SQL: str = "LIMIT 18446744073709551615"
 
     def _parse_columns(self, table: str, columns: list[Column]) -> tuple[list[str], list[str]]:
         """MySQL 方言列解析，带 MySQL 列关键字参数。"""
         return parse_column_list(table, columns, **_MYSQL_COLUMN_KW)
 
     # ---------- DDL：建表 / 查表 / 删表 / 索引 ----------
-
     def table_exists(self, table: str) -> bool:
         """判断表是否已存在（MySQL 方言，查 information_schema）。"""
         _check_ident(table, "表名")
         row = self.query(
-            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
-            (table,),
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %(t)s",
+            {"t": table},
             fetch_one=True,
         )
         return row is not None
@@ -492,10 +494,6 @@ class MySQLClient(DatabaseClientBase):
                 continue
             self.execute(stmt)
 
-    def ensure_table(self, table: str, columns: dict[str, str] | list[Column] | Schema) -> None:
-        """幂等建表，等价 create_table(..., if_not_exists=True)。"""
-        self.create_table(table, columns, if_not_exists=True)
-
     def ensure_schema(self, schema: Schema, migrate: bool = False) -> None:
         """按 Schema 幂等建表 + 建索引；migrate=True 时尝试补齐缺失列（ADD COLUMN）。
 
@@ -527,199 +525,6 @@ class MySQLClient(DatabaseClientBase):
             if idx_name_match and idx_name_match.group(1) in existing_indexes:
                 continue
             self.execute(stmt)
-
-    def drop_table(self, table: str, if_exists: bool = True) -> None:
-        """删表。"""
-        _check_ident(table, "表名")
-        if_ex = "IF EXISTS " if if_exists else ""
-        self.execute(f"DROP TABLE {if_ex}{quote_ident(table)}")
-
-    # ---------- 便捷 CRUD ----------
-    def insert(self, table: str, data: dict[str, Any]) -> int:
-        """插入一行，返回新行 id。"""
-        if not data:
-            raise DatabaseValidationError("insert 数据不能为空")
-        _check_ident(table, "表名")
-        for k in data.keys():
-            _check_ident(k, "字段名")
-        columns = ", ".join(quote_ident(k) for k in data.keys())
-        placeholders = ", ".join(["%s"] * len(data))
-        sql = f"INSERT INTO {quote_ident(table)} ({columns}) VALUES ({placeholders})"
-        return self.execute(sql, tuple(data.values()))["lastrowid"]
-
-    def select(
-        self,
-        table: str,
-        where: dict[str, Any] | None = None,
-        order_by: str | None = None,
-        limit: int | None = None,
-    ) -> list[dict[str, Any]]:
-        """查询多行，where 做等值匹配。"""
-        _check_ident(table, "表名")
-        sql = f"SELECT * FROM {quote_ident(table)}"
-        params: list[Any] = []
-        if where:
-            conditions = []
-            for k, v in where.items():
-                _check_ident(k, "字段名")
-                if v is None:
-                    conditions.append(f"{quote_ident(k)} IS NULL")
-                else:
-                    conditions.append(f"{quote_ident(k)} = %s")
-                    params.append(v)
-            sql += f" WHERE {' AND '.join(conditions)}"
-        if order_by:
-            if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*(\s+(ASC|DESC))?$", order_by.strip()):
-                raise DatabaseValidationError(f"非法 order_by: {order_by!r}")
-            sql += f" ORDER BY {order_by}"
-        if limit is not None:
-            # 与 _compile_query 同口径：limit 强制非负 int，负数直接报错——
-            # MySQL 下 LIMIT -1 是语法错误，提前拦下给出统一的中文异常。
-            n = int(limit)
-            if n < 0:
-                raise DatabaseValidationError(f"limit 不能为负数: {n}")
-            sql += f" LIMIT {n}"
-        return self.query(sql, tuple(params))  # type: ignore
-
-    # ---------- 谓词下推：Query / Filter → 参数化 SQL（MySQL 方言，用 %s 占位符） ----------
-    @staticmethod
-    def _compile_filter(f: Filter, idx: int) -> tuple[str, list[Any]]:
-        """把单个 Filter 编译成 (SQL 片段, 参数列表)，MySQL 用 %s 占位符。"""
-        if not isinstance(f, Filter):
-            raise TypeError(f"filters 列表元素必须是 Filter，收到 {type(f)}")
-        _check_ident(f.field, "字段名")
-        col = quote_ident(f.field)
-        op = f.op
-
-        # IS NULL / IS NOT NULL：无参
-        if op is FilterOp.IS_NULL:
-            return f"{col} IS NULL", []
-        if op is FilterOp.NOT_NULL:
-            return f"{col} IS NOT NULL", []
-
-        # IN：展开成 (%s, %s, ...)
-        if op is FilterOp.IN:
-            if not isinstance(f.value, (list, tuple)) or len(f.value) == 0:
-                raise DatabaseValidationError(
-                    f"Filter(field={f.field!r}, op=IN) 的 value 必须是非空 list/tuple，"
-                    f"收到 {type(f.value).__name__}"
-                )
-            placeholders = ", ".join(["%s"] * len(f.value))
-            return f"{col} IN ({placeholders})", list(f.value)
-
-        # 其它二元操作符
-        if f.value is None:
-            raise DatabaseValidationError(
-                f"Filter(field={f.field!r}, op={op.value}) 必须提供 value；"
-                f"判空请用 IS_NULL / NOT_NULL"
-            )
-        return f"{col} {op.value} %s", [f.value]
-
-    @staticmethod
-    def _compile_query(q: Query) -> tuple[str, list[Any]]:
-        """把 Query 对象编译成 (SQL 语句, 参数列表)，MySQL 方言。"""
-        _check_ident(q.table_name, "表名")
-        # 列投影：columns=None 保持 SELECT *；显式指定时逐列过标识符白名单，杜绝拼接注入
-        if q.columns is None:
-            col_clause = "*"
-        else:
-            if not q.columns:
-                raise DatabaseValidationError("columns 不能是空列表")
-            for c in q.columns:
-                _check_ident(c, "列名")
-            col_clause = ", ".join(quote_ident(c) for c in q.columns)
-        sql_parts: list[str] = [f"SELECT {col_clause} FROM {quote_ident(q.table_name)}"]
-        params: list[Any] = []
-
-        if q.filters:
-            conds: list[str] = []
-            for i, f in enumerate(q.filters):
-                frag, p = MySQLClient._compile_filter(f, i)
-                conds.append(frag)
-                params.extend(p)
-            sql_parts.append("WHERE " + " AND ".join(conds))
-
-        if q.sort_by is not None:
-            sort_cols = [q.sort_by] if isinstance(q.sort_by, str) else list(q.sort_by)
-            if not sort_cols:
-                raise DatabaseValidationError("sort_by 不能是空列表")
-            for col in sort_cols:
-                _check_ident(col, "排序字段名")
-            direction = "ASC" if q.sort_order is SortOrder.ASC else "DESC"
-            order_by = ", ".join(f"{quote_ident(c)} {direction}" for c in sort_cols)
-            sql_parts.append(f"ORDER BY {order_by}")
-
-        if q.limit is not None:
-            n = int(q.limit)
-            if n < 0:
-                raise DatabaseValidationError(f"limit 不能为负数: {n}")
-            sql_parts.append(f"LIMIT {n}")
-
-        if q.offset is not None:
-            m = int(q.offset)
-            if m < 0:
-                raise DatabaseValidationError(f"offset 不能为负数: {m}")
-            # MySQL 支持 LIMIT m, n 语法，单独 OFFSET 必须配合 LIMIT，没有 LIMIT 时补个大数
-            if q.limit is None:
-                sql_parts.append("LIMIT 18446744073709551615")  # MySQL 官方文档推荐的"无上限"值
-            sql_parts.append(f"OFFSET {m}")
-
-        return " ".join(sql_parts), params
-
-    def select_where(self, query: Query) -> list[dict[str, Any]]:
-        """按声明式 Query 查询，接口与 SQLiteClient 完全一致。"""
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        sql, params = self._compile_query(query)
-        return self.query(sql, tuple(params))  # type: ignore[return-value]
-
-    def select_one_where(self, query: Query) -> dict[str, Any] | None:
-        """按声明式 Query 查询单行（自动 LIMIT 1）。"""
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        limited = query.model_copy(update={"limit": 1, "offset": None})
-        rows = self.select_where(limited)
-        return rows[0] if rows else None
-
-    def select_one(self, table: str, where: dict[str, Any] | None = None, order_by: str | None = None,) -> dict[str, Any] | None:
-        """查询单行，不存在返回 None。"""
-        rows = self.select(table, where=where, order_by=order_by, limit=1)
-        return rows[0] if rows else None
-
-    def update(self, table: str, data: dict[str, Any], where: dict[str, Any]) -> int:
-        """更新行，返回影响行数。"""
-        if not data or not where:
-            raise DatabaseValidationError("update 需要 data 和 where")
-        _check_ident(table, "表名")
-        set_clause = ", ".join([f"{quote_ident(k)} = %s" for k in data.keys()])
-        where_parts: list[str] = []
-        params: list[Any] = list(data.values())
-        for k, v in where.items():
-            _check_ident(k, "字段名")
-            if v is None:
-                where_parts.append(f"{quote_ident(k)} IS NULL")
-            else:
-                where_parts.append(f"{quote_ident(k)} = %s")
-                params.append(v)
-        sql = f"UPDATE {quote_ident(table)} SET {set_clause} WHERE {' AND '.join(where_parts)}"
-        return self.execute(sql, tuple(params))["rowcount"]
-
-    def delete(self, table: str, where: dict[str, Any]) -> int:
-        """删除行，返回影响行数。"""
-        if not where:
-            raise DatabaseValidationError("delete 必须传 where 防止误删全表")
-        _check_ident(table, "表名")
-        where_parts: list[str] = []
-        params: list[Any] = []
-        for k, v in where.items():
-            _check_ident(k, "字段名")
-            if v is None:
-                where_parts.append(f"{quote_ident(k)} IS NULL")
-            else:
-                where_parts.append(f"{quote_ident(k)} = %s")
-                params.append(v)
-        sql = f"DELETE FROM {quote_ident(table)} WHERE {' AND '.join(where_parts)}"
-        return self.execute(sql, tuple(params))["rowcount"]
 
     # ---------- 事务上下文管理（与 SQLiteClient 行为完全一致，支持嵌套） ----------
     def __enter__(self) -> "MySQLClient":
@@ -766,67 +571,6 @@ class MySQLClient(DatabaseClientBase):
                 self.conn.autocommit(True)
         return False
 
-    # ---------- 统计与批量写入 ----------
-    def count(self, table: str, where: dict[str, Any] | None = None) -> int:
-        """按等值条件统计行数，where=None 返回表总行数。"""
-        _check_ident(table, "表名")
-        sql = f"SELECT COUNT(*) AS cnt FROM {quote_ident(table)}"
-        params: list[Any] = []
-        conditions: list[str] = []
-        if where:
-            for k, v in where.items():
-                _check_ident(k, "字段名")
-                if v is None:
-                    conditions.append(f"{quote_ident(k)} IS NULL")
-                else:
-                    conditions.append(f"{quote_ident(k)} = %s")
-                    params.append(v)
-        if conditions:
-            sql += " WHERE " + " AND ".join(conditions)
-        row = self.query(sql, tuple(params), fetch_one=True)
-        return int(row["cnt"]) if row else 0  # type: ignore[index]
-
-    def batch_insert(self, table: str, rows: list[dict[str, Any]]) -> int:
-        """批量插入多行，返回插入行数；空列表直接返回0。"""
-        if not rows:
-            return 0
-        _check_ident(table, "表名")
-        columns = list(rows[0].keys())
-        for col in columns:
-            _check_ident(col, "字段名")
-        expected_cols = set(columns)
-        for i, row in enumerate(rows):
-            row_cols = set(row.keys())
-            if row_cols != expected_cols:
-                missing = expected_cols - row_cols
-                extra = row_cols - expected_cols
-                msg = f"第 {i} 行字段与首行不一致"
-                if missing:
-                    msg += f"，缺少字段: {sorted(missing)}"
-                if extra:
-                    msg += f"，多余字段: {sorted(extra)}"
-                raise DatabaseValidationError(msg)
-        col_sql_str = ", ".join(quote_ident(c) for c in columns)
-        placeholders = ", ".join("%s" for _ in columns)
-        sql = f"INSERT INTO {quote_ident(table)} ({col_sql_str}) VALUES ({placeholders})"
-        params_list = [tuple(row[c] for c in columns) for row in rows]
-        self.executemany(sql, params_list)
-        return len(rows)
-
-    # ---------- 条件写入：upsert / update_where / delete_where ----------
-    @staticmethod
-    def _compile_filters(filters: list[Filter] | None) -> tuple[str, list[Any]]:
-        """把 Filter 列表编译成 (WHERE 片段, 参数列表)，与 SQLite 语义一致。"""
-        if not filters:
-            return "", []
-        conds: list[str] = []
-        params: list[Any] = []
-        for i, f in enumerate(filters):
-            frag, p = MySQLClient._compile_filter(f, i)
-            conds.append(frag)
-            params.extend(p)
-        return " AND ".join(conds), params
-
     def upsert(
         self,
         table: str,
@@ -863,7 +607,7 @@ class MySQLClient(DatabaseClientBase):
             _check_ident(c, "字段名")
 
         col_sql = ", ".join(quote_ident(c) for c in columns)
-        placeholders = ", ".join("%s" for _ in columns)
+        placeholders = ", ".join(self._placeholder(c) for c in columns)
         # MySQL 8.0.19+ 用行别名 AS new（VALUES(col) 自 8.0.20 起弃用）；5.7 / MariaDB 回退 VALUES(col)。
         if update_columns:
             if self._supports_row_alias:
@@ -884,41 +628,6 @@ class MySQLClient(DatabaseClientBase):
             on_duplicate = "ON DUPLICATE KEY UPDATE " + f"{quote_ident(keys[0])} = {quote_ident(keys[0])}"
 
         sql = f"INSERT INTO {quote_ident(table)} ({col_sql}) VALUES ({placeholders}){alias} {on_duplicate}"
-        return self.execute(sql, tuple(data.values()))["rowcount"]
+        return self.execute(sql, data)["rowcount"]
 
-    def update_where(self, table: str, values: dict[str, Any], query: Query) -> int:
-        """按声明式 Query 条件批量更新，返回影响行数，接口与 SQLiteClient 完全一致。"""
-        if not values:
-            raise DatabaseValidationError("update_where 需要 values")
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        if not query.filters:
-            raise DatabaseValidationError("update_where 的 query.filters 不能为空（防止误更新全表）")
-        _check_ident(table, "表名")
-
-        set_parts: list[str] = []
-        params: list[Any] = []
-        for col, val in values.items():
-            _check_ident(col, "字段名")
-            if isinstance(val, SqlExpr):
-                set_parts.append(f"{quote_ident(col)} = {val.sql}")
-            else:
-                set_parts.append(f"{quote_ident(col)} = %s")
-                params.append(val)
-
-        where_sql, where_params = self._compile_filters(query.filters)
-        params.extend(where_params)
-        sql = f"UPDATE {quote_ident(table)} SET {', '.join(set_parts)} WHERE {where_sql}"
-        return self.execute(sql, tuple(params))["rowcount"]
-
-    def delete_where(self, table: str, query: Query) -> int:
-        """按声明式 Query 条件批量删除，返回影响行数，接口与 SQLiteClient 完全一致。"""
-        if not isinstance(query, Query):
-            raise TypeError(f"query 必须是 fast_agents.database.Query，收到 {type(query)}")
-        if not query.filters:
-            raise DatabaseValidationError("delete_where 的 query.filters 不能为空（防止误删全表）")
-        _check_ident(table, "表名")
-        where_sql, params = self._compile_filters(query.filters)
-        sql = f"DELETE FROM {quote_ident(table)} WHERE {where_sql}"
-        return self.execute(sql, tuple(params))["rowcount"]
 

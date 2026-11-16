@@ -18,7 +18,7 @@
 - ChromaClient 为可选后端，使用前需 ``pip install chromadb``或``pip install fast-agents[chroma]``。
 
 - 异常体系：
-  - ``DatabaseError``：模块异常基类（**刻意继承 ``ValueError``**，兼容既有 ``except ValueError``）；
+  - ``DatabaseError``：模块异常基类（**继承 ``Exception``**，独立谱系；上层用 ``except DatabaseError`` 分流，不再依赖 ``except ValueError``）；
   - ``DatabaseConnectionError`` / ``DatabaseOperationalError`` / ``DatabaseValidationError``：
     分别对应连接层 / 执行层 / 校验层错误，上层可按类型精确分流；
   - ``DatabaseIdentifierError`` / ``DatabaseIntegrityError`` / ``DatabaseQueryError`` / ``DatabaseDriverMissingError``：
@@ -34,9 +34,6 @@
 - 同样的 insert/batch_insert/upsert/update/delete 批量操作。
 上层业务代码（memory/trace/logs）只依赖 DatabaseClientBase 抽象，切换后端无需改动一行业务代码。
 """
-from .chroma_client import ChromaClient
-from .database_client_base import DatabaseClientBase
-from .mysql_client import MySQLClient
 from .errors import (
     DatabaseConnectionError,
     DatabaseDriverMissingError,
@@ -47,11 +44,18 @@ from .errors import (
     DatabaseQueryError,
     DatabaseValidationError,
 )
-from .query import Filter, FilterOp, Query, SortOrder
+
+# 关系型客户端
+from .query import Filter, FilterOp, Query, SortOrder, SqlExpr
 from .schema import Column, ColumnType, Index, Schema
-from .sqlite_client import SqlExpr, SQLiteClient
-from .vector_client_base import VectorClientBase
+from .database_client_base import DatabaseClientBase
+from .sqlite_client import SQLiteClient
+from .mysql_client import MySQLClient
+
+# 向量型客户端
 from .vector_query import VectorFilter, VectorFilterOp
+from .vector_client_base import VectorClientBase
+from .chroma_client import ChromaClient
 
 __all__ = [
     # 异常体系
