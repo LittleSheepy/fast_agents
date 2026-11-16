@@ -206,6 +206,8 @@ def main_of_new_add():
 5. **导出同步**：如需对外暴露，更新 `fast_agents/__init__.py`；同步 README.md「特性」「项目结构」「文档导航」三栏；同步 `docs/演进路线图.md` 对应条目状态。
 6. **依赖同步**：如有新增依赖，同步 `pyproject.toml` / `requirements.txt` / `uv.lock`（本任务预期绝大多数情况下为零新增依赖）。
 7. **交付包**：按照仓库目录存放交付文件并打包,未修改的不用打包。打包名字可以参考fast_agents_模块名_xxxx.zip 或者 fast_agents_模块名_xxxx.zip格式
+8. **可下载**：交付包打包后要给我下载链接 以供我下载。
+9. **不提交**：不需要你提交gitee或者github
 ---
 
 ## 8. 交付顺序
