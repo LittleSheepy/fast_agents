@@ -36,6 +36,11 @@ from .trace import (
     TraceLogger, SpanKind, SpanStatus, SpanRecord,
     TraceStoreBase, JsonlStore, MEMORY_PATH, SQLiteStore,
 )
+from .skills import (
+    BaseSkill, skill,
+    SkillRegistry, SkillLoader, SkillMiddleware,
+    SkillMetadata, SkillLoadResult,
+)
 
 __all__ = [
     # 版本信息
@@ -74,4 +79,9 @@ __all__ = [
     # Trace（可观测性，G1 初版，v1.1.0 新增 SQLiteStore）
     "TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
     "TraceStoreBase", "JsonlStore", "MEMORY_PATH", "SQLiteStore",
+
+    # Skills 技能系统（v1.1.0）
+    "BaseSkill", "skill",
+    "SkillRegistry", "SkillLoader", "SkillMiddleware",
+    "SkillMetadata", "SkillLoadResult",
 ]

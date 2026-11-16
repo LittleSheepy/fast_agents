@@ -177,7 +177,11 @@ def skill(
         @wraps(func)
         def wrapper(*args, **kwargs):
             skill_instance = DecoratedSkill()
-            return skill_instance.execute(*args, **kwargs)
+            # 把位置参数转换为关键字参数传递给execute
+            sig = inspect.signature(func)
+            bound_args = sig.bind(*args, **kwargs)
+            bound_args.apply_defaults()
+            return skill_instance.execute(**bound_args.arguments)
         
         # 附加Skill类到wrapper，方便注册
         wrapper.skill_class = DecoratedSkill

@@ -5,9 +5,10 @@ Skill注册表：统一管理代码型Skill和文件型Skill
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 from .base import BaseSkill
+from .errors import SkillNotFoundError
 from .loader import SkillLoader
 from .models import SkillLoadResult, SkillMetadata
 
@@ -25,7 +26,14 @@ class SkillRegistry:
         self._code_skills: Dict[str, BaseSkill] = {}
         self._code_metadata: Dict[str, SkillMetadata] = {}
         self.loader = SkillLoader(extra_paths=extra_skill_paths)
-        self._tools = None  # 延迟初始化
+        self._tools: Optional[List[Callable]] = None
+        self._skill_tools: Optional[List[Any]] = None  # 包装后的ToolBase工具
+        self._tracer = None
+    
+    def set_tracer(self, tracer) -> None:
+        """注入trace打点器，透传到loader"""
+        self._tracer = tracer
+        self.loader.set_tracer(tracer)
     
     def register(self, skill: Union[BaseSkill, Type[BaseSkill], Any]) -> None:
         """
@@ -155,17 +163,16 @@ class SkillRegistry:
     
     def get_tools(self) -> List[Any]:
         """
-        获取Skill相关的工具，供Agent绑定使用
-        返回三个工具：load_skill, read_skill_reference, run_skill_script
+        获取Skill相关的工具函数（裸函数），返回四个函数：
+        load_skill, read_skill_reference, run_skill_script, list_loaded_skills
+        注意：如需符合ToolBase规范的工具对象，请使用build_skill_tools()
         """
         if self._tools is None:
-            self._tools = self._create_skill_tools()
+            self._tools = self._create_skill_functions()
         return self._tools
     
-    def _create_skill_tools(self) -> List[Any]:
-        """创建Skill系统内置的三个工具"""
-        # 这里不依赖你的Tool基类，而是返回可被你现有tools系统包装的函数
-        # 你可以根据你现有的tool装饰器/基类进行适配
+    def _create_skill_functions(self) -> List[Callable]:
+        """创建Skill系统内置的四个工具函数（裸函数）"""
         
         def load_skill(skill_name: str) -> str:
             """
@@ -200,7 +207,27 @@ class SkillRegistry:
             """
             return self.run_script(skill_name, script_name, args)
         
-        return [load_skill, read_skill_reference, run_skill_script]
+        def list_loaded_skills() -> str:
+            """
+            列出当前已加载的技能，以及每个技能允许使用的工具列表。
+            用于确认当前工具使用权限，避免调用不被允许的工具。
+            """
+            # 这个函数实际会被middleware替换，这里只保留占位符
+            return "请通过SkillMiddleware获取已加载技能列表"
+        
+        return [load_skill, read_skill_reference, run_skill_script, list_loaded_skills]
+    
+    def build_skill_tools(self) -> List[Any]:
+        """
+        构建符合框架ToolBase规范的Skill工具列表，和build_memory_tools()风格对齐
+        直接返回可注册到ToolRegistry的工具对象，无需手动包装
+        """
+        if self._skill_tools is None:
+            # 延迟导入，避免循环依赖
+            from ..tools import StructuredTool
+            funcs = self._create_skill_functions()
+            self._skill_tools = [StructuredTool.from_function(f) for f in funcs]
+        return self._skill_tools
     
     def list_skills(self) -> List[Dict[str, Any]]:
         """列出所有可用Skill信息"""

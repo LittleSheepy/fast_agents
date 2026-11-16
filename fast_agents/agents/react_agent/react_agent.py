@@ -232,6 +232,12 @@ class ReActAgent(AgentBase):
                 tracer.attach_to_tool_registry(self.tool_registry)
             except Exception:
                 pass
+            # v1.1.0 把tracer透传给技能系统，开启技能全链路打点
+            if self.skill_middleware is not None:
+                try:
+                    self.skill_registry.set_tracer(tracer)
+                except Exception:
+                    pass
 
         # 注册退出时自动 close（防子进程僵尸）
         atexit.register(self._safe_close)
@@ -243,13 +249,21 @@ class ReActAgent(AgentBase):
 
         系统提示词只在构造时注入一次，因此工具变更后需要调用本方法同步提示词里的
         工具清单；本方法只改写已有的那条 system 消息，不会新增消息。
+        
+        【C10】技能加载/卸载后会自动调用本方法，同步allowed_tools过滤后的工具清单。
 
         用户画像不在这里拼进 prompt——它属于跨轮可能变化的信息（通过 update_user_profile
         更新），每次 run() 开始前由 _inject_profile_ 系列方法统一追加，避免重复叠加。
         """
-        tools_desc = self.tool_registry.get_tools_description()
+        # 【C10】优先使用技能中间件过滤后的工具描述（无技能加载时返回None，回退到全量）
+        tools_desc = None
+        if self.skill_middleware is not None:
+            tools_desc = self.skill_middleware.get_filtered_tools_description()
+        if tools_desc is None:
+            tools_desc = self.tool_registry.get_tools_description()
+        
         prompt = self.system_prompt_template.format(tools=tools_desc)
-        # 追加技能索引（Level 1）与已加载技能详情（Level 2）
+        # 追加技能索引（Level 1）与已加载技能详情（Level 2）+ 工具限制提示
         if self.skill_middleware is not None:
             prompt = self.skill_middleware.before_agent_run(prompt)
         for message in self.messages.get_messages():
@@ -287,7 +301,7 @@ class ReActAgent(AgentBase):
         1. 构建/复用 SkillRegistry，默认把项目根目录下的 .skills/ 加入扫描路径；
         2. 创建 SkillMiddleware（负责技能索引注入与已加载技能的生命周期管理）；
         3. 把技能内置的 3 个工具（load_skill / read_skill_reference / run_skill_script）
-           包装成 StructuredTool 注册进 tool_registry。
+           直接注册进 tool_registry（v1.1.0 build_skill_tools已返回StructuredTool，无需重复包装）。
         """
         registry = skill_registry or SkillRegistry()
         # 默认扫描项目级 .skills 目录（显式传 registry 时也补充该路径）
@@ -296,15 +310,18 @@ class ReActAgent(AgentBase):
                 registry.add_skill_path(skills_dir, source="project")
         for p in skill_paths or []:
             registry.add_skill_path(p, source="custom")
-        registry.scan()
+        # 触发扫描发现技能
+        registry.loader.scan_skills()
 
         self.skill_registry = registry
-        self.skill_middleware = SkillMiddleware(registry=registry)
+        # 透传tracer给技能中间件，自动打点
+        self.skill_middleware = SkillMiddleware(registry=registry, tracer=getattr(self, 'tracer', None))
+        # 【C10】把tool_registry绑定给SkillMiddleware，支持allowed_tools动态过滤
+        self.skill_middleware.bind_tool_registry(self.tool_registry)
 
-        # 注册技能内置工具（registry.get_tools 返回裸函数，需包装成 StructuredTool）
-        for fn in registry.get_tools():
-            wrapped = StructuredTool.from_function(fn, name=fn.__name__)
-            self.tool_registry.register_tool(wrapped)
+        # 注册技能内置工具：v1.1.0 build_skill_tools直接返回包装好的StructuredTool
+        for tool in registry.build_skill_tools():
+            self.tool_registry.register_tool(tool)
 
         skills = registry.list_skills()
         if skills:
@@ -669,7 +686,12 @@ class ReActAgent(AgentBase):
                         )
 
                     try:
-                        tools = self.tool_registry.to_openai_tools()
+                        # 【C10】优先使用技能中间件过滤后的工具schema（无技能加载时返回None，回退到全量）
+                        tools = None
+                        if self.skill_middleware is not None:
+                            tools = self.skill_middleware.get_filtered_openai_tools()
+                        if tools is None:
+                            tools = self.tool_registry.to_openai_tools()
 
                         # 系统提示词已在构造/seed 时就位，这里只追加本轮用户输入（仅第 1 步追加）
                         # 开启 context 时，本轮用户输入已由 _fit_context 放进 user 层，无需重复追加

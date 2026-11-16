@@ -4,10 +4,11 @@ Skill模块 - 为fast_agents提供可复用的技能能力
 """
 
 from .base import BaseSkill, skill
-from .registry import SkillRegistry
-from .models import SkillMetadata, SkillLoadResult
+from .errors import SkillError, SkillNotFoundError, SkillLoadError, SkillValidationError, ScriptExecutionError, ReferenceNotFoundError
 from .loader import SkillLoader
 from .middleware import SkillMiddleware
+from .models import SkillMetadata, SkillLoadResult
+from .registry import SkillRegistry
 
 __all__ = [
     "BaseSkill",
@@ -17,6 +18,12 @@ __all__ = [
     "SkillLoadResult",
     "SkillLoader",
     "SkillMiddleware",
+    # 新增异常类
+    "SkillError",
+    "SkillNotFoundError",
+    "SkillLoadError",
+    "SkillValidationError",
+    "ScriptExecutionError",
+    "ReferenceNotFoundError",
 ]
 
-__version__ = "1.0.0"
