@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from fast_agents.database import (
+    DatabaseError,
     Filter,
     FilterOp,
     Query,
@@ -89,7 +90,7 @@ def main() -> None:
     ):
         try:
             fn()
-        except ValueError as e:
+        except DatabaseError as e:
             print(f"[10] {label} 空条件被拦截：{e}")
 
     db.close()

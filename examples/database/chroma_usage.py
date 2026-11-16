@@ -27,7 +27,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from fast_agents.database import ChromaClient, VectorFilter, VectorFilterOp
+from fast_agents.database import ChromaClient, DatabaseError, VectorFilter, VectorFilterOp
 
 
 def cosine_like_embedding(words_base, text_words, dim=8):
@@ -113,7 +113,7 @@ def main() -> None:
     # 8. delete：空条件被安全拦截（防止误删全量）
     try:
         db.delete("demo_mem")
-    except ValueError as e:
+    except DatabaseError as e:
         print(f"[8] 空条件 delete 被拦截: {e}")
     # 按 metadata 条件删除：删 preference 类
     removed = db.delete("demo_mem", where=VectorFilter(field="kind", op=VectorFilterOp.EQ, value="preference"))

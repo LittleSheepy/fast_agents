@@ -150,7 +150,7 @@ def _run_demo(db):
 
 if __name__ == "__main__":
     # 默认只跑 SQLite demo（无需外部依赖）
-    # demo_sqlite()
+    demo_sqlite()
 
     # 有 MySQL 环境时取消注释跑 MySQL demo
-    demo_mysql()
+    # demo_mysql()

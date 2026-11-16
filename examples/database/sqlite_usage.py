@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from fast_agents.database import SQLiteClient
+from fast_agents.database import DatabaseError, SQLiteClient
 
 
 def main() -> None:
@@ -73,7 +73,7 @@ def main() -> None:
             db.update("users", {"age": 18}, {"name": "Eve"})
             # 故意触发错误（name NOT NULL 约束失败）
             db.insert("users", {"name": None, "age": 1})
-    except ValueError:
+    except DatabaseError:
         print("[9] 事务回滚，Eve 年龄不会被修改")
     eve_age_after = db.select_one("users", {"name": "Eve"})["age"]
     assert eve_age_before == eve_age_after, "事务回滚失败"

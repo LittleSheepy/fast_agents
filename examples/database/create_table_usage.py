@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from fast_agents.database import (
     Column,
     ColumnType,
+    DatabaseError,
     Index,
     Schema,
     SQLiteClient,
@@ -126,7 +127,7 @@ def main() -> None:
     # ---------- 非法表名会被拦截（防注入） ----------
     try:
         db.ensure_table("bad;drop table users;", {"id": "INTEGER"})
-    except ValueError as e:
+    except DatabaseError as e:
         print(f"[9] 非法表名被拦截: {e}")
 
     db.close()
