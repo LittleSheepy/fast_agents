@@ -1,19 +1,19 @@
 [project]
-name = "fast-agents"
+name = "fast-agents-py"
 version = "0.0.1"
 description = "简单、灵活、可扩展的多智能体框架"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "LittleSheepy", email = "littlesheepy@qq.com" }
 ]
 requires-python = ">=3.10"
 dependencies = [
     "docstring-parser>=0.18.0",
-    "duckduckgo-search>=8.1.1",
     "openai>=3.37.0",
     "pydantic>=2.14.1",
     "python-dotenv>=1.2.4",
-    "tavily-python>=0.8.5",
     "pyyaml>=6.0.3",
 ]
 
@@ -22,9 +22,16 @@ dependencies = [
 chroma = ["chromadb>=0.4,<1.0"]
 # MySQL 关系型后端可选依赖：pip install fast-agents[mysql]
 mysql = ["pymysql>=1.1.0"]
+# 内置 SearchTool 的搜索 provider 可选依赖：pip install fast-agents[search]
+search = ["duckduckgo-search>=8.1.1", "tavily-python>=0.8.5"]
+# I3 LLM多provider可选依赖
+anthropic = ["anthropic>=0.39.0"]
+gemini = ["google-generativeai>=0.8.0"]
+all_providers = ["anthropic>=0.39.0", "google-generativeai>=0.8.0", "voyageai>=0.2.0"]
 
 [tool.uv.build-backend]
 module-root = ""
+module-name = "fast_agents"   # 新增：显式告诉构建工具代码在fast_agents目录里
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]
