@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents 的**上下文工程（context engineering）**系统，参考 **LangChain 的 `trim_messages` 与 SummarizationNode**、**LlamaIndex 的 Context 构建与召回**、**CrewAI 的上下文传递**、**Anthropic 的 compaction 与 tool result 截断**、**DeepAgents 的「会话状态外化成文件」** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.4 · 2026-11-02 · **A14 文件工具单一来源治理**：删除 `context/tools.py` 里与 `tools/builtin/file_tool.py` 同名的 `WriteFileTool` / `EditFileTool`（两者工具名都是 `write_file` / `edit_file`，同时注册会互相静默覆盖）；`build_context_tools(include_filesystem=True)` 只产出 `list_files`，文件读写编辑（`read_file` / `write_file` / `edit_file` / `multi_edit_file`）统一由 `tools/builtin/file_tool.py` 提供；`ReActAgent._init_context()` 在注册完本模块工具后自动补齐 file_tool 四件套，同名工具若已由用户预注册则不覆盖
-> 适用版本：`fast_agents.context`（包内 `__version__ = "1.1.0"`）；`ReActAgent._init_context` 同步调整
-> 配套代码：`fast_agents/context/`（tools.py 删除两个类，文件数仍为 7）+ `fast_agents/agents/react_agent/react_agent.py`（`_init_context` 自动补齐 file_tool 四件套，且不覆盖已有同名工具）+ `examples/context/context_react_agent_demo.py`（示例 4/5 改用 file_tool 的 WriteTool/EditTool）+ `test/test_context.py`（16 → 17 项，新增「单一来源无重名」回归）+ `test/test_react_agent.py`（断言扩展到六件套），均已实测通过
+> 版本：v1.5 · 2026-11-16 · **F系列演进规划对齐代码复核结果**：代码逐行复核发现3处影响功能正确性的缺陷（多步任务中途爆窗、工具schema不计入预算、摘要压完就丢），在原有F4/F5基础上新增F6–F12编号，按「功能正确性补强 → API形态打磨 → 生产化优化」三阶段排期，小步提交、每步可独立review、每步对应可测行为变化
+> 适用版本：`fast_agents.context`（包内 `__version__ = "1.2.0"`，同步对齐文档版本）；
+> 配套代码：`fast_agents/context/`（7 文件 / 1636 行）+ `fast_agents/agents/react_agent/react_agent.py`（主循环逐步预算守卫接入点），测试基线 **17/17 全绿**
 > 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：**零新增三方依赖**（只用标准库；`tiktoken` 为可选增强，未安装时自动降级为启发式估算）
 
 ---
@@ -32,6 +32,7 @@
 
 | 版本 | 日期 | 变更 | 作者 |
 |------|------|------|------|
+| 1.5.0 | 2026-11-16 | **F系列演进规划对齐代码复核结果**：逐行复核context全量源码（7文件/1636行）与react_agent接入点，在原有F4/F5基础上新增F6–F12编号，按「功能正确性补强→API形态打磨→生产化优化」三阶段排期，小步提交、每步可独立review；修正文档原优先级判断：F4/F5是API形态问题，F6/F7是影响长任务功能正确性的真实缺陷，需优先修复；同步更新第十二章演进路线与《演进路线图.md》模块F章节，版本号对齐包内`__version__`从1.1.0升到1.2.0 | — |
 | 1.4.0 | 2026-11-02 | **A14 文件工具单一来源治理（破坏性变更）**：删除 `context/tools.py` 里的 `WriteFileTool` / `EditFileTool`（与 `tools/builtin/file_tool.py` 的 `WriteTool` / `EditTool` 工具名完全相同，同时注册会互相静默覆盖，是真实可复现的静默错误）；`build_context_tools(include_filesystem=True)` 只产出 `list_files`；`ReActAgent._init_context()` 在注册完本模块工具后自动调用 `build_file_tools(workspace=".")` 补齐 `read_file` / `write_file` / `edit_file` / `multi_edit_file` 四件套，**同名工具若已由用户预注册则不覆盖**；`fast_agents.context.__all__`、`fast_agents/__init__.py`、`examples/context/context_react_agent_demo.py` 同步调整；`test_context.py` 16→17 项（新增「单一来源无重名」回归用例）；工具模块/文件工具/context/react_agent 全部测试（14+13+17+12）与 5 个示例全绿 | — |
 | 1.3.0 | 2026-11-02 | **B4 双通道注入**：`ContextBuilder.build()` 新增 `system_tail` 可选参数，调用方可把「相对稳定但跨轮可能变化」的文本（典型：用户画像）追加到 L1 system 末尾；`ReActAgent` 在 `enable_context=True` 路径把 `MemoryManager.get_profile().to_text()` 通过 `system_tail` 传给 builder，在 `enable_context=False` 路径直接把画像块追加到工作区 system 消息末尾；用固定 marker（`## 用户画像（稳定信息，请在回答中始终遵守）`）剥离旧块，保证跨 run 不叠加；未配 `profile_store` 或画像为空时 system 字节级一致；`test/test_react_agent.py` 新增 3 项，原有 16/16 context 测试与 react_agent 12/12 测试全绿 | — |
 | 1.2.0 | 2026-11-01 | **演进路线同步**：§十二 演进路线第 4 条从「依赖 B2/llm.embed() 待做」更新为「B2/I1 均已交付，下一步是把语义召回接到 ContextBuilder 并配合 A7 RAGTool」；其余章节与 7 文件源码保持一致（16/16 测试全过） | — |
@@ -44,11 +45,12 @@
 
 | 编号 | 任务 | 本次状态 |
 |---|---|---|
+| **F6–F12** | context模块功能正确性补强 + 生产化演进规划 | 📋 已规划：按三阶段小步提交，每步可独立review，详见第十二章 |
 | **F1** | `TokenCounter` + 上下文预算 | ✅ 已实现（`tokens.py`，三级降级计数 + `TokenBudget`） |
 | **F2** | 工具结果卸载到磁盘 | ✅ 已实现（`offload.py` + `read_offloaded` 工具） |
 | **F3** | 文件系统工具（`ls` / `read` / `write` / `edit` / `multi_edit`） | ✅ 已实现（`tools.py` 仅提供 `list_files` + `read_offloaded`，文件读写编辑**统一由 `tools/builtin/file_tool.py` 提供**，带乐观锁 / 原子写 / 备份 / 审批；`ReActAgent._init_context` 自动补齐四件套，且不覆盖已有同名工具） |
-| **F4** | 摘要 / 压缩中间件化 | 🟡 部分（三级策略已实现且可开关，但未包成通用中间件，见 [十二章](#十二下一步演进路线)） |
-| **F5** | Prompt caching 友好布局 | ✅ 进一步完善：L1 system 末尾追加画像走同一 system 消息，缓存锚点仍稳定；L2 memory / L5 user 不承载画像 |
+| **F4** | 摘要 / 压缩中间件化 | 🟡 部分（三级策略已实现且可开关，但未包成通用中间件，P2 排在 F6–F9 功能正确性修复之后，见 [十二章](#十二下一步演进路线)） |
+| **F5** | Prompt caching 友好布局 | ✅ 进一步完善：L1 system 末尾追加画像走同一 system 消息，缓存锚点仍稳定；L2 memory / L5 user 不承载画像；显式cache断点待补 |
 | **B4** | 双通道注入（偏好进 system 末尾） | ✅ 已实现：两条路径都把画像拼到 L1 system 末尾，不进 L2 / L5 |
 | **A14** | 文件工具命名空间治理（消除 `write_file` / `edit_file` 同名工具静默覆盖） | ✅ 已实现：`write_file` / `edit_file` 在全库只剩一份定义（`tools/builtin/file_tool.py`） |
 
@@ -1541,18 +1543,38 @@ $ python examples\context\context_react_agent_demo.py
 
 ## 十二、下一步演进路线
 
-按优先级排（编号与 [`docs/演进路线图.md`](./演进路线图.md) 模块 F / B / E 保持一致）：
+编号与《演进路线图.md》模块 F 保持一致，**严格遵循「功能正确性 → API 形态打磨 → 生产化优化」三阶段顺序，小步提交、每步独立可 review、每步对应可测行为变化**。
 
-1. **[F4] 压缩中间件化** —— 现在三级策略是 `ContextCompressor` 的方法调用，可开关但不能插拔。目标是抽成与 `skills` 的 `SkillMiddleware` 同构的中间件接口（`before_build` / `after_build`），让「专用摘要器」「按主题裁剪器」都能挂上来。**现在不做的原因**：单模块内部调用已够用，抽中间件要先在多个 Agent 上验证接口稳定性；
-2. **[F5] Prompt caching 断点显式化** —— 顺序已就位（静态在前），且 B4 让画像走 system_tail 后 L1 system 整块更稳定；但没打 `cache_control`。落点很小：给 `ContextLayer` 加 `cache_breakpoint: bool`，`flatten()` 时对该层最后一条消息打标即可，**不需要动压缩和裁剪逻辑**。现在不做是因为 OpenAI 侧缓存是自动的，只有接 Anthropic 才需要显式断点；
-3. **[F1+] 精确 tokenizer 接入** —— 现在是「tiktoken → 通用编码 → 启发式」三级降级，估算有 ±15% 误差。可增加 provider 级精确计数（如 Anthropic 官方计数接口）作为最高优先级的一级；
-4. **[B4+A7] 语义召回层与 RAG 工具接入** —— 目前 memory 层只注入「长期记忆 + 会话摘要」，没有向量召回。`ContextPacket.metadata` 已留扩展位。B2 语义检索包装器（v1.4.0 / 2026-11-01）与 `llm.embed_query/embed_documents`（v2.4.0 / 2026-10-29）已交付，语义召回的前置链路已打通，下一步是在 `ContextBuilder` 里开一个可选的 embedding 召回槽位，并配合 A7 `RAGTool` 把本地文档切片结果接入 L4（files）层；
-5. **[F2+] 流式截断** —— 现在卸载发生在「工具结果已完整返回」之后，对**流式输出过程中**的超长内容无能为力。可加一个「边流边算 token、超阈值即截断」的中间层；
-6. **[F2+] 卸载文件的生命周期管理** —— 现在只有 `max_files` 数量的粗粒度淘汰，没有按时间 / 按会话的清理。长跑服务需要「会话结束时清掉本会话的卸载文件」；
-7. **[B5] 记忆衰减与合并** —— 双通道注入（B4）已落地，长期记忆检索与画像已分流。下一步做记忆的「时间衰减 + 重复项合并」，进一步压 token、避免模型被重复偏好淹没；
-8. **[E3] 子代理上下文隔离** —— 用独立上下文窗口跑子任务，只把结果返回主 Agent。这属于 `agents` 模块，但它能从根上降低单 Agent 的上下文压力，是长任务的关键能力。
+### 12.1 已交付
 
-> **当前最明显的空缺**：F4（压缩中间件化）与 F5（缓存断点）都只铺了地基。**能跑、能用、能开关，但还不能像 LangGraph 那样把压缩当成一个可编排的图节点。** B4（双通道注入）已在 v1.3 落地，记忆模块的 B 系列里仅剩 B5（衰减合并）未做。
+| 编号 | 任务 | 完成版本 | 落点 |
+|------|------|---------|------|
+| ✅ **F1** | `TokenCounter` + `TokenBudget` | v1.0.0 | `tokens.py`：三级降级计数（tiktoken → 通用编码 → 启发式估算） |
+| ✅ **F2** | 工具结果卸载 | v1.0.0 | `offload.py` + `read_offloaded`：超阈值落盘、按行回读 |
+| ✅ **F3** | 文件系统工具 | v1.0.0 | `tools/builtin/file_tool.py` 四件套 + `context/tools.py` 的 `list_files` / `read_offloaded`（A14 单一来源） |
+| ✅ **F5** | Prompt caching 友好布局（静态段连续） | v1.3.0（context）/ v1.6.0（memory） | B4 画像经 `ContextBuilder.build(system_tail=...)` 追加到 L1 system 末尾、不拆静态段，天然兼容缓存；显式缓存断点留作待办 |
+
+### 12.2 待办（按优先级）
+
+| 编号 | 任务 | 优先级 | 依赖 | 一句话说明 |
+|------|------|--------|------|-----------|
+| **F6** | Run 内逐步预算守卫 | **P1** | — | `_fit_context` 从 run 开头下沉到主循环每次 LLM 调用前，仅整窗超 `budget.available*0.95` 才重平衡，新增 `rebalance_history()` 只压 history 层；修多步任务中途爆窗，改 `react_agent.py` + `builder.py` |
+| **F7** | 工具 schema 计入预算 + 配额动态回流 | **P1** | — | `count_tool_schemas()` 接入 `build()` 预算扣减，system 层实际占用回流给 history 层；修预算漏算，改 `tokens.py` + `builder.py` |
+| **F8** | 启用 summary 层 + 摘要跨 run 回流 | P2 | F6 | `LAYER_ORDER` 预留的 `summary:25` 层正式启用，摘要移到独立 summary 层（role 由 system 改 assistant），`accumulated_summary` 跨 run `build()` 时真正读取 |
+| **F9** | `validate()` 接入 `build()` + 跨层 tool 配对保护 | P2 | — | `build()` 返回前自动调 `ContextWindow.validate()`，跨层扫描 tool 配对、孤立 tool 消息自动裁剪而非等 400 |
+| **F4** | 压缩中间件化 | P2 | F1 | 三级策略（卸载 → 裁剪 → 摘要）已实现、待抽成与 `SkillMiddleware` 同构的 `before_build` / `after_build` 钩子接口，新增 `hooks.py` |
+| **F5** | Prompt caching 断点显式化 | P2 | — | 给 `ContextLayer` 加 `cache_breakpoint: bool` 标记，Anthropic 场景自动打 `cache_control`；OpenAI 自动前缀缓存无需改动 |
+| **F10** | 精确 tokenizer 接入（F1 延伸） | P3 | — | 支持 provider 级精确计数（Anthropic 官方 API 等）作为最高优先级后端，估算误差从 ±15% 降至 ±3%；改 `tokens.py` |
+| **F11** | logging 替换 print + 压缩 / 卸载事件落 trace | P3 | — | 全模块 print 换标准 logging（`fast_agents.context.*` 命名空间），压缩 / 卸载 / 预算告警事件接入 TraceLogger span metadata；改全模块 7 文件 |
+| **F12** | 卸载索引并发安全 | P3 | — | 卸载目录 `index.json` 改用 `database.SQLiteClient` 存储，获得 WAL 并发安全；改 `offload.py` |
+| **F13** | 流式截断（F2+） | P3 | — | 工具流式输出过程中边算 token、超阈值即截断，无需等完整结果返回 |
+| **F14** | 卸载文件生命周期管理（F2+） | P3 | — | 会话结束时自动清理本会话产生的卸载文件，长跑服务磁盘不堆积；改 `offload.py` + `react_agent` |
+| **B4+A7** | 语义召回层与 RAG 工具接入 | P3 | I1 / B2 | `ContextBuilder` 增加可选 embedding 召回槽位，配合 A7 RAGTool 把本地文档切片接入 L4 files 层（前置链路已打通） |
+| **E3** | 子代理上下文隔离 | P3 | — | 独立上下文窗口跑子任务、只返回结果给主 Agent，从根上降低单窗压力（属 agents 模块 E3，context 提供窗口隔离能力） |
+
+> **当前最明显的空缺修正**：原文档认为 F4 / F5 是最明显空缺，经代码逐行复核修正——F4 / F5 是 API 形态打磨问题，**F6 / F7 才是影响长任务功能正确性的真实缺陷**：当前 `_fit_context()` 仅在 run 开头调用一次，主循环内每步追加消息后无整窗度量，多步任务会中途爆窗；同时工具 schema 不计入预算、配额静态分配不回流，预算计量存在漏算。先修功能正确性，再做 API 形态，最后做生产化打磨。
+>
+> **小步提交原则**：每个 F 编号对应一次独立提交，改动范围控制在 1-2 个文件，新增测试 2-4 项，既有 17/17 测试保持全绿，零新增依赖、零破坏性变更。
 
 ---
 

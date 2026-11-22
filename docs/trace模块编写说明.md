@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents **Trace（全链路可观测性）**系统，参考 **OpenTelemetry Trace/Span 模型**、**LangChain Callbacks/Tracer**、**OpenAI Agents SDK Tracing** 的核心概念（trace / span / 父子关系 / 钩子），给出本模块的完整说明、源码解析与自定义教程。同时对齐 fast_agents 已交付的 tools / memory / mcp / skills / context / database 模块文档骨架，做到「翻开任何一份模块说明，都知道在哪一节能找到什么」。
 
-> **版本**：v1.2.0 · 2026-11-12 · 路线图 K1 最小闭环 + K3 评估工具/成本日报 + K1 收尾四项：Trace/Span 数据模型 + TraceLogger 记录器 + JsonlStore（默认）+ SQLiteStore（结构化后端）+ ToolRegistry 钩子打点 + LLM/Agent 可选接入 + LLM token/model 元数据 + tool 真实耗时 + 查询/回放 + 后端自动后缀识别 + **TraceEvaluator 离线评估器**（成本/效率/质量三类指标聚合、dict/JSON/文本/CSV 四格式输出）+ **Token 成本日报**（按自然日聚合、模型价目表自动匹配、JSON/文本/CSV 三格式导出）+ **K1 收尾四项**（可配置预览截断长度、`replay`/`build_tree` 树形聚合、`error_type` 异常分类、`perf_counter` 单调时钟耗时）
+> **版本**：v1.3.0 · 2026-11-18 · 路线图 K1 最小闭环 + K3 评估工具/成本日报 + K1 收尾四项 + **SpanKind 补全与 attributes 框架标准属性**：Trace/Span 数据模型 + TraceLogger 记录器 + JsonlStore（默认）+ SQLiteStore（结构化后端）+ ToolRegistry 钩子打点 + LLM/Agent 可选接入 + LLM token/model 元数据 + tool 真实耗时 + 查询/回放 + 后端自动后缀识别 + **TraceEvaluator 离线评估器**（成本/效率/质量三类指标聚合、dict/JSON/文本/CSV 四格式输出）+ **Token 成本日报**（按自然日聚合、模型价目表自动匹配、JSON/文本/CSV 三格式导出）+ **K1 收尾四项**（可配置预览截断长度、`replay`/`build_tree` 树形聚合、`error_type` 异常分类、`perf_counter` 单调时钟耗时）+ **attributes 框架标准属性 + SpanKind 补全**（SpanKind 新增 SKILL/MCP/MEMORY/DATABASE/CONTEXT；SpanRecord 新增 `attributes: Dict[str, Any]` 字段与 `set_attribute()`/`set_attributes()`；`start_span`/`start_span`/`with span()`/with trace() 均支持 `attributes=` 参数；jsonl 与 SQLite 双后端读写 `attributes` 列，SQLite schema 同步加列；evaluator 优先从 `attributes['tool.name']`/`attributes['llm.model']`/`attributes['llm.input_tokens']`/`attributes['llm.output_tokens']` 提取字段，兼容旧 metadata 口径；`test_trace.py` 74 → **88**，合计 149 → **164/164** 全绿）
 > **适用版本**：`fast_agents.trace`
-> **配套代码**：`fast_agents/trace/`（**9 个**源码文件）+ `tests/trace/`（**5 个测试文件、共 149 项**全绿：`test_trace.py` 74 项 K1 + `test_trace_jsonl_store.py` 12 项 JsonlStore + `test_trace_sqlite_store.py` 11 项 SQLiteStore + `test_trace_eval.py` 33 项 K3 评估器 + `test_trace_cost.py` 19 项 K3 成本日报）+ `examples/trace/`（**6 个**可运行示例）
+> **配套代码**：`fast_agents/trace/`（**9 个**源码文件）+ `tests/trace/`（**5 个测试文件、共 164 项**全绿：`test_trace.py` 88 项 K1 + `test_trace_jsonl_store.py` 12 项 JsonlStore + `test_trace_sqlite_store.py` 12 项 SQLiteStore + `test_trace_eval.py` 33 项 K3 评估器 + `test_trace_cost.py` 19 项 K3 成本日报）+ `examples/trace/`（**6 个**可运行示例）
 > **运行环境**：Python 3.10+（仓库 `.python-version` = 3.10），**Windows 平台**（仓库当前唯一目标平台，见 `AGENTS.md` R11）
 > **依赖**：**零新增依赖**，仅标准库（`json / os / threading / uuid / time / contextvars / pathlib / contextlib / enum / abc / itertools / sqlite3 / statistics / dataclasses / datetime`）+ 全框架已有的 `pydantic>=2.14.1` + 框架自带 `database.SQLiteClient`；不引入 OpenTelemetry / LangChain / loguru / pandas / numpy 任何外部库
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分放在第十二章，并与 `docs/演进路线图.md` 的 K 模块编号对齐。
@@ -34,6 +34,7 @@
 
 | **版本** | 日期 | 变更 | 作者 |
 |------|------|------|------|
+| **1.3.0** | 2026-11-18 | **SpanKind 补全 + attributes 框架标准属性（零新增依赖、零破坏性改动）**：①**SpanKind 补全到 9 类**——原有 `LLM / TOOL / DECISION / AGENT / CUSTOM` 基础上，新增 **`SKILL`（技能调用）/ `MCP`（MCP 工具调用）/ `MEMORY`（记忆读写）/ `DATABASE`（数据库操作）/ `CONTEXT`（上下文/模板渲染）**，覆盖框架所有一级模块的打点类型；枚举仍是字符串型，落盘兼容旧值。②**新增 `attributes` 字段**——`SpanRecord` 新增 `attributes: Dict[str, Any] = Field(default_factory=dict)`，并提供 `set_attribute(key, value)` / `set_attributes(dict)` 两个门面方法（非字符串 key / 异常一律吞掉，符合 R6 旁路不阻塞）。③**打点入口统一支持 `attributes=`**——`TraceLogger.start_span(name, kind=..., *, input=..., metadata=..., attributes=...)` 与 `with tracer.span(..., attributes=...)` 均接受 attributes；`with tracer.trace()` 保留原有签名（root span 由首个 `start_span` 隐式生成，如需给 root 设属性可在首个 start_span 上传入）。④**双后端同步落盘列**——`schema.py` 新增 `attributes TEXT NOT NULL DEFAULT '{}'` 列（老库自动 ALTER 补列）；`jsonl_store.py` / `sqlite_store.py` 写入与读回 `attributes` 字段，使用 `json_safe_dumps` / `json_safe_load` 与 metadata 同口径处理。⑤**evaluator 字段提取优先级升级为「attributes 优先、metadata 兜底」**——工具名按 `attributes['tool.name']` → span.name → metadata 兜底；模型名按 `attributes['llm.model']` → metadata['model']；token 用量按 `attributes['llm.input_tokens']/llm.output_tokens` → metadata 兜底，既保持对旧落盘文件的完全兼容，也让新打点接入点写 attributes 即可被评估器直接消费。⑥**`end_span` 幂等修复**——span.finish 触发的 `_on_finish_callback` 若内部再次调用 `end_span`，会先写入一次，外层在 finish 返回后检查 `_persisted` 直接返回，避免同一 span 重复写两行。⑦测试新增 14 条覆盖 attributes 写入/读回/非字符串 key/不可序列化值/9 类 SpanKind 落盘/回调幂等，`tests/trace/test_trace.py` 74 → **88**；trace 模块合计 **88 + 12 + 12 + 33 + 19 = 164/164** 全绿；`tests/tools/test_tools.py` 66、`tests/agents/test_react_agent.py` 17 同步通过。 | — |
 | **1.2.0** | 2026-11-12 | **K1 收尾四项交付 + 文档对齐最新代码（零新增依赖、零破坏性改动）**：①**输入/输出预览截断长度可配置**——把硬编码在打点接入层的预览长度收编为 `TraceLogger(input_preview_len=..., output_preview_len=...)` 两个可选 keyword 参数 + 门面方法 `truncate_preview(text, default_len, *, is_input=False)`；默认 `None` 时沿用 Agent 输入 500 / Agent 输出 300 / LLM 输出 200，行为**逐字节不变**，配置 `<= 0` 表示不截断；`tests/trace/test_trace.py` 50 → **56 项**，合计 124 → **130/130**。②**`replay()` 返回树形结构 + `build_tree()` 辅助**——`replay()` 返回 dict 追加 `children` 递归字段（同层按 `_create_seq` 排序、悬空父提升为 orphan root、多 root 保留），新增纯只读 `build_tree(trace_id=None, session_id=None)`；`test_trace.py` 56 → **60**，合计 130 → **134/134**。③**统一 `error_type` 异常分类字段**——`SpanRecord` 新增可选 `error_type`，`finish()` / `end_span()` 自动从 `"ExceptionName: msg"` 切取异常类名（ASCII，允许点号限定名），工具错误统一 `"ToolError"`，SQLite schema 加列（老库自动 ALTER 补列、历史数据 None 不回填）；`test_trace.py` 60 → **65**，合计 134 → **139/139**。④**`duration_ms` 改用 `perf_counter()` 单调时钟差值（抗墙钟跳变）**——`TraceLogger.start_span` 新建 Span 时记录私有单调时钟起点 `_mono_start`（不落盘），`finish()` 默认路径走 `perf_counter()` 差值；`start_time` / `end_time` 仍为 `time.time()` 墙钟，显式 `end_time`（后钩子 / 手工精确起止）或直接构造的 `SpanRecord` 仍走墙钟差值，口径与旧版**逐字节一致**；`test_trace.py` 65 → **70**，合计 139 → **144/144**。⑤**文档对齐最新代码 `e2ae4c2`（零源码改动、零依赖变更）**——测试基线 113 → 124，`evaluate()` 的 `limit` / `top_n_traces` 统一为「trace 粒度」截断（按 trace 最近活跃时间倒序取最近 N 条**完整 trace**，不再按 span 条数切片丢 root），序列化兜底函数名 `_safe_serialize` 更正为 `json_safe_dumps` / `json_safe_serialize`。⑥上游并入 2 项回归用例（`test_parent_child_relationship_with_error`、`test_no_root_with_success_span_still_success`）；⑦**内存后端生命周期语义修正**——`InMemoryTraceStore.close()` 改为 no-op（不再清空记录，`TraceLogger` 退出 with 块自动 close 不再丢数据），主动清空职责移交扩展方法 `clear()`；`tests/trace/test_trace.py` 71 → **74 项**，trace 模块当前基线 **74 + 12 + 11 + 33 + 19 = 149/149** 全绿。 | — |
 | **1.1.0** | 2026-11-10 | **K3 离线评估与成本日报交付（零新增默认依赖、零破坏性改动）**：①**TraceEvaluator 离线评估器**——新增 `fast_agents/trace/evaluator.py`，交付 `TraceEvaluator` / `TraceMetrics` / `EvaluationReport` 三个公开类，离线消费已落盘 trace（TraceLogger / Store / 文件路径三种构造方式，JsonlStore 与 SQLiteStore 通用），按 trace 聚合成本 / 效率 / 质量三类指标，支持 `session_id` / `trace_id` / `limit` / `top_n_traces` 过滤，提供 `to_dict()` / `to_json()` / `to_text()` 三种输出；新增 `tests/trace/test_trace_eval.py` 21 项，trace 模块合计 67 → **88/88**。②**CSV 明细导出（`to_csv`）**——`EvaluationReport.to_csv(path=None, *, encoding="utf-8-sig")`，固定 25 列，`success` 输出 `true`/`false`、`tool_distribution` 折叠为 `name=count;...`，默认带 BOM 落盘（Windows Excel 中文不乱码）；`test_trace_eval.py` 21 → **27**，合计 88 → **94/94**。③**Token 成本日报（`daily_cost_report`）**——按自然日聚合（默认北京时间 UTC+8，可切时区），内置 22 个常见模型默认价目表（按最长前缀优先匹配），新增 `DayCostMetrics` / `CostDailyReport`，提供 dict/JSON/文本/CSV 四输出；新增 `tests/trace/test_trace_cost.py` 16 项，K1+K3 合计 94 → **110/110**。 | — |
 | **1.0.0** | 2026-11-06 | **初版（路线图 K1 最小闭环）**：`fast_agents/trace/` 作为独立子包交付（`__init__.py` / `models.py` / `store_base.py` / `jsonl_store.py` / `sqlite_store.py` / `trace_logger.py` 共 6 个文件）。一次性交付：**SpanRecord** 数据模型（trace_id/span_id/parent_id/session_id/name/kind/start_time/end_time/duration_ms/input/output/status/error/metadata）+ **SpanKind** 枚举（llm/tool/decision/agent/custom）+ **SpanStatus** 枚举（success/error）+ **TraceLogger** 门面（手动 span / with 上下文 / trace() 开新根 / 失败安全 / 幂等 end_span / `read_spans` 多条件过滤 / `replay` 缩进回放 / 后端自动识别）+ **TraceStoreBase** 抽象基类 + **JsonlStore**（文件后端，jsonl 逐行 append 落盘、坏行跳过）+ **InMemoryTraceStore**（纯内存后端）+ **SQLiteStore**（结构化后端，复用框架自带 `database.SQLiteClient`，一条 Span 一行、三索引谓词下推、WAL 并发写、幂等迁移）。**接入**：LLM 门面 `invoke / stream_invoke / embed_query / embed_documents` 仅新增可选 `tracer=None` 打点（stream 走包装生成器），LLM span 写入 `model` + `usage` / `prompt_tokens` / `completion_tokens` / `total_tokens`；ReActAgent 新增可选 `tracer=None`，run 内开 `agent.<name>.run` trace + `agent.run` Span + 每步 `decision.stepN` Span；工具打点走 `ToolRegistry.add_hook` 钩子，读 `ToolResult.metadata["duration_ms"]` 回推真实耗时。**零新增依赖**、**零破坏性改动**：`tests/trace/test_trace.py` **67/67** 全绿；`examples/trace/` 下 4 个离线可跑示例；顶层 `fast_agents/__init__.py` 同步重导出 trace 全部公开符号。 | — |
@@ -113,9 +114,9 @@ fast_agents/
     └── evaluator.py                    # K3 TraceEvaluator 离线评估器：TraceMetrics / EvaluationReport / dict·JSON·文本·CSV 输出
 
 tests/trace/
-├── test_trace.py                       # 74 项测试，全绿；覆盖 K1 打点链路、LLM/Agent/tool 钩子、生命周期、预览截断可配置、replay/build_tree 树形聚合、error_type 自动分类、单调时钟耗时（抗墙钟跳变）、内存后端 close 不清空 / clear 主动清空
+├── test_trace.py                       # 88 项测试，全绿；覆盖 K1 打点链路、LLM/Agent/tool 钩子、生命周期、预览截断可配置、replay/build_tree 树形聚合、error_type 自动分类、单调时钟耗时（抗墙钟跳变）、内存后端 close 不清空 / clear 主动清空
 ├── test_trace_jsonl_store.py           # 12 项测试，全绿；覆盖 JsonlStore 文件后端、序列化兜底、坏行跳过
-├── test_trace_sqlite_store.py          # 11 项测试，全绿；覆盖 SQLiteStore 谓词过滤、幂等迁移、upsert、后缀识别
+├── test_trace_sqlite_store.py          # 12 项测试，全绿；覆盖 SQLiteStore 谓词过滤、幂等迁移、upsert、后缀识别
 ├── test_trace_eval.py                  # 33 项 K3 评估器测试，全绿；覆盖构造/聚合/过滤/输出/CSV/脏数据/零开销
 └── test_trace_cost.py                  # 19 项 K3 成本日报测试，全绿；覆盖按日聚合/价目表/时区/CSV 导出
 
@@ -325,12 +326,17 @@ ToolRegistry 的钩子是**后钩子**——工具执行完了才调用 hook，�
 class SpanKind(str, Enum):
     LLM = "llm"           # 大模型调用（invoke/stream_invoke/embed_query/embed_documents）
     TOOL = "tool"         # 工具调用（通过 ToolRegistry.add_hook 自动打点）
+    SKILL = "skill"       # 技能调用（skills 模块）
+    MCP = "mcp"           # MCP 工具调用（MCP 协议层）
+    MEMORY = "memory"     # 记忆读写（memory 模块：working/episodic/semantic）
+    DATABASE = "database" # 数据库操作（SQL/向量库 CRUD）
+    CONTEXT = "context"   # 上下文/模板渲染（context 模块：Prompt 拼装、变量注入）
     DECISION = "decision" # Agent 决策/推理步骤（是否调工具、选哪个工具、最终回答）
     AGENT = "agent"       # 一次完整 Agent run
     CUSTOM = "custom"     # 用户自定义打点
 ```
 
-路线图最小集是 `llm/tool/decision` 三类，额外留 `agent/custom` 作扩展：`agent` 用于包裹整次 run，`custom` 给用户手动打点用。传字符串（如 `"llm"`）给 `start_span(kind=...)` 会自动归一化为枚举，非法字符串退化为 `CUSTOM`。
+路线图最小集是 `llm/tool/decision` 三类，`agent/custom` 作为扩展，v1.3.0 补齐 `skill/mcp/memory/database/context` 五个一级模块打点类型。传字符串（如 `"llm"`）给 `start_span(kind=...)` 会自动归一化为枚举，非法字符串退化为 `CUSTOM`；旧落盘文件中 `"custom"` 等旧值也能被正常读回，向后兼容。
 
 ### 6.2 SpanStatus（执行状态枚举）
 
@@ -366,7 +372,8 @@ class SpanRecord(BaseModel):
     error: Optional[str]           # 异常信息（status=error 时填写）
     error_type: Optional[str]      # 异常分类（自动推断异常类名，如 ValueError / ToolError / RuntimeError；显式传入优先）
     # 扩展
-    metadata: Dict[str, Any]       # 扩展元数据（模型名、token 用量、工具状态、自定义 KV…）
+    metadata: Dict[str, Any]       # 用户业务元数据（模型名、token 用量、工具状态、自定义 KV…）
+    attributes: Dict[str, Any]     # 框架标准属性（命名空间点号键名，如 llm.model / tool.name / skill.name / mcp.server）
 ```
 
 **私有属性（不参与序列化，用户通常无需关心）**：
@@ -376,6 +383,13 @@ class SpanRecord(BaseModel):
 - `_mono_start: Optional[float]`（`PrivateAttr`，默认 None）：**单调时钟起点**（`time.perf_counter()` 秒）。仅由 `TraceLogger.start_span` 在「正常创建」时设置，供 `finish()` 计算抗墙钟跳变的耗时；直接构造的 `SpanRecord` / 从存储读回的 Span 保持 None，耗时退化为墙钟差值。
 
 **字段对齐路线图 K1 最小集**：`start_time`（时间戳）/ `kind`（类型）/ `input`（输入）/ `output`（输出）/ `duration_ms`（耗时）/ `session_id`（会话 id），六项全部覆盖。
+
+**`metadata` vs `attributes` 分工**（v1.3.0 引入）：
+
+- **`metadata`**：用户业务上下文、任意键值、随业务自由扩展，框架不解析其键名。旧打点（LLM 写 `metadata["model"]`、`metadata["prompt_tokens"]` 等）全部保留，evaluator 继续识别。
+- **`attributes`**：**框架标准属性**，推荐使用**命名空间点号风格**（`llm.model` / `llm.input_tokens` / `llm.output_tokens` / `tool.name` / `skill.name` / `mcp.server` / `memory.op` / `db.system` / `ctx.template`）。evaluator 与可视化 UI 优先从 `attributes` 读结构化字段，未命中时再 fallback 到 metadata。**不要为每种能力都再加一级字段**（如 tool_inputs / skill_params 之类）——不同模块都有输入输出，统一放在 `input` / `output` + `attributes` 的命名空间键里即可。
+
+两类字段都通过 `json_safe_dumps` 安全落盘，不可序列化对象会被转字符串兜底，保证不丢整条 Span。
 
 **finish 方法**：
 
@@ -568,9 +582,9 @@ __all__ = ["TraceLogger", "SpanKind", "SpanStatus", "SpanRecord",
 
 ```powershell
 cd D:\path\to\fast_agents
-python tests\trace\test_trace.py              # K1 打点链路：74/74 全过
+python tests\trace\test_trace.py              # K1 打点链路：88/88 全过
 python tests\trace\test_trace_jsonl_store.py  # JsonlStore 后端：12/12 全过
-python tests\trace\test_trace_sqlite_store.py # SQLiteStore 后端：11/11 全过
+python tests\trace\test_trace_sqlite_store.py # SQLiteStore 后端：12/12 全过
 python tests\trace\test_trace_eval.py         # K3 评估器：33/33 全过
 python tests\trace\test_trace_cost.py         # K3 成本日报：19/19 全过
 python examples\trace\basic_usage.py          # 最小手动打点示例
@@ -683,14 +697,14 @@ tracer.attach_to_tool_registry(tool_registry)  # 一行接入；之后 registry.
 ### 8.6 跑测试
 
 ```powershell
-python tests\trace\test_trace.py              # K1 打点链路：74 通过
+python tests\trace\test_trace.py              # K1 打点链路：88 通过
 python tests\trace\test_trace_jsonl_store.py  # JsonlStore 后端：12 通过
-python tests\trace\test_trace_sqlite_store.py # SQLiteStore 后端：11 通过
+python tests\trace\test_trace_sqlite_store.py # SQLiteStore 后端：12 通过
 python tests\trace\test_trace_eval.py         # K3 评估器：32 通过
 python tests\trace\test_trace_cost.py         # K3 成本日报：19 通过
 ```
 
-预期：各脚本都打印「完成：N 通过，0 跳过，0 失败」；trace 模块合计 **149/149 全绿**。
+预期：各脚本都打印「完成：N 通过，0 跳过，0 失败」；trace 模块合计 **164/164 全绿**。
 
 ### 8.7 K3 离线评估最小示例
 
@@ -1042,15 +1056,15 @@ daily.to_csv(path=None)           # → str（每天一行 CSV；给 path 落盘
 
 | 测试文件 | 项数 | 覆盖点 | 运行命令 |
 |---|---|---|---|
-| `tests/trace/test_trace.py` | **74/74** | K1 打点链路（见下表） | `python tests\trace\test_trace.py` |
+| `tests/trace/test_trace.py` | **88/88** | K1 打点链路（见下表） | `python tests\trace\test_trace.py` |
 | `tests/trace/test_trace_jsonl_store.py` | **12/12** | JsonlStore 文件后端、序列化兜底 | `python tests\trace\test_trace_jsonl_store.py` |
-| `tests/trace/test_trace_sqlite_store.py` | **11/11** | SQLiteStore 谓词过滤 / 迁移 / 幂等 | `python tests\trace\test_trace_sqlite_store.py` |
+| `tests/trace/test_trace_sqlite_store.py` | **12/12** | SQLiteStore 谓词过滤 / 迁移 / 幂等 | `python tests\trace\test_trace_sqlite_store.py` |
 | `tests/trace/test_trace_eval.py` | **33/33** | 见下表（K3） | `python tests\trace\test_trace_eval.py` |
 | `tests/trace/test_trace_cost.py` | **19/19** | K3 Token 成本日报 | `python tests\trace\test_trace_cost.py` |
 
-> 合计 **149 项全绿**（74 + 12 + 11 + 33 + 19）。
+> 合计 **164 项全绿**（88 + 12 + 12 + 33 + 19）。
 
-**74 项用例覆盖点**：
+**88 项用例覆盖点**：
 
 1. **Span 数据模型**：默认 span_id 自动生成、start_time 默认当前时刻、finish 自动算 duration_ms（单调时钟差值）、finish 合并 metadata、error 自动置 ERROR、finish 负耗时截断为 0、SpanKind 枚举取值；
 2. **存储 InMemoryTraceStore / JsonlStore**（用例位于 `tests/trace/test_trace_jsonl_store.py`）：内存后端写入读回、按 session_id/trace_id/kind 过滤、limit 截断；JsonlStore 文件模式写盘且跨实例读回、append=False 清空重写、落盘文件每行均为合法 JSONL、不累积内存（`test_file_store_does_not_accumulate_in_memory`）、不可序列化 input/output 与极端不可序列化对象也能落库（`test_jsonl_store_handles_unserializable_input_output` / `test_jsonl_store_file_handles_extreme_unserializable` 等）；
@@ -1098,14 +1112,14 @@ daily.to_csv(path=None)           # → str（每天一行 CSV；给 path 落盘
 
 ```text
 $ python tests\trace\test_trace.py
-=== 开始运行测试（共 74 项） ===
+=== 开始运行测试（共 88 项） ===
   ✅ PASS: test_span_record_defaults
   ...
   ✅ PASS: test_with_trace_context_manager
 --- 完成：74 通过，0 跳过，0 失败 ---
 ```
 
-说明：trace 模块现有 **5 个测试文件、共 149 项全绿**——`test_trace.py` 74/74、`test_trace_jsonl_store.py` 12/12、`test_trace_sqlite_store.py` 11/11、`test_trace_eval.py` 33/33、`test_trace_cost.py` 19/19。本仓库测试用自带的零依赖运行器（`tests/_runner.py`，提供 `raises` / `skip` / `tmp_path` / `MonkeyPatch` 等），**不使用 pytest**。与其他模块的合跑基线以各模块自身 runner 结果为准。
+说明：trace 模块现有 **5 个测试文件、共 164 项全绿**——`test_trace.py` 88/88、`test_trace_jsonl_store.py` 12/12、`test_trace_sqlite_store.py` 12/12、`test_trace_eval.py` 33/33、`test_trace_cost.py` 19/19。本仓库测试用自带的零依赖运行器（`tests/_runner.py`，提供 `raises` / `skip` / `tmp_path` / `MonkeyPatch` 等），**不使用 pytest**。与其他模块的合跑基线以各模块自身 runner 结果为准。
 
 ### 11.4 示例验证
 
@@ -1186,13 +1200,24 @@ Trace Token 成本日报（K3）
 
 ## 十二、下一步演进路线
 
-按优先级排（与《演进路线图.md》§十一 K 模块编号一致；本模块当前版本 v1.2.0，以下为待办能力，不按版本号切分）：
+编号与《演进路线图.md》§十一 K 模块保持一致（本模块当前版本 v1.2.0）。
 
-1. **K1 收尾（补丁级）**——✅ **输入输出截断长度可配**、✅ **replay/build_tree 树形聚合**、✅ **error_type 异常分类** 四项**全部交付**（K1 收尾完成）。**duration 改用 perf_counter 单调时钟差值抗墙钟跳变**：`finish()` 默认路径用 `perf_counter()` 差值算 duration_ms，`start_time`/`end_time` 仍为墙钟；显式 `end_time` 或直接构造的 `SpanRecord` 仍走墙钟差值（零破坏）。其中 `error_type` 规则：①显式传入优先；②否则从 `"ExceptionName: msg"` 切取冒号前异常类名（ASCII 标识符，允许点号限定名，如 `json.JSONDecodeError`）；③中文/纯数字/纯符号开头保持 None；工具错误统一 `"ToolError"`；老 SQLite 库自动补列，历史数据保持 None（零破坏）。
-2. **K2 异步并发支持**——async 工具/LLM 打点接入、多进程文件锁或文档化「每 worker 独立文件」、Sampler 采样器（按比例/错误率）、SpanEvent 时间点事件（首 token 到达、解析开始）、流式 token 统计（开 `stream_options={"include_usage": True}`）；状态栈已是实例级 ContextVar，跨协程传播已就位，无需返工；依赖 A26 Agent 多工具并发 与 I2 LLM ainvoke 前置落地；
-3. **K3 评估工具（已交付基础统计 + CSV 导出 + 成本日报，继续扩展）**——✅ 基础统计聚合（成本/效率/质量三类指标、跨 trace avg/p95/std、工具/模型分布、dict/JSON/文本/CSV 四输出）已交付；✅ CSV 明细导出（`to_csv`，每条 trace 一行 25 列）已交付；✅ **Token 成本日报**（`daily_cost_report`，按自然日聚合、内置 22 个常见模型价目表、最长前缀匹配、dict/JSON/文本/CSV 四输出、可按时区/日期/会话过滤、支持自定义价目表覆盖）已交付。后续增强：工具选择准确率、LLM-as-Judge 打分、双 Agent Win Rate、A/B 对比、按问题集批量回归评估、按问题维度的成本归因；
-4. **K4 Web UI 可视化**——瀑布图看板（独立 HTML/SVG 或轻量前端），只读本地 store 数据、不引服务依赖；
-5. **K5 外部上报**——可选 OTLP / Langfuse exporter，与「零依赖 / 离线可跑」红线隔离，做成独立可选 exporter、默认不装。
+### 12.1 已交付
+
+| 编号 | 任务 | 完成版本 | 落点 |
+|------|------|---------|------|
+| ✅ **K1** | TraceLogger 初版（Span 模型 + JsonlStore + SQLiteStore + 全链路接入 + 查询 / 回放） | v1.0.0 | `fast_agents/trace/`：`models.py` / `store_base.py` / `jsonl_store.py` / `sqlite_store.py` / `trace_logger.py`，LLM / Agent / tool 全链路打点；含 6 个离线示例 |
+| ✅ **K1 收尾** | 截断长度可配 + 树形聚合 + `error_type` + 单调时钟 | v1.2.0 | 输入 / 输出截断可配（`input_preview_len` / `output_preview_len`）+ `replay()` / `build_tree()` 树形聚合 + `error_type` 异常分类 + `duration_ms` 改用 `perf_counter()` 抗墙钟跳变（零破坏） |
+| ✅ **K3（基础）** | 离线评估器 + CSV 明细导出 + Token 成本日报 | v1.1.0 | `evaluator.py`：`TraceEvaluator` / `TraceMetrics` / `EvaluationReport`（成本 / 效率 / 质量三类指标）+ `to_csv`（25 列）+ `daily_cost_report`（内置 22 模型价目表） |
+
+### 12.2 待办（按优先级）
+
+| 编号 | 任务 | 优先级 | 依赖 | 一句话说明 |
+|------|------|--------|------|-----------|
+| **K2** | 异步与并发安全 | P2 | A26 / I2 | async 工具 / LLM 打点接入、多进程文件锁、Sampler 采样器、SpanEvent 时间点事件、流式 token 统计；状态栈已是实例级 ContextVar，跨协程传播已就位，依赖 A26 与 I2 前置落地 |
+| **K3（高阶）** | 评估工具高阶能力 | P2 | K1 | 工具选择准确率、LLM-as-Judge 打分、双 Agent Win Rate、A/B 对比、按问题集批量回归评估、按问题维度的成本归因 |
+| **K4** | Web UI / 可视化看板 | P2 | K1 | 瀑布图看板（独立 HTML / SVG 或轻量前端），只读本地 store 数据、不引服务依赖 |
+| **K5** | 外部上报对接（OpenTelemetry / Langfuse） | P2 | K1 | 可选 OTLP / Langfuse exporter，与「零依赖 / 离线可跑」红线隔离，做成独立可选 exporter、默认不装 |
 
 ---
 
@@ -1220,7 +1245,7 @@ Trace Token 成本日报（K3）
 - [x] 快速上手命令是 Windows PowerShell、使用仓库自带 runner（`python tests\trace\test_trace.py`，不用 pytest）；最小示例 ≤20 行、无需 API Key；含 SQLite 示例和 4 种典型用法；
 - [x] API 速查按类分小节，列出所有对外方法的参数/返回/说明，含 `end_span` 幂等与 `end_time` 参数、SQLiteStore / InMemoryTraceStore API 说明；
 - [x] 第十章包含 15 条关键设计决策、19 条常见坑（每条都有可执行解法）、7 条 Windows 平台注意事项；
-- [x] 测试章节列出 K1 74 项 + JsonlStore 12 项 + SQLiteStore 11 项 + K3 评估器 33 项 + K3 成本日报 19 项覆盖点 + 关键回归断言 + 全绿基线（149 通过、0 跳过、0 失败）；
+- [x] 测试章节列出 K1 88 项 + JsonlStore 12 项 + SQLiteStore 12 项 + K3 评估器 33 项 + K3 成本日报 19 项覆盖点 + 关键回归断言 + 全绿基线（164 通过、0 跳过、0 失败）；
 - [x] 演进路线与《演进路线图.md》K1-K5 编号一致；待办能力已列入第十二章，版本号按 `1.x.y` 倒叙维护；
 - [x] 章节数量、顺序、编号与其余模块文档（tools/memory/skills/mcp/context/database）一致（开篇 → 一～十三 → 附录）；
 - [x] 全文无"待补充/TBD"残留，未实现项已列入第十二章；

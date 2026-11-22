@@ -1263,24 +1263,26 @@ except DatabaseError:                  # 或统一兜底（等价于 except Valu
 
 按优先级排（与 `docs/演进路线图.md` 编号对齐；database 模块在路线图里独立为 **J 模块（持久化层）**）。
 
-### 12.1 初版已交付
+### 12.1 已交付
 
-- **初版**（v1.0.0，2026-11-03；后续的 MySQL 后端、异常体系扩张、测试框架迁移到 `tests/database/` + `tests/_runner.py`、文档对齐代码等均并入本版本，**不单独计版本**）：`fast_agents/database/` **10 个源码文件**，包含**关系型双后端 + 向量型**两套平行后端 + 统一异常体系。
-  - **关系型**：`SQLiteClient` 支持连接与上下文事务、基础 SQL 通道（execute / executemany / executescript / query）、三种声明式建表 + 幂等建索引 + `migrate=True` 补列、CRUD（insert / batch_insert / select / select_one / select_where / select_one_where / count / update / delete）、读侧谓词下推（10 种 FilterOp + AND + 单/多列排序 + limit/offset + `Query.columns` 列投影）、写侧条件写入（`upsert` + `update_where` / `delete_where` + `SqlExpr`）、标识符白名单防注入；非内存库默认开启 WAL + foreign_keys，并显式设 `PRAGMA busy_timeout`。
-  - **向量型**：`VectorClientBase`（12 个抽象方法，与 `DatabaseClientBase` 平行）+ `VectorFilter` 元数据过滤模型（EQ/NE/GT/…/IN/AND/OR）+ `ChromaClient` 首个向量后端（本地 `PersistentClient` / 远端 `HttpClient` 双模式，`chromadb` 走可选依赖 extras；含"少一次往返 / delete 精确计数 / dimension 真正生效 / add 自动分块 / 关匿名遥测 / 健壮性补强 / drop 仅吞不存在"等优化）。
-  - `tests/database/` 下 **4 个**测试文件、共 **184 项**，全绿基线 **183 通过 / 1 跳过**（`test_database.py` 94 + `test_database_sqlite.py` 24 + `test_database_mysql.py` 33 + `test_database_chroma.py` 32；1 项跳过为需真实 MySQL 的端到端用例，Chroma 32 项需 `fast-agents[chroma]`）；配套 **6 个**示例（含 `mysql_usage.py`）。
+| 编号 | 任务 | 完成版本 | 落点 |
+|------|------|---------|------|
+| ✅ **初版** | 三种声明式建表 + 幂等 migrate + DDL / CRUD / 事务 + 读侧谓词下推 + 写侧条件写入 + count / batch_insert / upsert | v1.0.0 | `fast_agents/database/` **10 个源码文件**：`SQLiteClient`（默认后端）+ `database_client_base.py` + `schema.py` + `query.py` + `errors.py` + 向量三件套；`tests/database/` **4 个**测试文件、共 184 项（183 通过 / 1 跳过） |
+| ✅ **J3** | memory / trace / profile 迁移到 `SQLiteClient`（含 B9） | v1.0.0 | `memory/` 三个 SQLite 后端 + `trace/sqlite_store.py` 全部改走 `ensure_schema(migrate=True)` + 统一连接与 PRAGMA，B9（WAL + 并发安全）随之落地 |
+| ✅ **J4（MySQL）** | `MySQLClient` 可选后端 | v1.0.0 | `mysql_client.py`：接口与 `SQLiteClient` 100% 对齐，方言层适配，`pymysql` 走 `pip install fast-agents[mysql]` |
+| ✅ **J5** | 统一异常体系 | v1.0.0 | `errors.py`：`DatabaseError` 基类 + 7 个语义子类，三后端共用、不再裸抛驱动原生异常 |
+| ✅ **J6** | upsert | v1.0.0 | `SQLiteClient` / `MySQLClient` 的 `upsert()`（SQLite `ON CONFLICT DO UPDATE`、MySQL `ON DUPLICATE KEY UPDATE`） |
 
 ### 12.2 待办（按优先级）
 
-1. **J2 · 连接池 / 线程安全 + busy_timeout 收口**（P2，依赖 G2 异步并发）—— 现状：`SQLiteClient` 是单连接，线程不安全；跨线程用会偶发 `database is locked`。**部分已落地**：`_connect()` 已显式 `PRAGMA busy_timeout = timeout * 1000`（与构造参数同口径，默认 5s；上层传 `timeout=10.0` 即可对齐 10s 口径）。**剩余目标**：用 `threading.local` 给每个线程一个连接（或简单连接池）；单独暴露 `busy_timeout` 参数以便与连接 timeout 解耦。**为什么连接池现在不做**：fast_agents 当前是单线程同步模型（ReActAgent 顺序跑），连接池是 G2 异步并发之后的需求，提前做是过度设计。
-2. **J3 · memory/trace/profile 三模块迁移到 SQLiteClient（含 B9 落地）**（**P1**）—— **已落地**：memory 三个 SQLite 后端（`sqlite_store.py` / `session_store.py` / `profile_store.py`）与 `trace/sqlite_store.py` 均已迁移到 `SQLiteClient`（`ensure_schema(..., migrate=True)` 建表 / 迁移 + 统一连接与 PRAGMA），不再各自手写 `CREATE TABLE` + `user_version` 迁移；B9（SQLite WAL + 并发安全）随迁移自然落地。**剩余**：`trace/jsonl_store.py` 等非 SQLite 落盘路径保持原样；后续新增的上层 store 一律走 `DatabaseClientBase` 抽象。
-3. **J4 · MySQL / Postgres 后端**（P2，依赖 G4 打包发布）—— **MySQL 已落地**：`fast_agents/database/mysql_client.py`（`MySQLClient`）接口与 `SQLiteClient` 100% 对齐，`pymysql` 走 `pip install fast-agents[mysql]` 可选依赖。**剩余**：`postgres_client.py` 未实现——有了 MySQL 这版样板，照着写 Postgres 即可，上层 0 改动切换。**为什么 Postgres 现在不做**：现阶段目标场景仍是本地 / 小团队 Agent，MySQL 已覆盖「需要网络数据库」的需求；等 G4 PyPI 发布、出现明确的 Postgres 部署诉求时再做。
-4. **J5 · 统一异常体系**（**已交付，含扩张**）—— **已落地**：`errors.py` 定义 `DatabaseError` 基类（继承 `ValueError`）+ 7 个语义子类（`DatabaseConnectionError` / `DatabaseOperationalError` / `DatabaseValidationError` 三大层 + `DatabaseIdentifierError` / `DatabaseIntegrityError` / `DatabaseQueryError` / `DatabaseDriverMissingError` 四个场景），`SQLiteClient` / `MySQLClient` / `ChromaClient` 三后端及其依赖的 `schema.check_ident` 已全部按语义接入、不再裸抛驱动原生异常，零破坏。**剩余目标**：待出现更细的分流诉求时再考虑 `NotFoundError` 等；按「没有第二个真实使用方不提前造抽象」的原则暂不加。
-5. **J6 · upsert**（P3）—— **单条已落地**：`upsert(table, data, conflict_keys, update_columns=None)` 已提供 `ON CONFLICT DO UPDATE`；`batch_insert` 提供参数化批量插入。**剩余目标**：批量 upsert（一次多条冲突更新），等出现真实批量冲突写场景再做。
-6. **J7 · 语义记忆（`memory/semantic_store.py`）接入 `VectorClientBase`**（P2，依赖 J3 节奏；本轮新增编号，`演进路线图.md` 的 J 模块同步随后）—— 现状：database 模块已提供 `VectorClientBase` + `ChromaClient`，但 `memory/` 层尚未接入；本轮刻意**不动** `semantic_store.py`，先把 database 层的向量抽象站稳。目标：让语义记忆通过 `VectorClientBase`（默认 `ChromaClient`）落盘，不在 memory 层直接 `import chromadb`，与关系型一样"只依赖抽象"。**为什么现在不做**：先把 database 层的向量抽象与首个后端交付、验收，再动上层，避免一次改动跨两层、破坏面过大。
-7. **J8 · 远端 Chroma Server / 其他向量后端**（P3）—— 现状：`ChromaClient` 已支持远端 `HttpClient` 模式（`host/port/ssl/headers/tenant/database`），但尚未在真实服务端验证；FAISS / Milvus / pgvector 后端未实现。目标：补齐更多向量后端，均实现同一套 `VectorClientBase`。**为什么现在不做**：等出现真实的多机 / 大库检索需求再做，避免为不存在的问题提前造轮子。
+| 编号 | 任务 | 优先级 | 依赖 | 一句话说明 |
+|------|------|--------|------|-----------|
+| **J2** | 连接池 / 线程安全 + `busy_timeout` 收口 | **P2** | K2 异步并发 | 现状单连接、线程不安全，跨线程用偶发 `database is locked`；`_connect()` 已显式设 `PRAGMA busy_timeout`，剩余用 `threading.local` 每线程一连接 + 独立 `busy_timeout` 参数；单线程同步模型下连接池是 K2 之后的需求 |
+| **J4（Postgres）** | Postgres 后端 | P2 | G1 打包发布 | 有 MySQL 这版样板，照着写 `postgres_client.py` 即可、上层 0 改动切换；等 PyPI 发布、出现明确 Postgres 部署诉求时再做 |
+| **J7** | `Query.filters` 支持 OR / 嵌套条件组 | P2 | — | `Filter` 只表达叶子条件、顶层隐式 AND，而向量 `VectorFilter` 已支持 `op=AND/OR + 嵌套`；目标给 `Filter` 加逻辑分组、两后端递归编译为带括号的参数化 SQL |
+| **J8** | 远端 Chroma Server / 其他向量后端 | P3 | — | `ChromaClient` 已支持远端 `HttpClient` 模式但未在真实服务端验证；FAISS / Milvus / pgvector 后端未实现，等真实多机 / 大库检索需求再做 |
 
-当下最明显的空缺：**跨模块迁移已基本收口，剩下 Postgres 后端（J4 剩余）与远端 Chroma 服务端验证（J8）**——database 模块的建表 / CRUD / 读侧谓词下推 / 写侧条件写入（upsert + update_where/delete_where）已足以覆盖 memory / trace 后端的全部现有用法；下一步按 J4 / J7 / J8 推进。
+> **当下最明显的空缺**：跨模块迁移已基本收口，剩下 **Postgres 后端（J4 剩余）与远端 Chroma 服务端验证（J8）**——建表 / CRUD / 读侧谓词下推 / 写侧条件写入（upsert + update_where / delete_where）已足以覆盖 memory / trace 后端的全部现有用法；下一步按 J4 / J7 / J8 推进。
 
 ---
 

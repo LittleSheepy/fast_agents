@@ -1,6 +1,6 @@
 # Skill 模块编写说明
 
-> **对应代码**：`fast_agents/skills/`（已同步至最新代码，2026-10-29）
+> **对应代码**：`fast_agents/skills/`（已同步至最新代码，2026-11-17）
 > **读者**：想给 FastAgents 增加技能、或想照着这套思路给自己的 Agent 加技能机制的人
 > **本文只写「已经实现的东西」**。「还没做但打算做」的部分一律放在 `docs/演进路线图.md`，本文不重复。
 
@@ -29,9 +29,22 @@
 
 | 版本 | 日期 | 变更 | 作者 |
 |------|------|------|------|
-| 1.0.0 | 2026-10-27 | 首次编写，逐行对齐 `fast_agents/skills/` 真实实现 | — |
+| 1.9.1 | 2026-11-18 | 【K1】技能trace打点融合修正：对齐trace模块在94bf92b新增的`attributes`/`set_attribute`/`SpanKind.SKILL`/finish自动落盘能力——①四个入口（`load_skill`/`read_reference`/`read_asset`/`run_script`）的`kind`由字符串`"skill"`改为枚举`SpanKind.SKILL`，统一使用`attributes`承载框架标准属性（`skill.name`/`skill.op`/`asset.size_bytes`/`script.exit_code`等，命名空间点号风格），`metadata`不再承载skill.*键；②所有错误路径（技能不存在、路径穿越、文件缺失、参数校验失败、命令注入拦截、敏感路径拦截、危险命令拦截、脚本退出码非0、超时、异常）显式传`status=SpanStatus.ERROR`，修复原代码中`error`不自动翻转status导致错误span被记为SUCCESS的bug；③每个span补`skill.op`标识操作类型（`load`/`read_reference`/`read_asset`/`run_script`），便于评估器按op聚合；④`SpanKind`/`SpanStatus`改为延迟导入（模块级`_ensure_trace_imports()`），不传tracer时零开销且避免skills→trace反向强依赖；测试基线保持**84/84**全绿；零新增第三方依赖 | wxy |
+| 1.9.0 | 2026-11-18 | 【C8】同名技能冲突消解落地（对齐 Claude Code 分层作用域）：新增来源优先级 `builtin` < `user` < `project` < `custom` < `code`，同名技能按优先级高者覆盖低者、扫描时打印覆盖警告；代码型技能（`register()` / `BaseSkill` / `@skill`）恒为最高优先级；新增 `SkillConflictError` 异常与 `get_skill_source()` / `list_skill_conflicts()` 两个调试 API。顺带刷齐文档欠账：§四 异常类计数 10→11、§五 assets 文本扩展名补 `.tsv`/`.htm`、§七 `__init__.py` 导出补 `AssetNotFoundError` / `SkillConflictError`、§八 补 `scripts/<脚本名>.schema.json` 示例、§九 `get_tools()` 12→13 件套、§十一 测试基线 60/64→84/84、§十二 补 C18/C8 归档、§十三 参考补 `file_skill_dependency_demo.py`、附录 import 补 `AssetNotFoundError` | wxy |
+| 1.8.1 | 2026-11-18 | 【C12】`check_skill_dependencies` 返回结构统一（方案B）：技能不存在与正常两个分支统一返回 6 个 key（`skill_name`/`ok`/`errors`/`warnings`/`missing_tools`/`missing_skills`）；新增 `_collect_dependency_report()` 结构化收集，`_check_dependencies` 收敛为薄封装（签名与返回类型 `List[str]` 不变），`load_skill` 两处调用零改动；`missing_tools`/`missing_skills` 返回真实去重清单（未注册工具 / 未找到·被禁用·版本不满足的技能）；LLM 工具返回文案附结构化摘要；新增 3 项测试，测试总数 81→**84/84** 全绿 | wxy |
+| 1.8.0 | 2026-11-18 | 【C18】方案B对齐主流规范，一级元数据回归极简：① **脚本参数Schema从SKILL.md frontmatter外移到`scripts/&lt;脚本名&gt;.schema.json`**（和同名`.py`脚本同目录，改完脚本顺手改schema，脚本和schema文件绑定便于维护），frontmatter不再写长scripts段；② **沙箱三字段（`allow_network`/`allow_write_paths`/`env_whitelist`）从`SkillMetadata`上移到SkillLoader/Registry/Middleware初始化全局配置**，宿主统一管理沙箱策略，每个技能默认追加自身`tmp/`到可写路径白名单；③ 保留参数校验全部能力（类型/必填/enum/范围校验、类型自动转换、命令注入防护、敏感路径拦截），仅调整schema读取位置；④ `SkillMetadata`一级元数据仅保留`name/description/version/tags/requires`等核心字段，对齐Anthropic Agent Skills规范，单技能常驻token约100；新增3项C18测试，测试总数76/76全绿；工具总数保持13个不变 | wxy |
+| 1.7.0 | 2026-11-18 | 【C15】静态资产（assets）完整读取（遵循三级渐进式披露，对齐 Anthropic/Microsoft 主流实践）：`load_skill` 扫描 `assets/` 目录（文本/二进制分流）；新增 `read_skill_asset` LLM 工具（路径穿越防护、文本按 UTF-8 返回内容、二进制/超大文件仅返回元信息）；**`assets` 清单只进入 `SkillLoadResult`**（Level 2 加载后通过 `full_prompt` 展示），不进入 `SkillMetadata` 常驻索引，避免随 function schema 常驻 token 膨胀；`full_prompt` 分"文本资源/二进制资源"两段展示；工具总数 12→13；6 项 C15 测试通过 | wxy |
+| 1.6.2 | 2026-11-18 | 【文档】同步死代码 `get_skill_index_text()` 删除（commit `27e2d7a`）：7.4 节介绍改为已移除说明、10.8 坑标注已清理、示例与 C15 条目收窄 | — |
+| 1.6.1 | 2026-11-17 | 【文档】第十二章「下一步演进路线」按《xx模块编写说明模版.md》改为 **12.1 已交付 / 12.2 待办（按优先级）** 两张表，编号对齐《演进路线图.md》C 系列 | — |
+| 1.6.0 | 2026-11-17 | 【C14】技能热重载：mtime 增量检测 + 后台监控线程 + 三个管理工具 | — |
+| 1.5.0 | 2026-11-17 | 【C6-2】脚本沙箱增强：参数 Schema 校验与类型转换、命令注入防护、敏感路径拦截、网络默认禁用、危险命令扫描 | — |
+| 1.4.0 | 2026-11-17 | 【C12】技能依赖与前置检查：工具 / 技能 / 框架版本 / 循环依赖校验 + `check_skill_dependencies` 预检 | — |
+| 1.3.0 | 2026-11-17 | 【C11】技能运行时启用 / 禁用 + 按 tag 批量开关（8 个 registry API + 4 个 LLM 工具） | — |
+| 1.2.0 | 2026-11-17 | 【C10】`allowed_tools` 落地生效：加载技能后按白名单过滤 LLM 可见工具，卸载自动恢复全量 | — |
+| 1.1.0 | 2026-11-17 | 【P0】接入 trace 打点、统一异常体系 `errors.py`、`build_skill_tools()` 工具工厂、默认扫描路径统一 `.skills`、脚本执行安全加固 | — |
+| 1.0.0 | 2026-10-27 | **初版**：首次编写，逐行对齐 `fast_agents/skills/` 真实实现 | — |
 
-> 约定：以后每次改动 `fast_agents/skills/` 的对外行为（新增工具、改元数据字段、改加载层级），都要在这里补一行。
+> 约定：本文档当前版本为**初版**（v1.0.0）；以后每次改动 `fast_agents/skills/` 的对外行为（新增工具、改元数据字段、改加载层级），都要在表格**最上方**补一行新版本——更新记录按版本号**倒序**维护，最新的排在最上。
 
 ---
 
@@ -171,12 +184,13 @@ AutoGen 生态中出现了以 `SKILL.md` 为载体的 Skill 叫法，运行时�
 ```text
 fast_agents/
 └── skills/                          # ← 模块目录（单数 skills 这个包名本身就是复数，注意区分）
-    ├── __init__.py                  # 统一导出 + __version__
-    ├── models.py                    # SkillMetadata / SkillLoadResult
+    ├── __init__.py                  # 统一导出（技能类 + 模型 + 11 个异常类）
+    ├── models.py                    # SkillMetadata / SkillLoadResult / ScriptParam / ScriptSchema
     ├── base.py                      # BaseSkill 基类 + @skill 装饰器
-    ├── loader.py                    # 文件型技能：扫描 / 解析 / 加载 / 跑脚本
-    ├── registry.py                  # 代码型 + 文件型统一注册表 + 三个内置工具
-    ├── middleware.py                # 注入 system prompt + 管理已加载技能生命周期
+    ├── errors.py                    # 统一异常体系（SkillError 及 11 个子类）
+    ├── loader.py                    # 文件型技能：扫描 / 解析 / 加载 / 沙箱跑脚本 / 热重载检测
+    ├── registry.py                  # 代码型 + 文件型统一注册表 + 13 个内置工具 + build_skill_tools()
+    ├── middleware.py                # 注入 system prompt + LRU 生命周期 + 工具白名单 + 热重载线程
     ├── agent_integration_example.py # 接入已有 Agent 的 5 个接入点示范
     └── code_skill_example.py        # 代码型技能两种写法的完整示例
 ```
@@ -220,7 +234,7 @@ fast_agents/
 
 ### 4.3 三条主线
 
-模块虽然只有 6 个文件，但真正跑起来是三条链路，读代码时按链路读最快。
+模块源码共 9 个文件（含 `errors.py` 与两个示例），但真正跑起来是三条链路，读代码时按链路读最快。
 
 **链路 A：索引注入（每次构造 / 刷新 system prompt 时）**
 
@@ -268,7 +282,7 @@ SkillRegistry.scan()
 |------|------|--------------|--------|---------|
 | **Level 1** | 技能名 + 描述（元数据） | 每次构造 / 刷新 system prompt | `SkillRegistry.get_index_prompt()` | 约 100 字 / 技能 |
 | **Level 2** | `SKILL.md` 正文（执行指令） | 模型调 `load_skill` 之后 | 模型主动决策 | 视正文长度，官方建议 ≤5000 字 |
-| **Level 3** | `references/` 文档、`scripts/` 脚本 | 指令里提到、模型按需读取/执行 | `read_skill_reference` / `run_skill_script` | 单份文档大小 |
+| **Level 3** | `references/` 文档、`scripts/` 脚本、`assets/` 静态资源 | 指令里提到、模型按需读取/执行 | `read_skill_reference` / `run_skill_script` / `read_skill_asset` | 单份文档大小 / 文本资产 200KB 上限 |
 
 ### 5.1 Level 1：索引常驻
 
@@ -285,7 +299,7 @@ SkillRegistry.scan()
 1. 根据用户需求判断是否需要使用某个技能
 2. 使用 `load_skill` 工具加载对应技能的完整指令
 3. 按照加载后的执行流程完成任务
-4. 需要参考文档时使用 `read_skill_reference`，需要执行脚本时使用 `run_skill_script`
+4. 需要参考文档时使用 `read_skill_reference`，需要执行脚本时使用 `run_skill_script`，需要读取静态资源（模板/样例/配置等文本文件）时使用 `read_skill_asset`（二进制资产仅返回元信息，需通过脚本处理）
 
 注意：不要猜测技能的内部流程，务必先加载再执行。
 ```
@@ -310,13 +324,19 @@ SkillRegistry.scan()
 
 ## 参考文档
 - notes.md
+
+## 静态资源（assets/）      # 仅当技能带 assets/ 时出现，文本与二进制分两组
+- templates/tpl.json
 ```
+
+> **【C15】**技能带 `assets/` 时，`full_prompt` 会在末尾追加「## 静态资源（assets/）」段，文本资源与二进制资源分两组列出。
 
 模型在下一步收到这段文本，同时 `SkillMiddleware` 把它记进 `_loaded_content`，下一轮 `refresh_system_prompt()` 时它会作为「## 已加载的技能详情」追加到 system prompt 末尾——**这样后续轮次不用重复调 `load_skill`**。
 
 ### 5.3 Level 3：资源按需
 
 - `read_skill_reference(skill_name, reference_name)`：先精确匹配 `references/<name>`，匹配不到再做一次模糊匹配（大小写不敏感 + 子串包含）。
+- `read_skill_asset(skill_name, asset_name)`：【C15】读取 `assets/` 下的静态资源。**文本类扩展名**（`.md/.txt/.json/.yaml/.yml/.csv/.tsv/.xml/.html/.htm/.css/.js/.py/.bat/.cmd/.ps1/.ini/.cfg/.toml/.log/.sql`）且不超过 **200KB** 时按 UTF-8 返回正文；二进制资源（图片/字体/可执行文件等）或超过上限的大文本仅返回元信息（类型/大小/绝对路径），不返回正文，需交由 `run_skill_script` 里的脚本处理。路径穿越防护与 `read_skill_reference` 一致：`..`、绝对路径都会被拦截。支持子目录（传 `templates/report.html` 这类相对路径即可）。
 - `run_skill_script(skill_name, script_name, args)`：按扩展名挑解释器，见 [10.9](#109-跨平台注意事项)。
 
 ### 5.4 LRU 管理
@@ -330,6 +350,8 @@ load_skill("skill-c")
 再 load_skill("skill-a")                        # 命中已加载，先移除再追加（刷新 LRU）
   → ["skill-b", "skill-c", "skill-a"]
 ```
+
+> **【C10】加载的第二重效果**：技能被加载后，`allowed_tools` 会对 LLM 可见的工具做一次白名单过滤（取所有已加载技能 `allowed_tools` 的并集）；全部卸载或没有任何技能声明 `allowed_tools` 时自动恢复全量工具，详见 [7.6](#76-middlewarepy--注入与生命周期)。
 
 ---
 
@@ -347,19 +369,31 @@ load_skill("skill-c")
 | `author` | `Optional[str]` | `None` | 作者 |
 | `license` | `Optional[str]` | `None` | 许可证 |
 | `compatibility` | `Optional[str]` | `None` | 兼容性说明 |
-| `allowed_tools` | `List[str]` | `[]` | 预授权可用工具列表（**当前仅存元数据，未参与运行**） |
+| `allowed_tools` | `List[str]` | `[]` | 预授权可用工具列表（**【C10】加载技能后据此过滤 LLM 可见工具**） |
 | `tags` | `List[str]` | `[]` | 分类标签 |
+| `requires` | `List[str]` | `[]` | **【C12】**依赖的其他技能，支持版本约束如 `other-skill>=1.2.0` |
+| `requires_tools` | `List[str]` | `[]` | **【C12】**运行时必须存在的工具名 |
+| `min_fast_agents_version` | `Optional[str]` | `None` | **【C12】**最低框架版本 |
+| `max_fast_agents_version` | `Optional[str]` | `None` | **【C12】**最高兼容框架版本 |
 | `metadata` | `Dict[str, Any]` | `{}` | 自定义元数据 |
 | `skill_path` | `Optional[Path]` | `None` | **运行时字段**，技能目录路径 |
 | `skill_type` | `str` | `"file"` | **运行时字段**，`file` / `code` |
-| `source` | `str` | `"project"` | **运行时字段**，`project` / `user` / `code` / `plugin` |
+| `source` | `str` | `"project"` | **运行时字段**，`project` / `user` / `builtin` / `custom` / `code` |
+
+> **【C18方案B对齐主流规范说明】**
+> 1. `scripts_schema`（脚本参数Schema）已从SkillMetadata移除，外置到`scripts/<脚本名>.schema.json`文件，与同名`.py`脚本同目录，Level 2加载技能后扫描scripts目录读取，仅在需要运行脚本时校验参数，不随Level 1索引发送；
+> 2. `allow_network`/`allow_write_paths`/`env_whitelist`（沙箱三字段）已从SkillMetadata移除，改为SkillLoader/SkillRegistry/SkillMiddleware初始化时的全局配置参数，宿主统一管理沙箱策略，每个技能默认追加自身`tmp/`目录到可写白名单；
+> 3. 一级元数据仅保留核心字段，对齐Anthropic Agent Skills规范，单技能常驻索引token约100，避免SKILL.md开头过长。
 
 `validate()` 返回错误字符串列表（空列表 = 通过）：
 
 - `name` 非空，长度 ≤ 64；
 - `name` 必须匹配正则 `^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`——即只能小写字母 / 数字 / 连字符，不能以连字符开头结尾；
 - `name` 不能含连续连字符 `--`（注意：这条和上一条正则其实重叠，正则已经拦住了）；
-- `description` 非空，长度 ≤ 1024。
+- `description` 非空，长度 ≤ 1024；
+- **【C12】**`requires` 每项须为 `skill-name` 或 `skill-name>=1.0.0` 形式（支持 `>=` / `<=` / `==` / `>` / `<`）；
+- **【C12】**`min_fast_agents_version` / `max_fast_agents_version` 须为 `x.y.z` 形式；
+- `version` 须为语义化版本号（如 `1.0.0`，可带 `-suffix`）。
 
 ### 6.2 `SkillLoadResult`（`models.py`）
 
@@ -372,8 +406,10 @@ load_skill("skill-c")
 | `metadata` | `Optional[SkillMetadata]` | `None` | 元数据 |
 | `content` | `Optional[str]` | `None` | `SKILL.md` 原始全文（含 frontmatter） |
 | `instructions` | `Optional[str]` | `None` | 去掉 frontmatter 的正文 |
-| `scripts` | `List[Path]` | `[]` | `scripts/` 下的文件（**排除** `_` 开头的） |
+| `scripts` | `List[Path]` | `[]` | `scripts/` 下的文件（**排除** `_` 开头的和 `.schema.json` schema文件） |
 | `references` | `List[Path]` | `[]` | `references/` 下的文件（只保留 `.md/.txt/.json/.yaml/.yml`） |
+| `assets` | `List[Tuple[str, int, bool]]` | `[]` | 【C15】`assets/` 下所有文件清单（递归，跳过 `_` 开头）：每个元素是 `(相对路径, 大小字节, 是否二进制)` |
+| `scripts_schemas` | `Dict[str, ScriptSchema]` | `{}` | 【C18方案B】从`scripts/&lt;脚本名&gt;.schema.json`解析得到的参数Schema，脚本执行前自动校验参数，full_prompt会展示每个脚本的参数说明 |
 | `errors` | `List[str]` | `[]` | 错误信息 |
 | `warnings` | `List[str]` | `[]` | 警告信息 |
 
@@ -389,24 +425,35 @@ load_skill("skill-c")
 
 ```python
 from .base import BaseSkill, skill
-from .registry import SkillRegistry
-from .models import SkillMetadata, SkillLoadResult
+from .errors import (
+    SkillError, SkillNotFoundError, SkillLoadError, SkillValidationError,
+    SkillDependencyError, SkillCircularDependencyError,
+    ScriptExecutionError, ReferenceNotFoundError,
+    ScriptParamValidationError, ScriptSandboxViolationError,
+    AssetNotFoundError, SkillConflictError,
+)
 from .loader import SkillLoader
 from .middleware import SkillMiddleware
+from .models import SkillMetadata, SkillLoadResult, ScriptParam, ScriptSchema
+from .registry import SkillRegistry
 
 __all__ = [
     "BaseSkill", "skill", "SkillRegistry",
     "SkillMetadata", "SkillLoadResult", "SkillLoader", "SkillMiddleware",
+    "ScriptParam", "ScriptSchema",
+    "SkillError", "SkillNotFoundError", "SkillLoadError", "SkillValidationError",
+    "SkillDependencyError", "SkillCircularDependencyError",
+    "ScriptExecutionError", "ReferenceNotFoundError",
+    "ScriptParamValidationError", "ScriptSandboxViolationError",
+    "AssetNotFoundError", "SkillConflictError",
 ]
-
-__version__ = "1.0.0"
 ```
 
-> 注意 `__version__` 是 `skills` 包自己的版本，与 `fast_agents/version.py` 的 `__version__ = "0.0.1"` 是两回事。
+> 注意两点：① `skills/__init__.py` **目前不导出 `__version__`**（子包不单独维护版本，`fast_agents/version.py` 的 `__version__` 是框架顶层版本）；② 11 个异常类统一在 `errors.py` 定义、从这里导出，见 [7.9](#79-errorspy--统一异常体系)。
 
 ### 7.2 `models.py`
 
-两个 dataclass，没有逻辑分支，见 [第六章](#六核心数据模型)。
+四个 dataclass：核心模型 `SkillMetadata` / `SkillLoadResult`（字段见 [第六章](#六核心数据模型)），以及 **【C6-2】**新增的 `ScriptParam` / `ScriptSchema`——前者描述一个脚本参数（`name` / `type` / `required` / `default` / `enum` / `min` / `max` / `max_length`，带 `validate_value()`），后者描述一个脚本（`script_name` / `description` / `params` / `timeout`，带 `validate_args()`）。
 
 ### 7.3 `base.py` —— 代码型技能
 
@@ -466,28 +513,43 @@ REFERENCES_DIR = "references"
 ASSETS_DIR = "assets"
 ```
 
-**构造与默认路径**：`SkillLoader(extra_paths=None)`。默认加两条：
+**构造与默认路径**：`SkillLoader(extra_paths=None, default_allow_network=False, default_allow_write_paths=None, default_env_whitelist=None, default_script_timeout=30)`。默认加三条（优先级从高到低）：
 
-1. `Path.cwd() / "skills"`，`source="project"`（**注意：是 `skills`，不是 `.skills`**，详见 [10.3](#103-坑默认扫描路径有两套)）；
-2. `~/.fast_agents/skills`，`source="user"`。
+1. `Path.cwd() / ".skills"`，`source="project"`（**【C7】已统一为带点的 `.skills`**）；
+2. 框架内置：包根 `fast_agents/.skills`，`source="builtin"`；
+3. `~/.fast_agents/skills`，`source="user"`。
 
 `extra_paths` 里的路径按 `source="custom"` 追加。`add_skill_path()` 会做 `resolve()`，并且**只有目录存在才会真的加进去**（不存在就静默跳过）。
+
+【C18方案B】沙箱全局配置参数说明：
+- `default_allow_network`：全局默认是否允许脚本访问网络，默认`False`（断网，通过设置无效代理拦截）
+- `default_allow_write_paths`：全局可写路径白名单，每个技能加载时自动追加自身`tmp/`目录到白名单
+- `default_env_whitelist`：全局允许透传给脚本的环境变量白名单，默认透传PATH/SystemRoot等运行必需变量
+- `default_script_timeout`：脚本默认超时时间（秒），默认30秒，可被schema.json中声明的timeout覆盖
 
 **`scan_skills()`**：清空索引 → 遍历所有 `skill_paths` → 对每个子目录找 `SKILL.md` → 解析元数据 → 校验 → 如果 `metadata.name != skill_dir.name` 就打印警告并**强制改成目录名**。返回 `Dict[str, SkillMetadata]`。
 
 **`_split_frontmatter()`**：正则 `^---\s*\n(.*?)\n---\s*\n?`（`re.DOTALL`），拆出 YAML 块和正文。拆不到就返回 `(None, content)`——此时元数据走默认值（name 取目录名，description 取 `f"{目录名}技能"`）。
 
-**`load_skill()`**：索引为空时先 `scan_skills()` → 命中缓存直接返回 → 找不到返回 `success=False` → 读文件、拆 frontmatter、扫 `scripts/`（排除 `_` 开头）和 `references/`（限定后缀）→ 组装 `SkillLoadResult` 并缓存。
+**`load_skill()`**：索引为空时先 `scan_skills()` → 命中缓存直接返回 → 找不到返回 `success=False` → 读文件、拆 frontmatter、扫 `scripts/`（排除 `_` 开头）、`references/`（限定后缀）和 `assets/`（递归 + 文本/二进制分流，排除 `_` 开头）→ 组装 `SkillLoadResult` 并缓存。【C15 方案A】`assets` 清单**只进入 SkillLoadResult**（Level 2 加载后通过 full_prompt 展示给 LLM），不进入 SkillMetadata 常驻索引，避免随 function schema 常驻 token 膨胀，对齐 Anthropic / Microsoft Agent Skills 规范的三级渐进式披露原则。
 
 **`read_reference()`**：精确匹配失败后做模糊匹配（小写比较 + 子串包含）。
 
-**`run_script()`**：按扩展名挑解释器 —— `.py` 用 `sys.executable`；`.ps1/.bat/.cmd` 统一走 `powershell -ExecutionPolicy Bypass -File`；`.sh` 走 `bash`；其他当可执行文件直跑。参数拼成 `--key value`（`True` 只拼 `--key`，`False`/`None` 跳过）。默认 `timeout=30` 秒，`cwd` 设为技能目录，stdout/stderr 合并返回，非零退出码会附 `[退出码: N]`。
+**`run_script()`**：按扩展名挑解释器 —— `.py` 用 `sys.executable`；`.ps1/.bat/.cmd` 统一走 `powershell -ExecutionPolicy Bypass -File`。脚本扩展名先过白名单 `{".py", ".ps1", ".bat", ".cmd"}`，路径穿越直接拒。参数拼成 `--key value`（`True` 只拼 `--key`，`False`/`None` 跳过）。默认 `timeout=30` 秒，`cwd` 设为技能目录，stdout/stderr 合并返回，非零退出码会附 `[退出码: N]`。
 
-**`get_skill_index_text()`**：这是**另一套索引文本**，标题是 `## 可用技能列表`——但 Agent 实际用的是 `registry.get_index_prompt()`（标题 `## 可用技能（Skills）`）。两套并存，见 [10.8](#108-坑有两套索引文本)。
+**【C6-2】沙箱加固**（加在原有的路径穿越防护 / 扩展名白名单 / 输出截断之上）：
+
+- **参数 Schema 校验**：命中 `scripts_schema` 时按 `ScriptParam` 做类型转换与范围 / 枚举 / 长度校验，不通过返回 `参数校验失败`；未声明 Schema 的参数默认做命令注入字符检查；
+- **敏感路径拦截**：参数命中 `SENSITIVE_PATH_PREFIXES`（`C:\Windows\System32` / `SysWOW64` / `Users` 等）且不在 `allow_write_paths` 内时返回 `沙箱拦截`；
+- **危险命令扫描**：`.bat/.cmd/.ps1` 内容命中 `DANGEROUS_COMMANDS`（`format` / `reg delete` / `net user` / `Invoke-Expression` 等）直接拦截；
+- **环境变量沙箱**：仅透传 `PATH` 等必需变量 + `env_whitelist`；`allow_network=False`（默认）时把 `HTTP_PROXY`/`HTTPS_PROXY` 指向无效地址断网；
+- **输出截断**：stdout 超 `MAX_SCRIPT_OUTPUT_CHARS`（2000 字符）、stderr 超其一半时截断并附提示。
+
+索引文本统一由 `registry.get_index_prompt()` 生成（内部调用 `SkillMetadata.to_index_text()`）；原 `SkillLoader.get_skill_index_text()` 已于 commit `27e2d7a` 删除，见 [10.8](#108-坑有两套索引文本已清理)。
 
 ### 7.5 `registry.py` —— 统一注册表
 
-**构造**：`SkillRegistry(extra_skill_paths=None)`，内部立刻建一个 `SkillLoader`。
+**构造**：`SkillRegistry(extra_skill_paths=None, default_allow_network=False, default_allow_write_paths=None, default_env_whitelist=None, default_script_timeout=30, include_default_paths=True)`，内部立刻建一个 `SkillLoader`。后四个沙箱参数（**【C18】**）直接透传给 loader，宿主统一管理沙箱策略；`include_default_paths=False` 可跳过默认扫描路径（测试 / 独立示例用）。
 
 **`register(skill)`** 支持三种入参，靠特征分派：
 
@@ -498,7 +560,7 @@ ASSETS_DIR = "assets"
 | `BaseSkill` 实例 | `isinstance(skill, BaseSkill)` | 直接用 |
 | 其他 | — | `raise TypeError` |
 
-注册时若同名已存在，打印警告并覆盖。
+注册时若同名已存在，打印警告并覆盖。**【C8】**文件型技能之间按来源优先级（`builtin` < `user` < `project` < `custom` < `code`）覆盖同名者，代码型技能（`register()` / `BaseSkill` / `@skill`）恒为最高优先级。
 
 **核心方法**：
 
@@ -511,19 +573,38 @@ ASSETS_DIR = "assets"
 | `load_skill(name)` | 先查代码型，再交 loader |
 | `execute_skill` / `aexecute_skill` | 只对代码型有效；文件型返回一句「请按加载的指令执行」 |
 | `read_reference` / `run_script` | 只对文件型有效；代码型返回「不支持」 |
-| `get_index_prompt()` | Level 1 索引文本 |
-| `get_tools()` | 三个内置工具（懒加载缓存） |
-| `list_skills()` | `List[Dict]`，来自 `metadata.to_dict()` |
+| `get_index_prompt()` | Level 1 索引文本（**已剔除被禁用的技能**） |
+| `get_all_metadata()` / `get_enabled_metadata()` | 全部 / 仅启用中的技能元数据 |
+| `is_skill_disabled(name)` | **【C11】**单个技能是否被禁用 |
+| `disable_skill` / `enable_skill` | **【C11】**禁用 / 启用单个技能 |
+| `disable_skills_by_tag` / `enable_skills_by_tag` | **【C11】**按 tag 批量禁用 / 启用 |
+| `disable_all_skills` / `enable_all_skills` | **【C11】**批量开关全部技能 |
+| `get_disabled_skills()` | **【C11】**当前被禁用的技能清单 |
+| `check_skill_dependencies(name)` | **【C12】**依赖预检，统一返回 6 键：`{'skill_name','ok','errors','warnings','missing_tools','missing_skills'}` |
+| `set_middleware(mw)` / `set_tracer(tracer)` | 绑定中间件（启用禁用通知）与 trace 打点 |
+| `get_tools()` | 13 个内置工具（**裸函数**，懒加载缓存） |
+| `build_skill_tools()` | 13 个内置工具的 `StructuredTool` 版（**可直接注册进 `ToolRegistry`**） |
+| `list_skills()` | `List[Dict]`，来自 `metadata.to_dict()`，含 `disabled` 状态位 |
+| `get_skill_source(name)` | **【C8】**查询技能来源标签（`builtin` / `user` / `project` / `custom` / `code`），不存在返回 `None` |
+| `list_skill_conflicts()` | **【C8】**列出被高优先级来源覆盖的同名技能条目（调试 / 排查用） |
 
-**三个内置工具**（`_create_skill_tools()`）返回的是**裸 Python 函数**，不是 `ToolBase` 子类：
+**13 个内置工具**（`_create_skill_functions()`）返回的是**裸 Python 函数**，不是 `ToolBase` 子类；`build_skill_tools()` 再统一包成 `StructuredTool`：
 
 | 函数 | 签名 | 说明 |
 |------|------|------|
 | `load_skill` | `(skill_name: str) -> str` | 返回 `SkillLoadResult.full_prompt` |
 | `read_skill_reference` | `(skill_name: str, reference_name: str) -> str` | 转 `loader.read_reference` |
+| `read_skill_asset` | `(skill_name: str, asset_name: str) -> str` | **【C15】**转 `loader.read_asset`（文本返回内容，二进制仅返回元信息） |
 | `run_skill_script` | `(skill_name: str, script_name: str, args: Optional[Dict] = None) -> str` | 转 `loader.run_script` |
+| `list_loaded_skills` | `() -> str` | **【P0】**列出当前已加载技能（绑 `ToolRegistry` 后替换为真实实现） |
+| `disable_skill` / `enable_skill` | `(skill_name: str) -> str` | **【C11】**禁用 / 启用单个技能 |
+| `disable_skills_by_tag` / `enable_skills_by_tag` | `(tag: str) -> str` | **【C11】**按 tag 批量开关 |
+| `check_skill_dependencies` | `(skill_name: str) -> str` | **【C12】**加载前预检依赖 |
+| `enable_skill_hot_reload` | `(interval: float = 2.0) -> str` | **【C14】**开启热重载后台轮询 |
+| `disable_skill_hot_reload` | `() -> str` | **【C14】**关闭热重载 |
+| `reload_skills_now` | `() -> str` | **【C14】**立即手动重扫一次 |
 
-> 这三个函数的 **docstring 就是给模型看的工具描述**，靠 `StructuredTool.from_function` 自动抽取成 schema。所以改这三个函数时，docstring 不能乱写。
+> 这些函数的 **docstring 就是给模型看的工具描述**，靠 `StructuredTool.from_function` 自动抽取成 schema。所以改这些函数时，docstring 不能乱写。
 
 ### 7.6 `middleware.py` —— 注入与生命周期
 
@@ -535,6 +616,8 @@ SkillMiddleware(
     auto_inject_index: bool = True,             # 是否自动注入 Level 1 索引
     unload_after_turn: bool = False,            # 是否每轮结束就卸载已加载技能
     max_loaded_skills: int = 5,                 # LRU 上限
+    tracer=None,                                # 【P0】TraceLogger，技能操作打点
+    strict_tool_filter: bool = False,           # 【C10】True=调用越权工具直接拦截
 )
 ```
 
@@ -548,7 +631,12 @@ SkillMiddleware(
 | `after_agent_turn()` | 每轮对话结束 | 若 `unload_after_turn=True`，清空已加载技能 |
 | `_mark_skill_loaded(name, content)` | 内部 | 维护 LRU，超限弹出最旧的 |
 | `unload_skill(name)` / `clear_loaded_skills()` | 手动 | 卸载单个 / 全部 |
-| `get_loaded_skills()` / `get_stats()` / `get_tools()` | — | 查看状态 / 取三个内置工具 |
+| `get_loaded_skills()` / `get_stats()` / `get_tools()` | — | 查看状态 / 取 13 个内置工具 |
+| `bind_tool_registry(tr)` | `ReActAgent._init_skills` 时 | **【C10】**绑定工具表，算出并应用 `allowed_tools` 白名单 |
+| `get_filtered_tools()` / `get_filtered_tools_description()` | 取工具表 / 刷提示词时 | **【C10】**返回白名单过滤后的工具列表 / 工具描述文本 |
+| `get_filtered_openai_tools()` / `get_filtered_anthropic_tools()` | 组装 LLM 请求时 | **【C10】**返回过滤后的 OpenAI / Anthropic tools schema |
+| `is_tool_allowed(name)` | — | **【C10】**该工具是否在白名单内 |
+| `enable_hot_reload(interval)` / `disable_hot_reload()` / `reload_skills_now()` | 手动 | **【C14】**开启 / 关闭 / 立即触发技能热重载 |
 
 > `after_tool_call` 里的判定字符串是硬编码的中文 `"加载技能失败"`，与 `load_skill` 工具返回的错误前缀**必须保持一致**，改一处要改两处。
 
@@ -559,7 +647,7 @@ SkillMiddleware(
 | 接入点 | 位置 | 做什么 |
 |--------|------|--------|
 | 1 | `__init__` | 建 `SkillRegistry()` + `SkillMiddleware(...)`，可选 `register()` 代码型技能 |
-| 2 | `__init__` | `skill_middleware.get_tools()` 拿到三个工具，塞进自己的工具列表 |
+| 2 | `__init__` | `skill_middleware.get_tools()` 拿到工具（**新代码建议改用 `registry.build_skill_tools()`**，它直接返回 `StructuredTool`，无需手动包装） |
 | 3 | 构建 messages 时 | `skill_middleware.before_agent_run(system_prompt)` |
 | 4 | 工具调用后 | `skill_middleware.after_tool_call(name, args, result)` |
 | 5 | 每轮结束 | `skill_middleware.after_agent_turn()` |
@@ -574,6 +662,27 @@ SkillMiddleware(
 
 - **`@skill` 版**：`calculate(expression)`，先做危险关键字黑名单校验（`import`/`os`/`sys`/`__`/`exec`/`eval`/`open`/`file`/`compile`），再把 `^` 替换成 `**`，最后 `eval(expr, {"__builtins__": {}}, safe_dict)`。
 - **`BaseSkill` 版**：`DataAnalysisSkill`，演示覆盖 `get_instructions()`。
+
+### 7.9 `errors.py` —— 统一异常体系
+
+**【P0】新增**，把原先散落的字符串错误前缀收敛成异常类：根类 `SkillError(Exception)`，下设 11 个子类。
+
+| 异常类 | 触发场景 |
+|--------|---------|
+| `SkillNotFoundError` | 技能不存在 |
+| `SkillLoadError` | 加载 / 解析失败 |
+| `SkillValidationError` | 元数据校验不通过 |
+| `SkillDependencyError` | 依赖的技能 / 工具缺失或版本不满足（C12） |
+| `SkillCircularDependencyError` | 技能依赖成环（C12） |
+| `ScriptExecutionError` | 脚本执行失败 / 超时 |
+| `ReferenceNotFoundError` | `read_reference` 找不到文档 |
+| `AssetNotFoundError` | **【C15】**`read_asset` 找不到静态资产 |
+| `SkillConflictError` | **【C8】**同名技能冲突（按来源优先级覆盖时告警） |
+| `ScriptParamValidationError` | 脚本参数校验失败（C6-2） |
+| `ScriptSandboxViolationError` | 触发沙箱拦截（C6-2） |
+| `SkillError` | 其余技能相关错误的兜底基类 |
+
+> 对外仍以「返回错误字符串」为主（工具返回值不变），异常体系服务于内部抛出与上层捕获。
 
 ---
 
@@ -609,8 +718,11 @@ cd D:\00sheepy\01code\02alg_code_bjb\agent\fast_agents
     ├── SKILL.md
     ├── references/
     │   └── style.md
-    └── scripts/
-        └── greet.py
+    ├── scripts/
+    │   └── greet.py
+    └── assets/                 # 【C15】可选：静态资源（模板/样例/图片等）
+        └── templates/
+            └── tpl.json
 ```
 
 `.skills/hello-world/SKILL.md`：
@@ -654,6 +766,24 @@ print(f"你好，{args.name}！欢迎使用技能系统。")
 ```
 
 > 脚本参数按 `--key value` 拼，所以必须用 `argparse` 风格的命令行参数解析。
+
+**【C18】脚本的参数契约（类型 / 必填 / 枚举 / 范围）不再写在 `SKILL.md` frontmatter，而是放在与脚本同目录、同名的 `scripts/greet.schema.json` 里**。加载技能时自动扫描解析，`run_script()` 执行前按它做参数校验与类型转换；不写该文件则跳过前置校验（脚本自身的 `argparse` 仍会兜住）：
+
+`.skills/hello-world/scripts/greet.schema.json`：
+
+```json
+{
+  "name": "greet.py",
+  "description": "生成欢迎语",
+  "timeout": 10,
+  "params": [
+    {"name": "name", "type": "str", "required": true, "description": "称呼"},
+    {"name": "formal", "type": "bool", "default": false, "description": "是否正式语气"}
+  ]
+}
+```
+
+> schema 内的 `params` 支持 `type`（`str` / `int` / `float` / `bool` / `enum`）、`required`、`default`、`enum`、`min` / `max`、`max_length`；解析结果存于 `SkillLoadResult.scripts_schemas`。
 
 ### 8.3 让它跑起来
 
@@ -700,14 +830,14 @@ agent = ReActAgent(
 print(agent.run("帮我写一段社群欢迎语"))
 ```
 
-`ReActAgent` 在 `enable_skills=True` 时会自动：扫描技能目录 → 建 `SkillMiddleware` → 把三个技能工具包成 `StructuredTool` 注册进 `tool_registry` → 在 system prompt 里注入索引。发现技能时会打印 `🧩 技能系统已启用，发现 N 个技能: ...`。
+`ReActAgent` 在 `enable_skills=True` 时会自动：扫描技能目录 → 建 `SkillMiddleware` → 调 `registry.build_skill_tools()` 拿到 13 个 `StructuredTool` 注册进 `tool_registry` → 绑定工具表算 `allowed_tools` 白名单 → 在 system prompt 里注入索引。发现技能时会打印 `🧩 技能系统已启用，发现 N 个可用技能: ...`。
 
 ### 8.5 跑测试
 
 ```powershell
-# 注意：项目里的 test 与 Python 标准库同名，必须直接执行文件，不要用 -m
-python test\test_react_agent.py
-python test\test_tools.py
+# 测试目录已改名为 tests/，按脚本直接执行，不要用 -m
+python tests\skills\test_skills.py
+python tests\agents\test_react_agent.py
 ```
 
 ---
@@ -719,7 +849,7 @@ python test\test_tools.py
 ```python
 from fast_agents.skills import SkillRegistry
 
-registry = SkillRegistry(extra_skill_paths=None)
+registry = SkillRegistry(extra_skill_paths=None)   # 沙箱策略可传 default_allow_network / default_allow_write_paths / default_env_whitelist（C18）；include_default_paths=False 跳过默认扫描路径
 
 # 注册 / 注销代码型技能
 registry.register(MySkill())        # 实例
@@ -743,9 +873,24 @@ await registry.aexecute_skill("my-code-skill", **kwargs)   # 仅代码型
 registry.read_reference("demo-skill", "notes.md")          # 仅文件型
 registry.run_script("demo-skill", "hello.py", {"k": "v"})  # 仅文件型
 
+# 启用 / 禁用（C11）
+registry.disable_skill("demo-skill")
+registry.enable_skill("demo-skill")
+registry.disable_skills_by_tag("experimental")
+registry.get_disabled_skills()                # Dict[str, Any]
+registry.list_skills()                        # 含 disabled 状态位
+
+# 依赖预检（C12）
+registry.check_skill_dependencies("demo-skill")   # -> {"skill_name": str, "ok": bool, "errors": [...], "warnings": [...], "missing_tools": [...], "missing_skills": [...]}
+
+# 同名冲突（C8）
+registry.get_skill_source("demo-skill")           # -> "project" | "builtin" | "custom" | "code" | None
+registry.list_skill_conflicts()                   # -> List[Dict]，被覆盖的低优先级条目
+
 # 给 Agent 用
-registry.get_index_prompt()   # Level 1 文本
-registry.get_tools()          # [load_skill, read_skill_reference, run_skill_script]
+registry.get_index_prompt()   # Level 1 文本（已剔除被禁用技能）
+registry.get_tools()          # 13 个裸函数
+registry.build_skill_tools()  # 13 个 StructuredTool（可直接注册）
 ```
 
 ### 9.2 `SkillLoader`
@@ -759,8 +904,12 @@ loader.scan_skills()                       # Dict[str, SkillMetadata]
 loader.load_skill("demo-skill")            # SkillLoadResult
 loader.read_reference("demo-skill", "notes.md")
 loader.run_script("demo-skill", "hello.py", {"name": "x"}, timeout=30)
-loader.get_skill_index_text()              # 另一套索引文本
 loader.list_skills()                       # List[Dict]
+
+# 热重载（C14）
+loader.detect_changes(old_mtime_map)       # 增量变更检测
+loader.reload_skill("demo-skill")          # 单个技能重载
+loader.rescan_incremental()                # 增量重扫（新增 / 修改 / 删除）
 ```
 
 ### 9.3 `SkillMiddleware`
@@ -773,6 +922,8 @@ mw = SkillMiddleware(
     auto_inject_index=True,
     unload_after_turn=False,
     max_loaded_skills=5,
+    tracer=None,
+    strict_tool_filter=False,
 )
 
 prompt = mw.before_agent_run(system_prompt)                       # 注入
@@ -780,9 +931,19 @@ result = mw.after_tool_call(name, args, result)                   # 捕获 load_
 mw.after_agent_turn()                                             # 可选卸载
 mw.get_loaded_skills()                                            # List[str]
 mw.get_stats()                                                    # Dict[str, int]
-mw.get_tools()                                                    # 三件套
+mw.get_tools()                                                    # 13 件套（裸函数）
 mw.unload_skill("demo-skill")                                     # -> bool
 mw.clear_loaded_skills()
+
+# 工具白名单（C10）
+mw.bind_tool_registry(tool_registry)     # 绑定后自动算白名单
+mw.get_filtered_tools_description()      # 过滤后的工具描述文本
+mw.is_tool_allowed("calculator")         # -> bool
+
+# 热重载（C14）
+mw.enable_hot_reload(interval=2.0)
+mw.disable_hot_reload()
+mw.reload_skills_now()
 ```
 
 ### 9.4 `BaseSkill` / `@skill`
@@ -817,7 +978,7 @@ def my_func(x: str) -> str:
 from fast_agents.skills import SkillMetadata, SkillLoadResult
 
 meta.validate()        # -> List[str]，空列表表示通过
-meta.to_index_text()   # -> "- name: description"
+meta.to_index_text()   # -> "- **name** [code]: description"
 meta.to_dict()         # -> Dict
 
 result.full_prompt     # -> str（拼装好的 Level 2 文本）
@@ -851,52 +1012,46 @@ description: 生成规范的 Git 提交信息并执行提交。当用户说"提�
 description: 帮助处理 git 相关的事情
 ```
 
-### 10.3 坑：默认扫描路径有两套
+### 10.3 坑：默认扫描路径有两套（已修复，C7）
 
-| 使用方 | 默认路径 |
-|--------|---------|
-| `SkillLoader._add_default_paths()` | `Path.cwd() / "skills"`（**无点**） |
-| `ReActAgent._PROJECT_SKILLS_DIRS` | `fast_agents/.skills` + `<项目根>/.skills`（**有点**） |
+历史问题是 `SkillLoader._add_default_paths()` 扫 `cwd/skills`（无点），而 `ReActAgent` 扫 `.skills`（有点）。
 
-两套不一样。**实际接入 `ReActAgent` 时以 `.skills` 为准**，因为 Agent 会显式 `add_skill_path()`；`SkillLoader` 那条 `cwd/skills` 只在单独用 loader 时生效。
-
-**建议**：要么统一成 `.skills`（把 `loader.py` 里的 `Path.cwd() / "skills"` 改成 `Path.cwd() / ".skills"`），要么在文档里明确「单独用 loader 时要自己 `add_skill_path`」。目前是后者。
+**现已统一**：`loader._add_default_paths()` 按优先级加三条 —— `cwd/.skills`（`project`）→ 包根 `fast_agents/.skills`（`builtin`）→ `~/.fast_agents/skills`（`user`）；`ReActAgent._PROJECT_SKILLS_DIRS` 仍是 `fast_agents/.skills` + 项目根 `.skills`，两者现在指向同一套带点的 `.skills`。
 
 ### 10.4 坑：`get_tools()` 返回的是裸函数
 
-`registry.get_tools()` 返回 `[load_skill, read_skill_reference, run_skill_script]` 三个**普通函数**，不是 `ToolBase` 实例。所以：
+`registry.get_tools()` 返回 13 个**普通函数**，不是 `ToolBase` 实例；直接塞进 `tool_registry`（需要 `ToolBase`）会失败。
 
-- 直接塞进 `tool_registry`（需要 `ToolBase`）会失败；
-- `ReActAgent._init_skills()` 里做了包装：`StructuredTool.from_function(fn, name=fn.__name__)`。
+**现在有两条路**：① 用 `registry.build_skill_tools()`，它把同样 13 个函数统一包成 `StructuredTool`，可直接 `register_tool()`（`ReActAgent._init_skills()` 走的正是这条）；② 自己用 `StructuredTool.from_function(fn, name=fn.__name__)` 包一层。
 
-自己在别处接入时也要包一层。`agent_integration_example.py` 里 `self.tools.extend(skill_tools)` 这种写法，只有在自己的工具列表接受裸函数时才成立。
+`agent_integration_example.py` 里 `self.tools.extend(skill_tools)` 这种写法已过时——它假设工具列表接受裸函数，只在自建 Agent 时才成立。
 
 ### 10.5 坑：`name` 必须和目录名一致
 
 `scan_skills()` 里发现不一致时会打印警告并**强制把 `metadata.name` 改成目录名**。也就是说 frontmatter 里写的 `name` 会**被静默覆盖**——如果你靠 `name` 做索引，务必让两者一致。
 
-### 10.6 坑：`assets/` 目录扫不到
+### 10.6 坑：二进制资产不要尝试直接读正文
 
-`SkillLoader.ASSETS_DIR = "assets"` 这个常量定义了，但 `load_skill()` **只扫 `scripts/` 和 `references/`**，没有任何代码去读 `assets/`。也就是说 `assets/` 目前在加载结果里体现不出来，只能在技能指令里用相对路径手工引用。
+**（已在 v1.7.0/C15 落地，以下说明更新为行为约束，不再是未实现）**
 
-如果要用，要么改 `load_skill()` 补一段扫 `assets/`，要么就别用这个目录名，免得误以为它被自动处理了。
+`load_skill()` 会递归扫描 `assets/` 目录，并在 `full_prompt` 里把"文本资源"和"二进制资源"分两段列出；`read_skill_asset` 对二进制资源（图片/字体/可执行/非 UTF-8 编码的文本等）**不会返回正文**，只返回元信息（类型/大小/绝对路径）。如果你期望 LLM 直接读图片内容，会拿到的是提示"该文件为二进制格式，请通过脚本处理"。
 
-### 10.7 坑：`pyyaml` 没写进依赖
+使用约束：
+- 文本类资源（`.md/.txt/.json/.yaml/.yml/.csv/.py` 等）单次读取上限 **200KB**，超过也只返回元信息，需要局部内容请写脚本读取。
+- 二进制资源必须通过 `run_skill_script` 交给脚本处理（读字节、转格式、OCR、裁剪等），不要指望模型直接解析。
+- 以下划线开头的文件（如 `_cache.dat`、`templates/_partial.html`）视为内部文件，不会出现在 `assets` 清单里，也不会被 `read_skill_asset` 读到。
 
-`loader.py` 顶部 `import yaml`，但 `requirements.txt`（`openai` / `pydantic` / `python-dotenv` / `docstring-parser` / `duckduckgo-search` / `tavily-python`）和 `pyproject.toml` 的 `dependencies` 里都**没有 `pyyaml`**。
+### 10.7 坑：`pyyaml` 没写进依赖（已修复）
 
-后果：全新环境装完依赖后，只要一 import `fast_agents.skills`（因为 `registry` → `loader` → `yaml`），就会 `ModuleNotFoundError: No module named 'yaml'`。
+历史问题：`loader.py` 顶部 `import yaml`，但依赖清单里没有 `pyyaml`，全新环境一 import `fast_agents.skills`（`registry` → `loader` → `yaml`）就 `ModuleNotFoundError: No module named 'yaml'`。
 
-**修法**：在 `requirements.txt` 和 `pyproject.toml` 里各补一行 `pyyaml`（或 `pyyaml>=6.0`）。
+**现已写入**：`pyproject.toml` 的 `dependencies` 含 `pyyaml>=6.0.3`，全新环境 `uv sync` 后可直接 import `fast_agents.skills`。
 
-### 10.8 坑：有两套索引文本
+### 10.8 坑：有两套索引文本（已清理）
 
-| 方法 | 标题 | 谁在用 |
-|------|------|--------|
-| `SkillRegistry.get_index_prompt()` | `## 可用技能（Skills）` | **Agent 实际用的就是这个** |
-| `SkillLoader.get_skill_index_text()` | `## 可用技能列表` | 没有被 Agent 调用 |
+历史问题：`SkillRegistry.get_index_prompt()`（标题 `## 可用技能（Skills）`，Agent 实际在用）与 `SkillLoader.get_skill_index_text()`（标题 `## 可用技能列表`，无人调用）两套索引文本并存。
 
-两个方法的输出风格、是否附使用方法都不一样。改提示词风格时**只需要改 `get_index_prompt()`**；`get_skill_index_text()` 是遗留物，要么删掉，要么明确标注为「给单独用 loader 的场景」。
+**现已删除**：commit `27e2d7a` 移除了 `get_skill_index_text()`，索引文本统一由 `get_index_prompt()` 生成（内部调用 `SkillMetadata.to_index_text()`）；改提示词风格只需改这一处。
 
 ### 10.9 跨平台注意事项
 
@@ -950,16 +1105,15 @@ Windows 默认单条路径上限 260 字符。技能目录如果嵌得很深（`
 
 ### 11.1 现状
 
+技能模块的主测试是 `tests/skills/test_skills.py`，覆盖模型校验、三级加载、启用禁用、依赖检查、脚本沙箱、热重载等。
+
 | 测试文件 | 结果 | 说明 |
 |---------|------|------|
-| `test/test_react_agent.py` | ✅ 全过 | 含技能启用/禁用两条用例 |
-| `test/test_tools.py` | ✅ 14/14 | 工具模块主测试 |
-| `test/test_memory.py` | ✅ 全过 | 记忆模块专项 |
-| `test/test_file_tool.py` | ✅ 13/13 | 文件四件套专项 |
-| `test/test_context.py` | ✅ 16/16 | `context/` 模块专项 |
-| `test/test_mcp.py` | ✅ 10/10 | MCP 专项 |
+| `tests/skills/test_skills.py` | ✅ 84/84 | 技能模块主测试；覆盖模型校验、三级加载、启用禁用、依赖检查、脚本沙箱、热重载、静态资产、同名冲突消解等。早期 4 项 C14 热重用例的写法问题已随 `registry` 补 `scan_skills()` / `is_skill_loaded()` / `list_skills_metadata()` 便捷方法与 `middleware` 保留线程引用后全部修复 |
+| `tests/agents/test_react_agent.py` | ✅ 全过 | 含技能启用 / 禁用两条用例 |
+| `tests/mcp/test_mcp.py` | ✅ 全过 | MCP 专项 |
 
-> `test/` 与 Python 标准库的 `test` 包同名，**必须用 `python test\xxx.py` 直接执行**，不要用 `python -m test.xxx`。另外 `test/` 下**没有** `conftest.py`，每个测试文件各自在开头写 `sys.path.insert(0, 父目录)` 来保证能 import 到 `fast_agents`。
+> 测试目录已从 `test/` 改名为 `tests/`（避开与 Python 标准库 `test` 包同名），按脚本直接执行、不要用 `-m`；`tests/_runner.py` 是零依赖运行器。每个测试文件各自在开头写 `sys.path.insert(0, 父目录)` 来保证能 import 到 `fast_agents`。
 
 ### 11.2 手工验证一份技能包
 
@@ -1011,14 +1165,36 @@ print(r.run_script('你的技能名', 'hello.py', {'name': 'x'}))
 
 ## 十二、下一步演进路线
 
-本节只列**方向**，具体条目与编号以 `docs/演进路线图.md` 的 C 系列为准，这里不重复正文。
+编号以 `docs/演进路线图.md` 的 C 系列为准（其 §六 模块 C），两处编号保持一致。**P0 优化与 C6-2 / C7 / C8 / C10 / C11 / C12 / C14 / C15 / C17 / C18 十轮增强已全部落地**；下面 12.1 逐条给出完成版本与落点，12.2 只列**仍未做**的部分。
 
-- 统一默认扫描路径（[10.3](#103-坑默认扫描路径有两套)，对应 C7）；
-- 清理重复索引文本（[10.8](#108-坑有两套索引文本)）；
-- 让 `assets/` 真正被加载（[10.6](#106-坑assets-目录扫不到)）；
-- `allowed_tools` 目前只存不校验，可以让它真正参与权限控制（C10）；
-- 技能脚本沙箱（C6，`scripts/` 执行白名单 / 限时 / 限解释器）；
-- 技能依赖 / 版本管理（C8）。
+### 12.1 已交付
+
+| 编号 | 任务 | 完成版本 | 落点 |
+|------|------|---------|------|
+| ✅ **C1** | Skill 数据模型 + `SKILL.md` 解析 | v1.0.0 | `models.py`（`SkillMetadata` / `SkillLoadResult`）+ `loader._parse_skill_metadata`（YAML front matter） |
+| ✅ **C2** | `SkillRegistry` 扫描目录发现技能 | v1.0.0 | `registry.py` + `loader.scan_skills()` |
+| ✅ **C3** | 三级渐进式加载 | v1.0.0 | `loader.py` 索引 / 正文 / 资源三级（见 [第五章](#五核心机制三级渐进式加载)） |
+| ✅ **C4** | 技能工具（基础三件套） | v1.0.0 | `registry._create_skill_functions()` 的 `load_skill` / `read_skill_reference` / `run_skill_script`；现已扩展到 **13 个** |
+| ✅ **C5** | 示例技能包 | v1.0.0 | `examples/skills/`（`code_skill_demo.py` / `file_skill_demo.py` / `middleware_demo.py` 等） |
+| ✅ **P0** | 模块治理批（trace 打点 / 统一异常 / 工具工厂 / 路径统一 / 脚本安全加固） | v1.1.0 | 新增 `errors.py`；`build_skill_tools()`；`run_script()` 路径穿越与扩展名加固、输出截断、可配超时 |
+| ✅ **C7** | 统一默认扫描路径 | v1.1.0 | `loader._add_default_paths()`：`cwd/.skills`（project）→ 包根 `fast_agents/.skills`（builtin）→ `~/.fast_agents/skills`（user） |
+| ✅ **C10** | `allowed_tools` 落地生效 | v1.2.0 | `middleware.py` 白名单过滤（`get_filtered_tools()` / `get_filtered_openai_tools()` / `is_tool_allowed()`）+ `react_agent.py` 两处入口 |
+| ✅ **C11** | 技能运行时启用 / 禁用 | v1.3.0 | `registry.py` 8 个 API + `middleware.py` 事件回调 + 4 个 LLM 工具 |
+| ✅ **C12** | 技能依赖与前置检查 | v1.4.0 / v1.8.1 | `models.py` 4 个字段 + `registry.py` 校验（工具 / 技能 / 框架版本 / 循环依赖）+ `errors.py` 2 个异常 + `check_skill_dependencies`；v1.8.1 起 `check_skill_dependencies` 两分支统一 6 键，`missing_tools`/`missing_skills` 返回结构化清单 |
+| ✅ **C6-2** | `scripts/` 脚本沙箱增强 | v1.5.0 | `loader.run_script()` 九层加固（参数 Schema / 注入拦截 / 敏感路径 / 危险命令扫描 / 环境隔离等）+ `models.py`（`ScriptParam` / `ScriptSchema`） |
+| ✅ **C14** | 技能热重载 | v1.6.0 | `loader.py` mtime 增量检测（`detect_changes` / `reload_skill` / `rescan_incremental`）+ `middleware.py` 后台线程 + 3 个 LLM 工具，默认关闭 |
+| ✅ **C15** | `assets/` 静态资产完整读取 | v1.7.0 | `load_skill()` 递归扫描 `assets/`（文本/二进制分流）+ `read_skill_asset` LLM 工具（路径穿越防护、文本返回内容、二进制/超大文件仅返回元信息）；**方案A：assets 清单只进 `SkillLoadResult`**，不进 `SkillMetadata` 常驻索引，对齐 Anthropic/Microsoft 主流实践；工具总数 12→13 |
+| ✅ **C17** | 索引缓存与 1+N 扫描治理 | v1.7.0 | `loader.scan_skills()` mtime 门控命中直接返回 `_skill_index`；`registry` 全链路复用元数据字典消除 N 次重复扫描；缓存命中率高时热路径从 ~30ms 降到 ~0.05ms |
+| ✅ **C18** | 一级元数据极简（对齐主流规范） | v1.8.0 | 脚本参数 Schema 从 frontmatter 外移到 `scripts/<脚本名>.schema.json`（与脚本同目录、解析结果入 `SkillLoadResult.scripts_schemas`）；沙箱三字段（`allow_network` / `allow_write_paths` / `env_whitelist`）上移到 `SkillLoader` / `SkillRegistry` / `SkillMiddleware` 初始化全局配置；`SkillMetadata` 回归 `name` / `description` / `version` / `tags` 等核心字段，单技能常驻 token 约 100 |
+| ✅ **C8** | 同名技能冲突消解 | v1.9.0 | `loader` 按来源优先级（`builtin` < `user` < `project` < `custom` < `code`）覆盖同名技能并打印警告；新增 `SkillConflictError` + `get_skill_source()` / `list_skill_conflicts()`；多版本共存未做（待 C9 之后） |
+
+### 12.2 待办（按优先级）
+
+| 编号 | 任务 | 优先级 | 依赖 | 一句话说明 |
+|------|------|--------|------|-----------|
+| **C9** | 技能市场 / 远程安装 | **P2** | C12（已完成） | 从 URL / Git 拉取技能包，按 `name` 校验后安装 |
+| **C16** | 技能执行结果缓存 | **P2** | C3 | 相同参数脚本结果缓存，减少重复 IO 与进程启动开销 |
+| **C8** | 技能多版本共存 | **P3** | C9（技能市场） | 同名技能冲突消解已随 C8 落地（v1.9.0）；剩「同一技能多版本共存 + 版本约束自动选版本」，**排在 C9 技能市场之后**——单机技能目录下无多来源冲突，无前置需求 |
 
 ---
 
@@ -1026,12 +1202,12 @@ print(r.run_script('你的技能名', 'hello.py', {'name': 'x'}))
 
 **仓库内**
 
-- `fast_agents/skills/`（`__init__.py` / `models.py` / `base.py` / `loader.py` / `registry.py` / `middleware.py`）
+- `fast_agents/skills/`（`__init__.py` / `models.py` / `base.py` / `errors.py` / `loader.py` / `registry.py` / `middleware.py`）
 - `fast_agents/skills/agent_integration_example.py`、`fast_agents/skills/code_skill_example.py`
 - `fast_agents/agents/react_agent/react_agent.py`、`fast_agents/agents/react_agent/prompt.py`
-- `docs/Skill编写指南.md`（面向使用者的教程，含 frontmatter 字段详解与示例，偏「怎么写」）
 - `docs/演进路线图.md`（C 系列条目）
-- `test/test_react_agent.py`
+- `tests/skills/test_skills.py`、`tests/agents/test_react_agent.py`
+- `examples/skills/`（`code_skill_demo.py` / `file_skill_demo.py` / `middleware_demo.py` / `enable_disable_demo.py` / `dependency_demo.py` / `file_skill_dependency_demo.py` / `script_sandbox_demo.py` / `hot_reload_demo.py` 等）
 
 **外部**
 
@@ -1046,15 +1222,14 @@ print(r.run_script('你的技能名', 'hello.py', {'name': 'x'}))
 
 改动 `fast_agents/skills/` 之后，逐条打勾：
 
-- [ ] `python -c "from fast_agents.skills import SkillRegistry, SkillLoader, SkillMiddleware, BaseSkill, skill"` 无报错；
-- [ ] `python test\test_react_agent.py` 全过（含两条技能用例）；
+- [ ] `python -c "from fast_agents.skills import SkillRegistry, SkillLoader, SkillMiddleware, BaseSkill, skill, ScriptParam, ScriptSchema, SkillError, AssetNotFoundError, SkillConflictError"` 无报错；
+- [ ] `python tests/skills/test_skills.py` 全过；`python tests/agents/test_react_agent.py` 全过（含两条技能用例）；
 - [ ] 新增 / 修改的技能包能被 `scan()` 发现，且 `name` 没被强制改写（没打印告警）；
 - [ ] `get_index_prompt()` 的输出格式没被意外破坏（标题、`[代码]`/`[文件]` 标签、使用方法段落）；
 - [ ] `full_prompt` 的五个段落（`# Skill:` / `## 技能说明` / `## 执行指令` / `## 可用脚本` / `## 参考文档`）顺序与内容正确；
-- [ ] `load_skill` / `read_skill_reference` / `run_skill_script` 三个函数的 **docstring** 仍然准确（它们是给模型看的工具描述）；
+- [ ] 13 个内置工具的 **docstring** 仍然准确（它们是给模型看的工具描述）；
 - [ ] `SkillMiddleware.after_tool_call()` 里判定的错误前缀 `"加载技能失败"` 与 `load_skill` 实际返回的前缀一致；
 - [ ] `SKILL_FILENAMES` / `SCRIPTS_DIR` / `REFERENCES_DIR` / `ASSETS_DIR` 常量没被改坏；
 - [ ] 新增字段后同步更新了 `SkillMetadata.to_dict()`；
 - [ ] 本文档的 [第六章](#六核心数据模型)、[第九章](#九api-速查) 已同步更新；
 - [ ] 本文档 [一、更新历史](#一更新历史) 加了一行。
-```
