@@ -14,7 +14,7 @@
   - 另有 **database（持久化基础服务）** 与 **trace（全链路追踪）** 两个基础设施模块。
 - **依赖**：
   - 核心（已有）：`openai>=3.37`、`pydantic>=2.14`、`python-dotenv>=1.2`、`docstring-parser>=0.18`、`pyyaml>=6.0`；
-  - 可选（内置搜索用）：`duckduckgo-search>=8.1`（默认、免费无需 key）、`tavily-python>=0.8`（需 `TAVILY_API_KEY`）；
+  - 可选（内置搜索用，对应 extras `search`）：`duckduckgo-search>=8.1`（默认、免费无需 key）、`tavily-python>=0.8`（需 `TAVILY_API_KEY`）；装法 `pip install fast-agents[search]`；
   - "零重型依赖"指**不引编排框架与 SDK**（如 MCP 模块零依赖手写 JSON-RPC、trace 模块仅用标准库+pydantic），非"零第三方包"。
 - **Python >= 3.10**；包管理用 uv（仓库自带 `第0步uv_安装.bat` ~ `第3步uv_add.bat`）。
 - 仓库：<https://gitee.com/LittleSheepy/fast_agents>（镜像 <https://github.com/LittleSheepy/fast_agents>）。
@@ -93,6 +93,7 @@ python examples\trace\basic_usage.py
   - **LF**（`\n`）：`.sh` / `.json` / `.toml` / `.yml` / `.yaml` / `.cfg` / `.ini` / `.gitignore` / `.gitattributes`；
   - **二进制**（不处理换行）：`.png / .jpg / .pdf / .zip / .db / .sqlite / .pyc` 等。
 - 交付前逐字节校验：裸 LF=0（CRLF 文件）、裸 CR=0。
+- 添加CR之前一定要确认是不是LF，你经常在CRLF加CR，成了CRCRLF，这一点切记。
 
 ### 🔴 R5 —— SQL 必须参数化
 - 任何 SQL 一律用参数绑定（`?` 位置参数或 `:name` 命名参数）防注入；
@@ -117,6 +118,8 @@ python examples\trace\basic_usage.py
 - 每次回答一定要重新clone一次仓库。
 - 
 ### 🔴 R11 —— 只考虑windows平台，不考虑跨平台。
+
+### 🔴 R12 —— 禁止随意删除我的中文注释。
 
 ---
 
@@ -163,18 +166,14 @@ python examples\trace\basic_usage.py
 ### 6.1 测试入口有：main(测试所有，调用run_all)、main_of_new_add(AI新加测试要放这里一份)
 - 每个测试文件有两个入口：`main` 和 `main_of_new_add`
 - `main`:测试所有，调用run_all
-```python
-import os
-import sys
+- `main_of_new_add`:AI新加测试也要放这里一份，以便我能只运行到测试的。
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+```python
+from tests._runner import run_all
 
 def main():
-    from tests._runner import run_all
     raise SystemExit(run_all(globals()))
-```
-- `main_of_new_add`:AI新加测试也要放这里一份，以便我能只运行到测试的。
-```python
+
 def main_of_new_add():
     """ 新添加的测试在这里跑
     1.跑新加的测试
@@ -185,6 +184,11 @@ def main_of_new_add():
 
     # AI新添加的测试(AI可以删除覆盖)
     test_enter_transaction_failure_raises_operational_error_not_attributeerror() # AI新加的测试
+    
+if __name__ == "__main__":
+    print("")
+    main_of_new_add()
+    main()
 ```
 
 ### 6.2 不要使用pyterst
