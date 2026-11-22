@@ -6,7 +6,12 @@
 - ``SpanRecord``：单条 Span 的持久化记录模型（pydantic v2 BaseModel）；
 
 最小字段集对齐路线图 G1：时间戳 / 类型 / 输入 / 输出 / 耗时 / session_id；
-额外补充推荐字段：trace_id / span_id / parent_id / name / status / error / metadata。
+额外补充推荐字段：trace_id / span_id / parent_id / name / status / error / metadata / attributes。
+
+字段分工（与 OpenTelemetry / LangChain 等主流框架对齐）：
+- ``metadata``：**用户业务上下文**（任意键值，由调用方自由写入，不做规范约束）；
+- ``attributes``：**框架标准属性**（键名采用命名空间点号风格，如 ``skill.name`` / ``asset.size_bytes`` / ``script.exit_code``，由打点接入层自动写入，供评估器 / OTLP 导出 / 可视化识别）；
+- 两者共存，不能互相替代，也不合并到一级字段（避免每接一种能力就扩一批一级字段）。
 """
 from __future__ import annotations
 
@@ -25,11 +30,17 @@ from ..utils.utils import to_str
 class SpanKind(str, Enum):
     """Span 类型。路线图最小集为 llm/tool/decision，额外留 agent/custom 作扩展。"""
 
-    LLM = "llm"           # 大模型调用（invoke/stream_invoke/embed）
-    TOOL = "tool"         # 工具调用（通过 ToolRegistry.add_hook 自动打点）
-    DECISION = "decision" # Agent 决策/推理步骤（是否调工具、最终回答）
-    AGENT = "agent"       # 一次完整 Agent run
-    CUSTOM = "custom"     # 用户自定义打点
+    LLM = "llm"             # 大模型调用（invoke/stream_invoke/embed）
+    TOOL = "tool"           # 工具调用（通过 ToolRegistry.add_hook 自动打点）
+    SKILL = "skill"         # 技能调用（）
+    MCP = "mcp"             # MCP调用（）
+    MEMORY = "memory"       # 记忆调用（）
+    DATABASE = "database"   # database调用（）
+    CONTEXT = "context"     # context调用（）
+    DECISION = "decision"   # Agent 决策/推理步骤（是否调工具、最终回答）
+    AGENT = "agent"         # 一次完整 Agent run
+    GUARDRAIL = "guardrail" # 护栏检查（输入/输出/工具调用前后置），L 系列专用
+    CUSTOM = "custom"       # 用户自定义打点
 
 
 class SpanStatus(str, Enum):
@@ -133,6 +144,10 @@ class SpanRecord(BaseModel):
     # 用于 finish 时计算抗墙钟跳变的耗时。直接构造的 SpanRecord / 从存储读回的 Span 保持 None，
     # 耗时口径退化为旧的墙钟差值（零破坏）。
     _mono_start: Optional[float] = PrivateAttr(default=None)
+    # finish() 完成后的回调（由 TraceLogger.start_span 挂载）：用来触发 end_span 持久化，
+    # 保证「只调 span.finish() 而忘了调 tracer.end_span(span)」的接入点（如 skill loader）
+    # 也能正确写入存储。直接构造的 SpanRecord 不挂回调，不会自动写入。
+    _on_finish_callback: Optional[Any] = PrivateAttr(default=None)
 
     # ---------- 追踪链 ----------
     trace_id: str = Field(..., description="整条链路的唯一 id，一次 run 内所有 Span 共享")
@@ -159,7 +174,8 @@ class SpanRecord(BaseModel):
     error_type: Optional[str] = Field(default=None, description="异常分类（异常类名，如 ValueError / ToolError / LLMError）；status=error 时自动推断")
 
     # ---------- 扩展 ----------
-    metadata: Dict[str, Any] = Field(default_factory=dict, description="额外元数据，如模型名、token 用量")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="用户业务上下文（任意键值，由调用方自由写入）")
+    attributes: Dict[str, Any] = Field(default_factory=dict, description="框架标准属性（命名空间点号键名，如 skill.name / asset.size_bytes；由打点接入层自动写入，供评估器/OTLP识别）")
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -184,6 +200,31 @@ class SpanRecord(BaseModel):
             self._create_seq = _next_seq()
 
     # ---------- 便捷方法 ----------
+    def set_attribute(self, key: str, value: Any) -> None:
+        """写入单个框架标准属性。
+
+        所有打点异常必须吞掉，不允许 trace 的 bug 变成主业务的 bug（R6）。
+        键名推荐命名空间点号风格（``skill.name`` / ``asset.size_bytes`` /
+        ``script.exit_code`` / ``mcp.method.name`` / ``gen_ai.request.model``），
+        与 OpenTelemetry / LangChain 等主流框架的语义约定对齐。
+        """
+        try:
+            if not isinstance(key, str) or not key:
+                return
+            self.attributes[key] = value
+        except Exception:
+            pass
+
+    def set_attributes(self, attrs: Optional[Dict[str, Any]]) -> None:
+        """批量写入框架标准属性（``None`` / 非 dict 安全跳过）。"""
+        if not attrs or not isinstance(attrs, dict):
+            return
+        try:
+            for k, v in attrs.items():
+                self.set_attribute(k, v)
+        except Exception:
+            pass
+
     def finish(
         self,
         output: Any = None,
@@ -191,6 +232,7 @@ class SpanRecord(BaseModel):
         error: Optional[str] = None,
         error_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        attributes: Optional[Dict[str, Any]] = None,
         end_time: Optional[float] = None,
     ) -> None:
         """标记 Span 结束，自动计算耗时。
@@ -198,6 +240,8 @@ class SpanRecord(BaseModel):
         Args:
             error_type: 异常分类；显式传入时优先采用，否则从 ``error`` 自动推断
                 （冒号前的异常类名，例如 ``ValueError`` / ``TimeoutError``）。
+            metadata: 结束时批量合并到用户业务上下文的键值对（已有键会被覆盖）。
+            attributes: 结束时批量合并到框架标准属性的键值对（已有键会被覆盖）。
             end_time: 可选的精确结束时间戳（秒）。默认 None 时取当前时刻
                 （行为与改动前一致）；传入时以该值作为 ``end_time``，用于
                 「后钩子」这类拿不到真实起止、但需精确对齐耗时的场景。
@@ -242,6 +286,16 @@ class SpanRecord(BaseModel):
             self.error_type = None
         if metadata:
             self.metadata.update(metadata)
+        if attributes:
+            self.set_attributes(attributes)
+        # 回调挂载在 TraceLogger.start_span 上；直接构造的 SpanRecord 无此回调，保持纯模型行为。
+        # 回调内走 end_span 幂等路径，不会重复写入。所有打点异常吞掉（R6）。
+        cb = getattr(self, "_on_finish_callback", None)
+        if cb is not None:
+            try:
+                cb(self)
+            except Exception:
+                pass
 
 def dict_to_span_record(row: dict) -> SpanRecord:
     """把数据库行还原成 SpanRecord（忽略自增 id 列）。"""
@@ -260,6 +314,7 @@ def dict_to_span_record(row: dict) -> SpanRecord:
         "error":       row.get("error"),
         "error_type":  row.get("error_type"),
         "metadata":    json_safe_load(row.get("metadata")) or {},
+        "attributes":  json_safe_load(row.get("attributes")) or {},
     }
     # start_time 有默认值，仅在库里有值时覆盖，避免 None 覆盖默认时间
     if row.get("start_time") is not None:
@@ -274,10 +329,10 @@ def dict_to_span_record(row: dict) -> SpanRecord:
 def span_record_to_dict(span: SpanRecord) -> dict:
     """把 SpanRecord 转成数据库行字典（字段名与表列一一对应）。
 
-    直接按字段取值、再对 input/output/metadata 做 ``_safe_serialize`` 兜底，
+    直接按字段取值、再对 input/output/metadata/attributes 做 ``json_safe_dumps`` 兜底，
     而不是走 ``model_dump(mode="json")``——后者遇到无法识别的对象会整体抛
     ``PydanticSerializationError``，导致整条 Span 被静默丢弃。这里保证任何
-    input/output 都能落库（无法序列化的转 str），与 JsonlStore 的兜底口径一致。
+    字段值都能落库（无法序列化的转 str），与 JsonlStore 的兜底口径一致。
     """
     return {
         "span_id":     span.span_id,
@@ -295,6 +350,7 @@ def span_record_to_dict(span: SpanRecord) -> dict:
         "error":       span.error,
         "error_type":  span.error_type,
         "metadata":    json_safe_dumps(span.metadata or {}),
+        "attributes":  json_safe_dumps(span.attributes or {}),
         "create_seq":  getattr(span, "_create_seq", 0),
     }
 

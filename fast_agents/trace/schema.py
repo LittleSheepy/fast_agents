@@ -25,6 +25,7 @@ TRACE_SPANS_SCHEMA = Schema(
             Column(name="input", type=ColumnType.TEXT),
             Column(name="output", type=ColumnType.TEXT),
             Column(name="metadata", type=ColumnType.TEXT, nullable=False),
+            Column(name="attributes", type=ColumnType.TEXT, nullable=False, default="{}"),
             Column(name="create_seq", type=ColumnType.INTEGER),
         ],
         indexes=[

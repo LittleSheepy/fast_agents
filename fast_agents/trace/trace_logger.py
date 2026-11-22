@@ -220,9 +220,16 @@ class TraceLogger:
         *,
         input: Any = None,
         metadata: Optional[dict] = None,
+        attributes: Optional[dict] = None,
         session_id: Optional[str] = None,
     ) -> SpanRecord:
-        """创建并返回一个 SpanRecord（未 finish），同时压入栈。"""
+        """创建并返回一个 SpanRecord（未 finish），同时压入栈。
+
+        Args:
+            metadata: 用户业务上下文（任意键值）。
+            attributes: 框架标准属性（命名空间点号键名，如 ``skill.name``）；
+                不写 metadata，供评估器/OTLP识别标准字段。
+        """
         if not self.enabled:
             # 返回一个占位 Span，让调用方可以无脑 .finish()，但不会写入
             placeholder = SpanRecord(
@@ -232,6 +239,7 @@ class TraceLogger:
                 session_id=session_id or self._session_id,
                 input=input,
                 metadata=dict(metadata or {}),
+                attributes=dict(attributes or {}),
             )
             return placeholder
 
@@ -252,6 +260,7 @@ class TraceLogger:
             kind=kind,
             input=input,
             metadata=dict(metadata or {}),
+            attributes=dict(attributes or {}),
         )
         # 记录单调时钟起点：finish 时优先用它计算耗时（抗系统墙钟跳变）。
         # 仅「正常创建」的 Span 打此标记；直接构造的 SpanRecord 不带标记，
@@ -260,6 +269,15 @@ class TraceLogger:
             span._mono_start = time.perf_counter()
         except Exception:
             pass
+        # 挂载 finish 回调：调用方只调 span.finish() 而忘了调 tracer.end_span(span) 时
+        # （如 skill loader 的写法），也能自动触发持久化；end_span 有 _persisted 幂等保护，
+        # 不会重复写入。回调闭包捕获 self（TraceLogger），循环引用由 Python GC 正常回收。
+        def _on_finish(s: SpanRecord) -> None:
+            try:
+                self.end_span(s)
+            except Exception:
+                pass
+        span._on_finish_callback = _on_finish
         self._push_span(span.span_id)
         return span
 
@@ -271,12 +289,13 @@ class TraceLogger:
         error: Optional[str] = None,
         error_type: Optional[str] = None,
         metadata: Optional[dict] = None,
+        attributes: Optional[dict] = None,
         end_time: Optional[float] = None,
     ) -> None:
         """结束一个 Span 并写入 store。
 
-        调用前可以手动修改 span.input/metadata；error 非空时自动置 status=ERROR。
-        end_time 为可选精确结束时刻（秒），默认 None 时取当前时刻（行为不变）。
+        调用前可以手动修改 span.input/metadata/attributes，或调 span.set_attribute() 追加标准属性；
+        error 非空时自动置 status=ERROR。end_time 为可选精确结束时刻（秒），默认 None 时取当前时刻。
         error_type 为可选异常分类；显式传入优先，否则从 error 自动推断。
 
         幂等保证：同一 Span 重复调用 end_span 会直接返回，不会重复写入存储，
@@ -298,12 +317,20 @@ class TraceLogger:
             span.error_type = error_type
         if metadata:
             span.metadata.update(metadata)
+        if attributes:
+            span.set_attributes(attributes)
         if span.end_time is None:
-            span.finish(output=span.output, status=span.status, error=span.error, error_type=span.error_type, metadata=None, end_time=end_time)
+            span.finish(output=span.output, status=span.status, error=span.error, error_type=span.error_type, metadata=None, attributes=None, end_time=end_time)
+            # finish 可能已通过 _on_finish_callback 触发了一次 end_span（递归写入），
+            # 此时 _persisted 为 True；此处必须再次检查，避免外层再写入一次造成重复。
+            if span._persisted:
+                return
         else:
             # 已经 finish 过，不重新计算耗时
             if metadata:
                 span.metadata.update(metadata)
+            if attributes:
+                span.set_attributes(attributes)
         # 弹栈
         self._pop_span_if_top(span.span_id)
         # 写入 store（底层已保证异常不抛）
@@ -321,9 +348,10 @@ class TraceLogger:
         *,
         input: Any = None,
         metadata: Optional[dict] = None,
+        attributes: Optional[dict] = None,
     ) -> Iterator[SpanRecord]:
         """with 语法自动 start/finish 一个 Span，异常时自动 error。"""
-        s = self.start_span(name, kind, input=input, metadata=metadata)
+        s = self.start_span(name, kind, input=input, metadata=metadata, attributes=attributes)
         try:
             yield s
         except Exception as e:
@@ -331,7 +359,7 @@ class TraceLogger:
             raise
         else:
             # 若调用方已手动 finish，则 end_time 已有值，直接写入（end_span 会自动幂等）
-            self.end_span(s, output=s.output, status=s.status, error=s.error, error_type=s.error_type, metadata=s.metadata)
+            self.end_span(s, output=s.output, status=s.status, error=s.error, error_type=s.error_type, metadata=s.metadata, attributes=s.attributes)
         finally:
             # 兜底弹栈：确保无论如何栈都正确弹出，避免父链错乱
             self._pop_span_if_top(s.span_id)
@@ -479,6 +507,7 @@ class TraceLogger:
                 "input": s.input,
                 "output": s.output,
                 "metadata": s.metadata,
+                "attributes": s.attributes or {},
             }
             for s in spans
         ]
