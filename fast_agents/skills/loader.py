@@ -1,9 +1,12 @@
 """
 Skill加载器：负责扫描、解析、加载文件型Skill（SKILL.md格式）
 遵循Anthropic开放标准，兼容Windows和Unix路径
+【C6-2】脚本沙箱增强：参数Schema校验、类型自动转换、命令注入防护、网络/路径访问白名单
+【C15】静态资产(assets)读取：assets目录扫描+路径穿越防护+文本/二进制分流
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -13,8 +16,37 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from .errors import SkillLoadError, SkillNotFoundError, ScriptExecutionError, ReferenceNotFoundError
-from .models import SkillMetadata, SkillLoadResult
+from .errors import (
+    AssetNotFoundError,
+    SkillLoadError, SkillNotFoundError,
+    ScriptExecutionError, ReferenceNotFoundError,
+    ScriptParamValidationError, ScriptSandboxViolationError,
+)
+from .models import SkillMetadata, SkillLoadResult, ScriptParam, ScriptSchema
+
+# Trace 相关延迟导入（避免 skills → trace 反向强依赖；不传 tracer 时零开销）
+_SpanKind = None
+_SpanStatus = None
+
+
+def _ensure_trace_imports() -> None:
+    """延迟导入 SpanKind/SpanStatus，保证不传 tracer 时不触发 trace 模块加载。"""
+    global _SpanKind, _SpanStatus
+    if _SpanKind is None or _SpanStatus is None:
+        from fast_agents.trace import SpanKind, SpanStatus
+        _SpanKind, _SpanStatus = SpanKind, SpanStatus
+
+
+# 【C15】可作为文本直接读取的资产扩展名；其余按二进制处理
+_TEXT_ASSET_EXTENSIONS = {
+    ".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".tsv",
+    ".xml", ".html", ".htm", ".css", ".js", ".py", ".bat", ".cmd",
+    ".ps1", ".ini", ".cfg", ".toml", ".log", ".sql",
+}
+# 【C15】单个文本资产的最大字节数（防止把大文件塞进上下文）
+_MAX_TEXT_ASSET_BYTES = 200 * 1024  # 200KB
+# 【C15】二进制资产预览字节数（默认不返回内容，仅返回元信息与绝对路径）
+_BIN_ASSET_PREVIEW_BYTES = 0
 
 
 class SkillLoader:
@@ -22,10 +54,11 @@ class SkillLoader:
     Skill加载器：扫描目录，解析SKILL.md，加载技能内容
     
     支持扫描路径（优先级从高到低）:
-        - 自定义路径: 通过add_skill_path添加
-        - 项目级: ./.skills/
-        - 用户级: ~/.fast_agents/skills/
-        - 框架内置: fast_agents包内的.skills/
+        - 代码型注册/自定义路径(custom/code): 最高优先级，后注册覆盖前者
+        - 项目级: ./.skills/ (project)
+        - 用户级: ~/.fast_agents/skills/ (user)
+        - 框架内置: fast_agents包内的.skills/ (builtin)
+    【C8】同名技能冲突时，高优先级来源覆盖低优先级，打印警告日志
     """
     
     SKILL_FILENAMES = ["SKILL.md", "skill.md", "Skills.md", "skills.md"]
@@ -33,76 +66,168 @@ class SkillLoader:
     REFERENCES_DIR = "references"
     ASSETS_DIR = "assets"
     
+    # 【C8】技能来源优先级：数值越大优先级越高，冲突时高优先级覆盖低优先级
+    SOURCE_PRIORITY = {
+        "builtin": 0,   # 框架内置，最低优先级
+        "user": 1,      # 用户全局目录
+        "project": 2,   # 当前项目目录
+        "custom": 3,    # 显式add_skill_path添加的自定义路径
+        "code": 4,      # 代码型注册(BaseSkill/@skill)，最高优先级
+    }
+    
     # 脚本安全配置
     ALLOWED_SCRIPT_EXTENSIONS = {".py", ".ps1", ".bat", ".cmd"}
     DEFAULT_SCRIPT_TIMEOUT = 30
     MAX_SCRIPT_OUTPUT_CHARS = 2000
     
-    def __init__(self, extra_paths: Optional[List[Path]] = None):
+    # 【C6-2】敏感路径（绝对路径前缀），脚本禁止读写
+    SENSITIVE_PATH_PREFIXES = [
+        "C:\\Windows\\System32",
+        "C:\\Windows\\SysWOW64",
+        "C:\\Users",  # 用户目录默认禁止，allow_write_paths显式放开才允许
+    ]
+    # 【C6-2】禁止出现的危险命令片段（Windows平台）
+    DANGEROUS_COMMANDS = [
+        "del /f /s /q", "rmdir /s /q", "format ", "shutdown ",
+        "reg delete", "reg add", "net user", "net localgroup",
+        "powershell -enc", "Invoke-Expression", "IEX ",
+    ]
+    
+    def __init__(
+        self,
+        extra_paths: Optional[List[Path]] = None,
+        default_allow_network: bool = False,
+        default_allow_write_paths: Optional[List[str]] = None,
+        default_env_whitelist: Optional[List[str]] = None,
+        default_script_timeout: int = DEFAULT_SCRIPT_TIMEOUT,
+        include_default_paths: bool = True,
+    ):
         self.skill_paths: List[Tuple[Path, str]] = []  # (path, source_label)
         self._loaded_skills: Dict[str, SkillLoadResult] = {}
         self._skill_index: Dict[str, SkillMetadata] = {}
         self._tracer = None  # 延迟注入trace
         
-        # 添加默认路径
-        self._add_default_paths()
+        # 【C18】沙箱全局默认配置
+        self.default_allow_network: bool = default_allow_network
+        self.default_allow_write_paths: List[str] = list(default_allow_write_paths or [])
+        self.default_env_whitelist: List[str] = list(default_env_whitelist or [])
+        self.DEFAULT_SCRIPT_TIMEOUT = default_script_timeout
         
+        # 【性能优化】索引缓存：避免 get_index_prompt / is_skill_disabled 等调用反复全量重扫
+        # 索引缓存有效性直接由 _skill_index 是否为空表达（空即需要重扫），无需额外标志位；
+        # _last_roots_mtime 记录扫描根目录mtime快照（用于自动检测根目录级变更：新增/删除子目录）
+        self._last_roots_mtime: float = 0.0
+
+        # 添加默认路径（可关闭，单元测试/独立演示场景使用）
+        if include_default_paths:
+            self._add_default_paths()
+
         # 添加自定义路径
         if extra_paths:
             for p in extra_paths:
                 self.add_skill_path(p, source="custom")
+
+    def invalidate_index_cache(self) -> None:
+        """主动失效技能索引缓存：直接清空已缓存的索引，下次调用 scan_skills/get_all_metadata 时会强制重扫。
+        外部调用方在明确知道目录发生变更（如添加路径、热重载reload后）时可显式调用。
+        """
+        self._skill_index.clear()
     
     def set_tracer(self, tracer) -> None:
         """注入trace打点器，可选"""
         self._tracer = tracer
     
     def _add_default_paths(self):
-        """添加默认扫描路径"""
+        """添加默认扫描路径（project/builtin/user 三级），同一物理目录不重复添加"""
+        added: set[str] = set()
+
+        def _add(p: Path, source: str):
+            rp = str(Path(p).resolve())
+            if rp in added:
+                return
+            added.add(rp)
+            self.add_skill_path(p, source=source)
+
         # 1. 项目级: 当前工作目录下的.skills（统一标准路径）
         project_skills = Path.cwd() / ".skills"
-        self.add_skill_path(project_skills, source="project")
-        
-        # 2. 框架内置: fast_agents包内的.skills
+        _add(project_skills, source="project")
+
+        # 2. 框架内置: fast_agents包内的.skills（与 project 同目录时不重复添加）
         try:
             framework_root = Path(__file__).resolve().parents[2]
             builtin_skills = framework_root / ".skills"
-            self.add_skill_path(builtin_skills, source="builtin")
+            _add(builtin_skills, source="builtin")
         except Exception:
             pass
-        
+
         # 3. 用户级: ~/.fast_agents/skills/
         user_home = Path.home()
         user_skills = user_home / ".fast_agents" / "skills"
-        self.add_skill_path(user_skills, source="user")
+        _add(user_skills, source="user")
     
     def add_skill_path(self, path: Path, source: str = "custom"):
-        """添加Skill扫描路径"""
+        """添加Skill扫描路径；添加后会主动失效索引缓存，下次访问时自动重扫"""
         path = Path(path).resolve()
         if path.exists() and path.is_dir():
             self.skill_paths.append((path, source))
+            # 添加新路径后需要失效缓存（可能有新技能出现）
+            self.invalidate_index_cache()
     
-    def scan_skills(self) -> Dict[str, SkillMetadata]:
+    def _compute_roots_mtime(self) -> float:
+        """计算所有技能扫描根目录自身的mtime最大值。
+        根目录mtime变化意味着子目录/文件在根级发生新增/删除/重命名，需要重建索引。
+        子目录内文件的修改不影响根目录mtime，由 C14 的 _get_skill_dir_mtime（递归rglob）在热重载场景处理。
+        """
+        max_mtime = 0.0
+        for base_path, _source in self.skill_paths:
+            if not base_path.exists():
+                continue
+            try:
+                mt = base_path.stat().st_mtime
+                if mt > max_mtime:
+                    max_mtime = mt
+            except OSError:
+                pass
+        return max_mtime
+
+    def scan_skills(self, force: bool = False) -> Dict[str, SkillMetadata]:
         """
         扫描所有路径下的Skill，构建索引（Level 1: 仅加载元数据）
         返回skill_name -> SkillMetadata的映射
+        【性能优化】默认 force=False 时：索引非空且根目录mtime未变则直接返回缓存；
+        仅当force=True或根目录mtime变化时才真正执行全量重扫。
+        子目录内文件的内容修改由热重载（_check_and_apply_changes -> reload_skill）单独处理。
         """
+        if not force and self._skill_index:
+            # 快速路径：检查根目录mtime是否变化（新增/删除子目录）
+            current_roots_mtime = self._compute_roots_mtime()
+            if abs(current_roots_mtime - self._last_roots_mtime) < 0.001:
+                return self._skill_index
+
+        # 慢路径：全量重建索引
         self._skill_index.clear()
         self._loaded_skills.clear()
-        
-        for base_path, source in self.skill_paths:
+
+        # 【C8】按来源优先级从低到高排序，确保后扫描的高优先级技能覆盖低优先级同名技能
+        sorted_paths = sorted(
+            self.skill_paths,
+            key=lambda item: self.SOURCE_PRIORITY.get(item[1], 2)  # 未知来源默认project优先级
+        )
+
+        for base_path, source in sorted_paths:
             if not base_path.exists():
                 continue
-            
+
             # 遍历base_path下的每个子目录
             for skill_dir in base_path.iterdir():
                 if not skill_dir.is_dir():
                     continue
-                
+
                 # 查找SKILL.md文件
                 skill_file = self._find_skill_file(skill_dir)
                 if not skill_file:
                     continue
-                
+
                 # 解析元数据
                 try:
                     metadata = self._parse_skill_metadata(skill_file, skill_dir, source)
@@ -112,16 +237,41 @@ class SkillLoader:
                         if errors:
                             print(f"[SkillLoader] 警告: Skill {skill_dir.name} 元数据校验失败: {'; '.join(errors)}")
                             continue
-                        
+
                         # 检查name与目录名是否一致
                         if metadata.name != skill_dir.name:
                             print(f"[SkillLoader] 警告: Skill {skill_dir.name} 的name字段({metadata.name})与目录名不一致，已自动修正")
                             metadata.name = skill_dir.name
-                        
-                        self._skill_index[metadata.name] = metadata
+
+                        # 【C8】同名技能冲突检测：按优先级覆盖，打印警告
+                        if metadata.name in self._skill_index:
+                            old_meta = self._skill_index[metadata.name]
+                            old_priority = self.SOURCE_PRIORITY.get(old_meta.source, 2)
+                            new_priority = self.SOURCE_PRIORITY.get(source, 2)
+                            if new_priority >= old_priority:
+                                # 高优先级覆盖低优先级
+                                old_path = str(getattr(old_meta, 'skill_path', 'unknown'))
+                                new_path = str(metadata.skill_path)
+                                print(
+                                    f"[SkillLoader] 警告: 技能 '{metadata.name}' 存在同名冲突："
+                                    f"[{old_meta.source}] {old_path} 被 [{source}] {new_path} 覆盖"
+                                )
+                                self._skill_index[metadata.name] = metadata
+                            else:
+                                # 低优先级不覆盖高优先级，保留原有
+                                old_path = str(getattr(old_meta, 'skill_path', 'unknown'))
+                                new_path = str(metadata.skill_path)
+                                print(
+                                    f"[SkillLoader] 警告: 技能 '{metadata.name}' 存在同名冲突："
+                                    f"[{source}] {new_path} 优先级低于 [{old_meta.source}] {old_path}，保留高优先级版本"
+                                )
+                        else:
+                            self._skill_index[metadata.name] = metadata
                 except Exception as e:
                     print(f"[SkillLoader] 加载Skill {skill_dir.name} 失败: {e}")
-        
+
+        # 重扫完成后更新根目录mtime快照（供下次快速路径判断是否命中缓存）
+        self._last_roots_mtime = self._compute_roots_mtime()
         return self._skill_index
     
     def _find_skill_file(self, skill_dir: Path) -> Optional[Path]:
@@ -131,6 +281,91 @@ class SkillLoader:
             if candidate.exists() and candidate.is_file():
                 return candidate
         return None
+    
+    def _parse_script_param(self, raw: Dict[str, Any]) -> Optional[ScriptParam]:
+        """【C6-2】解析单个脚本参数定义"""
+        if not isinstance(raw, dict) or "name" not in raw:
+            return None
+        ptype = str(raw.get("type", "str")).lower()
+        if ptype not in ("str", "int", "float", "bool", "boolean", "enum"):
+            ptype = "str"
+        if ptype == "boolean":
+            ptype = "bool"
+        return ScriptParam(
+            name=str(raw["name"]),
+            type=ptype,
+            required=bool(raw.get("required", False)),
+            default=raw.get("default"),
+            description=str(raw.get("description", "")),
+            enum=raw.get("enum"),
+            min=raw.get("min"),
+            max=raw.get("max"),
+            max_length=raw.get("max_length"),
+        )
+    
+    def _parse_script_schema_json(self, schema_file: Path) -> Optional[ScriptSchema]:
+        """【C18方案B】解析scripts/目录下单个 <脚本名>.schema.json 文件，返回ScriptSchema；解析失败返回None"""
+        try:
+            content = schema_file.read_text(encoding="utf-8")
+            raw = json.loads(content)
+            if not isinstance(raw, dict):
+                print(f"[SkillLoader] 警告: 脚本schema文件 {schema_file} 不是JSON对象，已忽略")
+                return None
+            # 脚本名优先取schema里的name字段，否则取schema文件名（去掉.schema.json后缀）
+            sname = raw.get("name") or raw.get("script_name") or schema_file.name.replace(".schema.json", "")
+            params_raw = raw.get("params") or raw.get("args") or raw.get("arguments") or []
+            params: List[ScriptParam] = []
+            if isinstance(params_raw, list):
+                for pr in params_raw:
+                    sp = self._parse_script_param(pr)
+                    if sp is not None:
+                        params.append(sp)
+            return ScriptSchema(
+                script_name=str(sname),
+                description=str(raw.get("description", "")),
+                params=params,
+                timeout=raw.get("timeout"),
+            )
+        except Exception as e:
+            print(f"[SkillLoader] 警告: 解析脚本schema文件 {schema_file} 失败: {e}，已忽略")
+            return None
+    
+    def _parse_scripts_schema(self, raw_scripts: Any) -> Dict[str, ScriptSchema]:
+        """【C6-2】【C18已废弃仅保留兼容】解析YAML中的scripts参数Schema定义（方案B不再使用frontmatter scripts段）"""
+        result: Dict[str, ScriptSchema] = {}
+        if not isinstance(raw_scripts, (list, dict)):
+            return result
+        
+        items = raw_scripts if isinstance(raw_scripts, list) else [
+            {"name": k, **v} if isinstance(v, dict) else {"name": k}
+            for k, v in raw_scripts.items()
+        ]
+        
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sname = item.get("name") or item.get("script_name") or item.get("file")
+            if not sname:
+                continue
+            params_raw = item.get("params") or item.get("args") or item.get("arguments") or []
+            params: List[ScriptParam] = []
+            if isinstance(params_raw, list):
+                for pr in params_raw:
+                    sp = self._parse_script_param(pr)
+                    if sp is not None:
+                        params.append(sp)
+            schema = ScriptSchema(
+                script_name=str(sname),
+                description=str(item.get("description", "")),
+                params=params,
+                timeout=item.get("timeout"),
+            )
+            # 同时存带扩展名和不带扩展名两个key，方便模糊匹配
+            result[str(sname)] = schema
+            stem = Path(str(sname)).stem
+            if stem != str(sname):
+                result[stem] = schema
+        return result
     
     def _parse_skill_metadata(
         self, skill_file: Path, skill_dir: Path, source: str
@@ -165,6 +400,25 @@ class SkillLoader:
             return None
         
         # 构建SkillMetadata
+        # 【C12】支持多种YAML键名写法：requires / dependencies / depends_on
+        requires = meta_dict.get("requires",
+                     meta_dict.get("dependencies",
+                     meta_dict.get("depends_on", [])))
+        if not isinstance(requires, list):
+            requires = [requires] if requires else []
+        
+        requires_tools = meta_dict.get("requires_tools",
+                       meta_dict.get("required_tools",
+                       meta_dict.get("needs_tools", [])))
+        if not isinstance(requires_tools, list):
+            requires_tools = [requires_tools] if requires_tools else []
+        
+        min_ver = meta_dict.get("min_fast_agents_version",
+                  meta_dict.get("min_version",
+                  meta_dict.get("requires_framework_version", None)))
+        max_ver = meta_dict.get("max_fast_agents_version",
+                  meta_dict.get("max_version", None))
+        
         metadata = SkillMetadata(
             name=meta_dict.get("name", skill_dir.name),
             description=meta_dict.get("description", ""),
@@ -174,6 +428,10 @@ class SkillLoader:
             compatibility=meta_dict.get("compatibility"),
             allowed_tools=meta_dict.get("allowed-tools", meta_dict.get("allowed_tools", [])),
             tags=meta_dict.get("tags", []),
+            requires=requires,
+            requires_tools=requires_tools,
+            min_fast_agents_version=min_ver,
+            max_fast_agents_version=max_ver,
             metadata=meta_dict.get("metadata", {}),
             skill_path=skill_dir,
             skill_type="file",
@@ -204,12 +462,11 @@ class SkillLoader:
             # Trace打点开始
             if self._tracer is not None:
                 try:
+                    _ensure_trace_imports()
                     span = self._tracer.start_span(
                         name=f"skill.load.{skill_name}",
-                        kind="skill",
-                        attributes={
-                            "skill.name": skill_name,
-                        }
+                        kind=_SpanKind.SKILL,
+                        attributes={"skill.name": skill_name, "skill.op": "load"}
                     )
                 except Exception:
                     span = None
@@ -238,7 +495,7 @@ class SkillLoader:
                 )
                 if span:
                     try:
-                        span.finish(error=f"Skill not found: {skill_name}")
+                        span.finish(status=_SpanStatus.ERROR, error=f"Skill not found: {skill_name}")
                     except Exception:
                         pass
                 return result
@@ -252,7 +509,7 @@ class SkillLoader:
                 )
                 if span:
                     try:
-                        span.finish(error=f"Skill dir not found: {skill_dir}")
+                        span.finish(status=_SpanStatus.ERROR, error=f"Skill dir not found: {skill_dir}")
                     except Exception:
                         pass
                 return result
@@ -266,7 +523,7 @@ class SkillLoader:
                 )
                 if span:
                     try:
-                        span.finish(error="SKILL.md not found")
+                        span.finish(status=_SpanStatus.ERROR, error="SKILL.md not found")
                     except Exception:
                         pass
                 return result
@@ -278,12 +535,25 @@ class SkillLoader:
                 
                 # 扫描scripts目录
                 scripts = []
+                scripts_schemas: Dict[str, ScriptSchema] = {}
                 scripts_dir = skill_dir / self.SCRIPTS_DIR
                 if scripts_dir.exists() and scripts_dir.is_dir():
-                    scripts = [
-                        p for p in scripts_dir.iterdir()
-                        if p.is_file() and not p.name.startswith("_")
-                    ]
+                    for p in scripts_dir.iterdir():
+                        if not p.is_file() or p.name.startswith("_"):
+                            continue
+                        # 【C18方案B】识别.schema.json文件，作为对应脚本的参数Schema
+                        if p.name.endswith(".schema.json"):
+                            schema = self._parse_script_schema_json(p)
+                            if schema is not None:
+                                # 同时存带扩展名和不带扩展名两个key，方便模糊匹配
+                                scripts_schemas[schema.script_name] = schema
+                                stem = Path(schema.script_name).stem
+                                if stem != schema.script_name:
+                                    scripts_schemas[stem] = schema
+                            continue
+                        # 普通可执行脚本文件
+                        if p.suffix.lower() in self.ALLOWED_SCRIPT_EXTENSIONS:
+                            scripts.append(p)
                 
                 # 扫描references目录
                 references = []
@@ -294,6 +564,25 @@ class SkillLoader:
                         if p.is_file() and p.suffix.lower() in [".md", ".txt", ".json", ".yaml", ".yml"]
                     ]
                 
+                # 【C15】扫描assets目录（递归，文本/二进制分流；以下划线开头的视为内部文件）
+                # 方案A：assets清单只进入SkillLoadResult（Level 2加载后通过full_prompt展示），不进入SkillMetadata常驻索引
+                assets: List[Tuple[str, int, bool]] = []
+                assets_dir = skill_dir / self.ASSETS_DIR
+                if assets_dir.exists() and assets_dir.is_dir():
+                    for ap in sorted(assets_dir.rglob("*")):
+                        if not ap.is_file():
+                            continue
+                        rel_parts = ap.relative_to(assets_dir).parts
+                        if any(part.startswith("_") for part in rel_parts):
+                            continue
+                        rel_str = "/".join(rel_parts)
+                        try:
+                            sz = ap.stat().st_size
+                        except OSError:
+                            sz = 0
+                        is_bin = ap.suffix.lower() not in _TEXT_ASSET_EXTENSIONS
+                        assets.append((rel_str, sz, is_bin))
+                
                 result = SkillLoadResult(
                     success=True,
                     skill_name=skill_name,
@@ -302,6 +591,8 @@ class SkillLoader:
                     instructions=instructions,
                     scripts=scripts,
                     references=references,
+                    assets=assets,
+                    scripts_schemas=scripts_schemas,
                 )
                 
                 self._loaded_skills[skill_name] = result
@@ -311,6 +602,9 @@ class SkillLoader:
                         span.set_attribute("skill.cached", False)
                         span.set_attribute("skill.scripts_count", len(scripts))
                         span.set_attribute("skill.references_count", len(references))
+                        span.set_attribute("skill.assets_count", len(assets))
+                        span.set_attribute("skill.scripts_schemas_count", len(scripts_schemas))
+                        span.set_attribute("skill.sandbox.allow_network", self.default_allow_network)
                         span.finish()
                     except Exception:
                         pass
@@ -325,7 +619,7 @@ class SkillLoader:
                 )
                 if span:
                     try:
-                        span.finish(error=str(e))
+                        span.finish(status=_SpanStatus.ERROR, error=str(e))
                     except Exception:
                         pass
                 return result
@@ -337,21 +631,17 @@ class SkillLoader:
             )
     
     def read_reference(self, skill_name: str, ref_name: str) -> str:
-        """
-        读取Skill参考文档（Level 3: 按需读取）
-        """
+        """读取Skill参考文档（Level 3: 按需读取）"""
         span = None
         try:
             # Trace打点开始
             if self._tracer is not None:
                 try:
+                    _ensure_trace_imports()
                     span = self._tracer.start_span(
                         name=f"skill.read_reference.{skill_name}",
-                        kind="skill",
-                        attributes={
-                            "skill.name": skill_name,
-                            "skill.reference": ref_name,
-                        }
+                        kind=_SpanKind.SKILL,
+                        attributes={"skill.name": skill_name, "skill.reference": ref_name, "skill.op": "read_reference"}
                     )
                 except Exception:
                     span = None
@@ -361,7 +651,7 @@ class SkillLoader:
                 error_msg = f"读取参考文档失败: {'; '.join(skill_result.errors)}"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
@@ -373,10 +663,10 @@ class SkillLoader:
             # 安全：路径穿越防护
             ref_path = (refs_base_dir / ref_name).resolve()
             if not str(ref_path).startswith(str(refs_base_dir)):
-                error_msg = f"非法参考文档路径：禁止访问references目录外的文件"
+                error_msg = "非法参考文档路径：禁止访问references目录外的文件"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
@@ -393,7 +683,7 @@ class SkillLoader:
                 error_msg = f"参考文档 '{ref_name}' 不存在"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
@@ -411,12 +701,225 @@ class SkillLoader:
                 error_msg = f"读取参考文档失败: {str(e)}"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
         except Exception:
-            return f"读取参考文档失败: 内部错误"
+            return "读取参考文档失败: 内部错误"
+    
+    def read_asset(self, skill_name: str, asset_name: str) -> str:
+        """【C15】读取Skill静态资产
+        
+        设计：
+        - 路径穿越防护：asset_name resolve后必须仍在assets/目录下
+        - 文本/二进制分流：文本类扩展名且未超 200KB 时直接返回 UTF-8 内容；
+          二进制资产不返回正文，仅返回元信息（类型/大小/绝对路径），交由脚本/用户处理
+        - 模糊匹配：大小写不敏感 + 子串匹配（与read_reference保持一致）
+        """
+        span = None
+        try:
+            if self._tracer is not None:
+                try:
+                    _ensure_trace_imports()
+                    span = self._tracer.start_span(
+                        name=f"skill.read_asset.{skill_name}",
+                        kind=_SpanKind.SKILL,
+                        attributes={"skill.name": skill_name, "skill.asset": asset_name, "skill.op": "read_asset"}
+                    )
+                except Exception:
+                    span = None
+            
+            skill_result = self.load_skill(skill_name)
+            if not skill_result.success:
+                error_msg = f"读取静态资产失败: {'; '.join(skill_result.errors)}"
+                if span:
+                    try:
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
+                    except Exception:
+                        pass
+                return error_msg
+            
+            skill_dir = skill_result.metadata.skill_path
+            assets_base_dir = (skill_dir / self.ASSETS_DIR).resolve()
+            
+            # 路径穿越防护
+            asset_path = (assets_base_dir / asset_name).resolve()
+            try:
+                asset_path.relative_to(assets_base_dir)
+            except ValueError:
+                error_msg = "非法静态资产路径：禁止访问assets目录外的文件"
+                if span:
+                    try:
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
+                    except Exception:
+                        pass
+                return error_msg
+            
+            if not asset_path.exists():
+                # 模糊匹配：大小写不敏感 + 子串
+                if assets_base_dir.exists():
+                    for p in assets_base_dir.rglob("*"):
+                        if not p.is_file():
+                            continue
+                        rel = p.relative_to(assets_base_dir).as_posix()
+                        if (p.name.lower() == asset_name.lower()
+                                or rel.lower() == asset_name.lower()
+                                or asset_name.lower() in rel.lower()):
+                            asset_path = p
+                            break
+            
+            if not asset_path.exists() or not asset_path.is_file():
+                error_msg = f"静态资产 '{asset_name}' 不存在"
+                if span:
+                    try:
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
+                    except Exception:
+                        pass
+                return error_msg
+            
+            rel_path = asset_path.relative_to(assets_base_dir).as_posix()
+            try:
+                size = asset_path.stat().st_size
+            except OSError:
+                size = 0
+            suffix = asset_path.suffix.lower()
+            is_binary = suffix not in _TEXT_ASSET_EXTENSIONS
+            
+            if is_binary:
+                # 二进制资产：只返回元信息与绝对路径，不返回正文（这是预期行为，不记错误）
+                if span:
+                    try:
+                        span.set_attribute("asset.size_bytes", size)
+                        span.set_attribute("asset.is_binary", True)
+                        span.finish()
+                    except Exception:
+                        pass
+                return (
+                    f"# 静态资产: {skill_name}/assets/{rel_path}\n"
+                    f"\n"
+                    f"- 类型：二进制（{suffix or '无扩展名'}）\n"
+                    f"- 大小：{size} 字节\n"
+                    f"- 绝对路径：{asset_path}\n"
+                    f"\n"
+                    f"提示：该文件为二进制格式，不能直接作为文本注入对话；"
+                    f"如需要处理，请通过 `run_skill_script` 调用技能脚本来读写或处理该文件。"
+                )
+            
+            # 文本资产：大小上限保护
+            if size > _MAX_TEXT_ASSET_BYTES:
+                if span:
+                    try:
+                        span.set_attribute("asset.size_bytes", size)
+                        span.set_attribute("asset.is_binary", False)
+                        span.set_attribute("asset.too_large", True)
+                        span.finish()
+                    except Exception:
+                        pass
+                return (
+                    f"# 静态资产: {skill_name}/assets/{rel_path}\n"
+                    f"\n"
+                    f"- 类型：文本（{suffix}）\n"
+                    f"- 大小：{size} 字节（超过单次读取上限 {_MAX_TEXT_ASSET_BYTES} 字节）\n"
+                    f"- 绝对路径：{asset_path}\n"
+                    f"\n"
+                    f"提示：文件过大，未直接返回内容以避免撑爆上下文；"
+                    f"如需局部内容，请通过 `run_skill_script` 让脚本读取所需片段。"
+                )
+            
+            try:
+                content = asset_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                # 扩展名是文本但实际是二进制（或非UTF-8），降级为元信息返回
+                if span:
+                    try:
+                        span.set_attribute("asset.size_bytes", size)
+                        span.set_attribute("asset.decode_error", True)
+                        span.finish(status=_SpanStatus.ERROR, error="文本资产无法以UTF-8解码")
+                    except Exception:
+                        pass
+                return (
+                    f"# 静态资产: {skill_name}/assets/{rel_path}\n"
+                    f"\n"
+                    f"- 类型：扩展名是文本（{suffix}）但无法以 UTF-8 解码，按二进制处理\n"
+                    f"- 大小：{size} 字节\n"
+                    f"- 绝对路径：{asset_path}\n"
+                )
+            
+            if span:
+                try:
+                    span.set_attribute("asset.size_bytes", size)
+                    span.set_attribute("asset.is_binary", False)
+                    span.finish()
+                except Exception:
+                    pass
+            return (
+                f"# 静态资产: {skill_name}/assets/{rel_path}\n"
+                f"\n"
+                f"```\n{content}\n```"
+            )
+        except Exception:
+            return "读取静态资产失败: 内部错误"
+    
+    def _build_sandbox_env(self, skill_dir: Path) -> Dict[str, str]:
+        """【C6-2】【C18重构】构造沙箱环境变量：全局白名单透传 + 网络禁用，不再从SkillMetadata读取配置"""
+        env: Dict[str, str] = {}
+        
+        # 白名单环境变量透传（使用全局默认配置）
+        for key in self.default_env_whitelist:
+            val = os.environ.get(key)
+            if val is not None:
+                env[key] = val
+        
+        # 默认透传PATH、SYSTEMROOT等Windows运行必需变量
+        for must_have in ("PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "PYTHONIOENCODING"):
+            val = os.environ.get(must_have)
+            if val is not None and must_have not in env:
+                env[must_have] = val
+        env["PYTHONIOENCODING"] = "utf-8"
+        
+        # 网络禁用：通过环境变量拦截Python requests/urllib和常用库（使用全局默认配置）
+        if not self.default_allow_network:
+            env["HTTP_PROXY"] = "http://127.0.0.1:1"  # 指向无效代理
+            env["HTTPS_PROXY"] = "http://127.0.0.1:1"
+            env["NO_PROXY"] = ""
+            env["http_proxy"] = "http://127.0.0.1:1"
+            env["https_proxy"] = "http://127.0.0.1:1"
+            env["SKILL_SANDBOX_NETWORK_DISABLED"] = "1"
+        
+        return env
+    
+    def _get_allow_write_paths(self, skill_dir: Path) -> List[str]:
+        """【C18】获取当前技能的可写路径白名单：全局配置 + 技能自身tmp/目录"""
+        allow_list = list(self.default_allow_write_paths)
+        # 默认允许写入技能目录下的tmp/
+        default_tmp = str((skill_dir / "tmp").resolve())
+        if default_tmp not in allow_list:
+            allow_list.append(default_tmp)
+        return allow_list
+    
+    def _check_sensitive_path_access(self, args: Dict[str, Any], skill_dir: Path) -> Optional[str]:
+        """【C6-2】【C18重构】检查参数中是否包含敏感路径，返回错误信息或None，使用全局白名单+技能tmp目录"""
+        allow_list = [p.lower().replace("\\", "/") for p in self._get_allow_write_paths(skill_dir)]
+        # 敏感路径统一为小写正斜杠形式匹配
+        sensitive_prefixes = [p.lower().replace("\\", "/") for p in self.SENSITIVE_PATH_PREFIXES]
+        # 额外加入常见Windows系统路径的正斜杠/反斜杠变体
+        extra_sensitive = [
+            "c:/windows/system32", "c:/windows/syswow64", "c:/users",
+        ]
+        sensitive_prefixes.extend(extra_sensitive)
+        
+        for k, v in args.items():
+            if not isinstance(v, (str, Path)):
+                continue
+            s = str(v).lower().replace("\\", "/")
+            # 检查是否命中敏感路径
+            for prefix in sensitive_prefixes:
+                if s.startswith(prefix):
+                    in_allow = any(s.startswith(allowed) for allowed in allow_list)
+                    if not in_allow:
+                        return f"参数 '{k}' 指向敏感路径 '{v}'，不在写入白名单内（沙箱拦截）"
+        return None
     
     def run_script(
         self,
@@ -427,20 +930,19 @@ class SkillLoader:
     ) -> str:
         """
         执行Skill脚本（Level 3: 按需执行）
-        安全加固：严格路径校验、禁止路径穿越、仅允许指定扩展名、输出截断
+        安全加固（已有）：路径穿越防护、扩展名白名单、输出截断
+        【C6-2】新增：参数Schema校验+类型转换、命令注入防护、敏感路径拦截、网络白名单、可写路径白名单
         """
         span = None
         try:
             # Trace打点开始
             if self._tracer is not None:
                 try:
+                    _ensure_trace_imports()
                     span = self._tracer.start_span(
                         name=f"skill.run_script.{skill_name}",
-                        kind="skill",
-                        attributes={
-                            "skill.name": skill_name,
-                            "skill.script": script_name,
-                        }
+                        kind=_SpanKind.SKILL,
+                        attributes={"skill.name": skill_name, "skill.script": script_name, "skill.op": "run_script"}
                     )
                 except Exception:
                     span = None
@@ -450,21 +952,22 @@ class SkillLoader:
                 error_msg = f"执行脚本失败: {'; '.join(skill_result.errors)}"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
             
-            skill_dir = skill_result.metadata.skill_path
+            metadata = skill_result.metadata
+            skill_dir = metadata.skill_path
             scripts_base_dir = (skill_dir / self.SCRIPTS_DIR).resolve()
             
             # 安全：路径穿越防护
             script_path = (scripts_base_dir / script_name).resolve()
             if not str(script_path).startswith(str(scripts_base_dir)):
-                error_msg = f"非法脚本路径：禁止访问scripts目录外的文件"
+                error_msg = "非法脚本路径：禁止访问scripts目录外的文件"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
@@ -481,7 +984,7 @@ class SkillLoader:
                 error_msg = f"脚本 '{script_name}' 不存在"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
@@ -492,30 +995,95 @@ class SkillLoader:
                 error_msg = f"不支持执行该类型脚本：{suffix}，仅允许 {', '.join(self.ALLOWED_SCRIPT_EXTENSIONS)}"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
             
-            # 构建命令
+            # ========== 【C18方案B】参数Schema校验与类型转换（schema来自scripts/&lt;脚本名&gt;.schema.json） ==========
             args = args or {}
+            validated_args = args
+            schema = skill_result.get_script_schema(script_path.name) or skill_result.get_script_schema(Path(script_name).stem)
+            if schema is not None:
+                ok, errors, converted = schema.validate_args(args)
+                if not ok:
+                    error_msg = "参数校验失败：\n- " + "\n- ".join(errors)
+                    if span:
+                        try:
+                            span.set_attribute("script.validation_failed", True)
+                            span.finish(status=_SpanStatus.ERROR, error=error_msg)
+                        except Exception:
+                            pass
+                    return error_msg
+                validated_args = converted
+                # 覆盖timeout为脚本声明的值
+                if schema.timeout is not None:
+                    timeout = schema.timeout
+            else:
+                # 无Schema时也做基本的命令注入字符检查
+                for k, v in args.items():
+                    if isinstance(v, str):
+                        for ch in ['\n', '\r', ';', '&', '|', '`', '$', '(', ')', '<', '>', '\\']:
+                            if ch in v:
+                                error_msg = f"参数 '{k}' 包含非法字符 '{ch}'（命令注入防护，未声明Schema的参数默认禁止特殊字符）"
+                                if span:
+                                    try:
+                                        span.set_attribute("script.injection_blocked", True)
+                                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
+                                    except Exception:
+                                        pass
+                                return error_msg
+            
+            # ========== 【C6-2】新增：敏感路径访问检查（【C18】使用全局白名单+技能tmp目录） ==========
+            path_err = self._check_sensitive_path_access(validated_args, skill_dir)
+            if path_err:
+                if span:
+                    try:
+                        span.set_attribute("script.sandbox_blocked", True)
+                        span.finish(status=_SpanStatus.ERROR, error=path_err)
+                    except Exception:
+                        pass
+                return f"沙箱拦截：{path_err}"
+            
+            # ========== 【C6-2】新增：禁止危险命令片段（bat/cmd场景） ==========
+            if suffix in (".bat", ".cmd", ".ps1"):
+                try:
+                    script_content = script_path.read_text(encoding="utf-8", errors="replace")
+                    content_lower = script_content.lower()
+                    for dangerous in self.DANGEROUS_COMMANDS:
+                        if dangerous.lower() in content_lower:
+                            error_msg = f"脚本包含危险命令 '{dangerous}'，沙箱拦截"
+                            if span:
+                                try:
+                                    span.set_attribute("script.dangerous_command_blocked", True)
+                                    span.finish(status=_SpanStatus.ERROR, error=error_msg)
+                                except Exception:
+                                    pass
+                            return f"沙箱拦截：{error_msg}"
+                except Exception:
+                    pass
+            
+            # 构建命令
             cmd = []
             
             # Windows平台专用：根据扩展名选择解释器
             if suffix == ".py":
                 cmd = [sys.executable, str(script_path)]
-            elif suffix in [".ps1", ".bat", ".cmd"]:
+            elif suffix in (".ps1", ".bat", ".cmd"):
                 cmd = ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(script_path)]
             else:
                 # 理论上不会走到这里，上面已经校验扩展名
                 cmd = [str(script_path)]
             
-            # 添加参数：--key value格式
-            for key, value in args.items():
+            # 添加参数（使用校验+转换后的参数）
+            for key, value in validated_args.items():
                 if value is True:
                     cmd.append(f"--{key}")
                 elif value is not False and value is not None:
                     cmd.extend([f"--{key}", str(value)])
+            
+            # ========== 【C6-2】沙箱环境变量（【C18】使用全局默认配置） ==========
+            sandbox_env = self._build_sandbox_env(skill_dir)
             
             try:
                 result = subprocess.run(
@@ -526,6 +1094,7 @@ class SkillLoader:
                     timeout=timeout,
                     encoding="utf-8",
                     errors="replace",
+                    env=sandbox_env,  # 【C6-2】使用沙箱化的环境变量
                 )
                 
                 output = []
@@ -555,7 +1124,12 @@ class SkillLoader:
                 if span:
                     try:
                         span.set_attribute("script.timeout", timeout)
-                        span.finish()
+                        span.set_attribute("script.args_count", len(validated_args))
+                        span.set_attribute("script.allow_network", self.default_allow_network)
+                        if result.returncode != 0:
+                            span.finish(status=_SpanStatus.ERROR, error=f"脚本退出码非零: {result.returncode}")
+                        else:
+                            span.finish()
                     except Exception:
                         pass
                 
@@ -565,7 +1139,8 @@ class SkillLoader:
                 error_msg = f"脚本执行超时（{timeout}秒）"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.set_attribute("script.timeout_expired", True)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
@@ -573,33 +1148,13 @@ class SkillLoader:
                 error_msg = f"执行脚本失败: {str(e)}"
                 if span:
                     try:
-                        span.finish(error=error_msg)
+                        span.finish(status=_SpanStatus.ERROR, error=error_msg)
                     except Exception:
                         pass
                 return error_msg
         except Exception:
             # 打点兜底：绝不让观测代码打挂主流程
-            return f"执行脚本失败: 内部错误"
-    
-    def get_skill_index_text(self) -> str:
-        """获取所有Skill的索引文本（注入system prompt的Level 1内容）"""
-        if not self._skill_index:
-            self.scan_skills()
-        
-        if not self._skill_index:
-            return "当前没有可用的技能。"
-        
-        lines = ["## 可用技能列表", ""]
-        for name, meta in sorted(self._skill_index.items()):
-            lines.append(meta.to_index_text())
-        
-        lines.extend([
-            "",
-            "提示：当你判断需要使用某个技能时，使用 load_skill 工具加载完整技能指令。",
-            "技能采用渐进式加载：当前只显示技能名称和描述，加载后可看到完整执行流程。",
-        ])
-        
-        return "\n".join(lines)
+            return "执行脚本失败: 内部错误"
     
     def list_skills(self) -> List[Dict[str, Any]]:
         """列出所有已发现的Skill"""
@@ -607,3 +1162,120 @@ class SkillLoader:
             self.scan_skills()
         
         return [meta.to_dict() for meta in self._skill_index.values()]
+
+    # ========== 【C14】技能热重载相关方法 ==========
+
+    def _get_skill_dir_mtime(self, skill_dir: Path) -> float:
+        """【C14】递归计算技能目录下所有文件的最大mtime，用于检测变更"""
+        max_mtime = 0.0
+        try:
+            for file in skill_dir.rglob("*"):
+                if file.is_file():
+                    try:
+                        mtime = file.stat().st_mtime
+                        if mtime > max_mtime:
+                            max_mtime = mtime
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return max_mtime
+
+    def _build_dir_mtime_map(self) -> Dict[str, float]:
+        """【C14】构建当前所有已发现技能目录的mtime快照：skill_name -> max_mtime"""
+        mtime_map: Dict[str, float] = {}
+        # 先确保索引已构建
+        if not self._skill_index:
+            self.scan_skills()
+        for name, meta in self._skill_index.items():
+            skill_dir = getattr(meta, 'skill_path', None)
+            if skill_dir and Path(skill_dir).exists():
+                mtime_map[name] = self._get_skill_dir_mtime(Path(skill_dir))
+        return mtime_map
+
+    def detect_changes(self, old_mtime_map: Dict[str, float]) -> Dict[str, List[str]]:
+        """【C14】对比新旧mtime快照，检测变更，返回三类变更列表"""
+        new_mtime_map = self._build_dir_mtime_map()
+
+        added: List[str] = []
+        modified: List[str] = []
+        removed: List[str] = []
+
+        # 检测新增和修改
+        for name, new_mtime in new_mtime_map.items():
+            if name not in old_mtime_map:
+                added.append(name)
+            elif abs(new_mtime - old_mtime_map[name]) > 0.001:
+                modified.append(name)
+
+        # 检测删除
+        for name in old_mtime_map:
+            if name not in new_mtime_map:
+                removed.append(name)
+
+        return {
+            "added": added,
+            "modified": modified,
+            "removed": removed,
+            "new_mtime_map": new_mtime_map,
+        }
+
+    def reload_skill(self, skill_name: str) -> Optional[SkillMetadata]:
+        """【C14】重新解析单个技能的元数据，返回新元数据；技能不存在或解析失败返回None"""
+        # 找到该技能对应的目录（优先从现有元数据取）
+        old_meta = self._skill_index.get(skill_name)
+        if old_meta is None:
+            return None
+
+        skill_dir_path = getattr(old_meta, 'skill_path', None)
+        if skill_dir_path is None:
+            return None
+        skill_dir = Path(skill_dir_path)
+        if not skill_dir.exists():
+            return None
+
+        # 查找SKILL.md
+        skill_file = self._find_skill_file(skill_dir)
+        if not skill_file:
+            return None
+
+        try:
+            new_meta = self._parse_skill_metadata(skill_file, skill_dir, old_meta.source)
+            if new_meta is None:
+                return None
+            errors = new_meta.validate()
+            if errors:
+                print(f"[SkillLoader][热重载] 警告: 技能 '{skill_name}' 新元数据校验失败，保持旧版本: {'; '.join(errors)}")
+                return None
+            # 确保name与目录名一致
+            if new_meta.name != skill_dir.name:
+                new_meta.name = skill_dir.name
+            # 更新索引
+            self._skill_index[skill_name] = new_meta
+            # 清理该技能已加载的内容缓存（由调用方middleware负责后续处理）
+            if skill_name in self._loaded_skills:
+                del self._loaded_skills[skill_name]
+            # 单个技能reload不标记整个缓存dirty（只更新了这一个），但刷新根目录mtime快照防止后续误判
+            self._last_roots_mtime = self._compute_roots_mtime()
+            return new_meta
+        except Exception as e:
+            print(f"[SkillLoader][热重载] 重新加载技能 '{skill_name}' 失败: {e}")
+            return None
+
+    def rescan_incremental(self) -> Dict[str, List[str]]:
+        """【C14】增量重扫：发现新增技能、检测删除技能；不修改现有正常技能的元数据
+        返回新增/删除的技能名列表
+        """
+        before_names = set(self._skill_index.keys())
+        # 全量重扫（force=True，会清空_index重建，因此先备份）
+        old_meta_backup = dict(self._skill_index)
+        self._skill_index.clear()
+        self.scan_skills(force=True)
+        after_names = set(self._skill_index.keys())
+
+        added = sorted(after_names - before_names)
+        removed = sorted(before_names - after_names)
+
+        # 对于修改的技能——scan_skills已经重新解析了它们，因此只要在before和after中都存在，
+        # 就已经拿到新元数据了；detect_changes靠mtime判断是否真正修改了文件
+        return {"added": added, "removed": removed}

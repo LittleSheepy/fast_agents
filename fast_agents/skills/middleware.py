@@ -10,7 +10,14 @@ from .registry import SkillRegistry
 
 
 # Skill系统内置工具名，加载/过滤时始终放行（否则会把技能加载工具自己封掉）
-SKILL_BUILTIN_TOOLS = {"load_skill", "read_skill_reference", "run_skill_script", "list_loaded_skills"}
+SKILL_BUILTIN_TOOLS = {
+    "load_skill", "read_skill_reference", "read_skill_asset", "run_skill_script",
+    "list_loaded_skills",
+    "disable_skill", "enable_skill",  # 【C11】启用/禁用管理工具始终可用
+    "disable_skills_by_tag", "enable_skills_by_tag",
+    "check_skill_dependencies",  # 【C12】依赖预检工具始终可用
+    "enable_skill_hot_reload", "disable_skill_hot_reload", "reload_skills_now",  # 【C14】热重载管理工具始终可用
+}
 
 
 class SkillMiddleware:
@@ -33,6 +40,11 @@ class SkillMiddleware:
         max_loaded_skills: int = 5,
         tracer = None,
         strict_tool_filter: bool = False,
+        # 【C18】沙箱全局配置，透传给SkillRegistry/SkillLoader
+        default_allow_network: bool = False,
+        default_allow_write_paths: Optional[List[str]] = None,
+        default_env_whitelist: Optional[List[str]] = None,
+        default_script_timeout: int = 30,
     ):
         """
         Args:
@@ -44,8 +56,17 @@ class SkillMiddleware:
             strict_tool_filter: True=严格模式，调用不在白名单内的工具直接拦截并返回错误；
                 False=仅过滤LLM可见的工具清单（system prompt + tool schema），实际调用时不拦截
                 （默认False，给LLM自由度，同时避免误拦截非预期工具调用）
+            default_allow_network: 【C18】全局默认是否允许脚本访问网络（默认False，断网）
+            default_allow_write_paths: 【C18】全局可写路径白名单，每个技能默认追加自身tmp/目录
+            default_env_whitelist: 【C18】全局允许透传给脚本的环境变量白名单
+            default_script_timeout: 【C18】脚本默认超时时间（秒）
         """
-        self.registry = registry or SkillRegistry()
+        self.registry = registry or SkillRegistry(
+            default_allow_network=default_allow_network,
+            default_allow_write_paths=default_allow_write_paths,
+            default_env_whitelist=default_env_whitelist,
+            default_script_timeout=default_script_timeout,
+        )
         self.auto_inject_index = auto_inject_index
         self.unload_after_turn = unload_after_turn
         self.max_loaded_skills = max_loaded_skills
@@ -71,6 +92,15 @@ class SkillMiddleware:
         self._tool_registry: Optional[Any] = None
         # 原始工具列表备份（绑定registry时记录一次，用于恢复）
         self._original_tool_names: Optional[Set[str]] = None
+        
+        # 【C11】把自己注册到registry，让registry的enable/disable操作能通知到middleware
+        self.registry.set_middleware(self)
+        
+        # 【C14】热重载相关状态（默认关闭，需显式调用enable_hot_reload启用）
+        self._hot_reload_running: bool = False
+        self._hot_reload_interval: float = 2.0
+        self._hot_reload_thread: Optional[Any] = None
+        self._last_mtime_map: Dict[str, float] = {}
     
     def bind_tool_registry(self, tool_registry: Any) -> None:
         """
@@ -87,27 +117,42 @@ class SkillMiddleware:
             if list_tool is not None:
                 from ..tools import StructuredTool
                 def _list_loaded_skills_impl() -> str:
-                    """列出当前已加载的技能，以及每个技能允许使用的工具列表"""
+                    """列出当前已加载的技能，以及每个技能允许使用的工具列表；【C11】也展示禁用状态"""
+                    parts = []
+                    
+                    # 已加载技能
                     if not self._loaded_skills:
-                        return "当前没有加载任何技能，可以使用全部工具。"
-                    lines = ["当前已加载技能列表：", ""]
-                    for skill_name in self._loaded_skills:
-                        meta = self.registry.get_metadata(skill_name)
-                        allowed = meta.allowed_tools if meta else []
-                        if "*" in allowed:
-                            allowed_text = "允许全部工具"
-                        elif allowed:
-                            allowed_text = f"允许工具: {', '.join(sorted(allowed))}"
-                        else:
-                            allowed_text = "无工具限制"
-                        lines.append(f"- {skill_name}: {allowed_text}")
-                    lines.append("")
-                    if self._current_allowed_tools is not None:
-                        non_builtin = sorted(n for n in self._current_allowed_tools if n not in SKILL_BUILTIN_TOOLS)
-                        lines.append(f"当前可使用工具（白名单合并结果）：{', '.join(non_builtin)}")
+                        parts.append("当前没有加载任何技能，可以使用全部工具。")
                     else:
-                        lines.append("当前可使用工具：全部工具（无技能限制）")
-                    return "\n".join(lines)
+                        parts.append("当前已加载技能列表：")
+                        parts.append("")
+                        for skill_name in self._loaded_skills:
+                            meta = self.registry.get_metadata(skill_name)
+                            allowed = meta.allowed_tools if meta else []
+                            if "*" in allowed:
+                                allowed_text = "允许全部工具"
+                            elif allowed:
+                                allowed_text = f"允许工具: {', '.join(sorted(allowed))}"
+                            else:
+                                allowed_text = "无工具限制"
+                            parts.append(f"- {skill_name}: {allowed_text}")
+                        parts.append("")
+                        if self._current_allowed_tools is not None:
+                            non_builtin = sorted(n for n in self._current_allowed_tools if n not in SKILL_BUILTIN_TOOLS)
+                            parts.append(f"当前可使用工具（白名单合并结果）：{', '.join(non_builtin)}")
+                        else:
+                            parts.append("当前可使用工具：全部工具（无技能限制）")
+                    
+                    # 【C11】禁用状态
+                    disabled_info = self.registry.get_disabled_skills()
+                    if disabled_info["disabled_skills"] or disabled_info["disabled_tags"]:
+                        parts.append("")
+                        if disabled_info["disabled_skills"]:
+                            parts.append(f"已禁用技能：{', '.join(disabled_info['disabled_skills'])}")
+                        if disabled_info["disabled_tags"]:
+                            parts.append(f"已禁用标签：{', '.join(disabled_info['disabled_tags'])}")
+                    
+                    return "\n".join(parts)
                 
                 # 替换工具的func
                 list_tool.func = _list_loaded_skills_impl
@@ -317,3 +362,185 @@ class SkillMiddleware:
     def get_stats(self) -> Dict[str, int]:
         """获取Skill调用统计"""
         return self._call_stats.copy()
+    
+    # ========== 【C11】启用/禁用事件回调 ==========
+    
+    def _on_skill_disabled(self, skill_name: str) -> None:
+        """技能被禁用时调用：若已加载则自动卸载并重算白名单"""
+        if skill_name in self._loaded_skills:
+            self._loaded_skills.remove(skill_name)
+            self._unload_skill_internal(skill_name)
+        # 白名单已在_unload_skill_internal中重算，这里无需重复
+    
+    def _on_skill_enabled(self, skill_name: str) -> None:
+        """技能被启用时调用：索引会自动恢复，无需额外操作（白名单不受启用影响）"""
+        # 启用只是让技能重新可见，不改变白名单（白名单只和已加载技能相关）
+        pass
+    
+    def _on_tag_enabled(self, tag: str) -> None:
+        """按tag启用时调用：白名单不受影响（只有加载后才会影响）"""
+        # 已被该tag禁用但已加载的技能——tag恢复后它们仍然是已卸载状态，需要LLM重新加载
+        # 这里不需要额外操作，因为_on_skill_disabled时已经把它们卸载了
+        pass
+    
+    def _on_all_skills_disabled(self) -> None:
+        """全部技能被禁用时调用：清空所有已加载技能和白名单"""
+        self._loaded_skills.clear()
+        self._loaded_content.clear()
+        self._skill_allowed_tools.clear()
+        self._current_allowed_tools = None
+    
+    def _on_all_skills_enabled(self) -> None:
+        """全部技能被启用时调用：无需额外操作"""
+        pass
+
+    # ========== 【C14】技能热重载功能 ==========
+
+    def enable_hot_reload(self, interval: float = 2.0) -> str:
+        """【C14】启用技能热重载：启动后台线程，轮询监控技能目录文件变更
+        Args:
+            interval: 轮询间隔秒数，默认2秒；最小1秒，最大60秒
+        Returns:
+            启用结果提示文本
+        """
+        import threading
+        # 已启用且线程仍活着则直接返回；disable 后保留的已退出线程不算"在运行中"
+        t = getattr(self, "_hot_reload_thread", None)
+        if t is not None and t.is_alive():
+            return f"技能热重载已在运行中，当前轮询间隔 {self._hot_reload_interval} 秒。"
+
+        # 参数边界
+        interval = max(1.0, min(60.0, float(interval)))
+        self._hot_reload_interval = interval
+        self._hot_reload_running = True
+        # 初始化mtime快照
+        self._last_mtime_map = self.registry.loader._build_dir_mtime_map()
+
+        def _watch_loop():
+            """后台监控线程主循环"""
+            import time
+            while self._hot_reload_running:
+                try:
+                    self._check_and_apply_changes()
+                except Exception:
+                    # 监控线程绝不能抛异常退出
+                    pass
+                time.sleep(self._hot_reload_interval)
+
+        self._hot_reload_thread = threading.Thread(
+            target=_watch_loop,
+            name="SkillHotReloadWatcher",
+            daemon=True,
+        )
+        self._hot_reload_thread.start()
+        return (
+            f"已启用技能热重载，轮询间隔 {interval} 秒。\n"
+            "开发模式下修改 SKILL.md、scripts/、references/ 目录下的文件后，"
+            "框架会自动检测变更并重新加载相关技能，无需重启Agent。\n"
+            "注意：新增技能目录或删除技能目录也会被自动检测。"
+        )
+
+    def disable_hot_reload(self) -> str:
+        """【C14】关闭技能热重载，停止后台监控线程"""
+        self._hot_reload_running = False
+        t = getattr(self, "_hot_reload_thread", None)
+        # 等待后台线程真正退出后再返回；不把 _hot_reload_thread 置为 None，
+        # 这样外部仍可通过 is_alive() 判断线程是否已停；下次 enable_hot_reload 会覆盖新线程
+        if t is not None:
+            t.join(timeout=max(2.0, self._hot_reload_interval + 1.0))
+        return "已关闭技能热重载。"
+
+    def _check_and_apply_changes(self) -> None:
+        """【C14】检查一次变更并应用：新增/修改/删除技能时自动处理状态"""
+        changes = self.registry.loader.detect_changes(self._last_mtime_map)
+        added = changes["added"]
+        modified = changes["modified"]
+        removed = changes["removed"]
+        new_mtime_map = changes["new_mtime_map"]
+
+        # 如果没有任何变更，直接返回
+        if not added and not modified and not removed:
+            self._last_mtime_map = new_mtime_map
+            return
+
+        # 1. 处理新增技能：增量重扫会已经把它们加进索引，无需额外操作，只是打日志
+        for name in added:
+            print(f"[SkillMiddleware][热重载] 检测到新增技能: {name}")
+
+        # 2. 处理删除技能：如果已加载则卸载，清理白名单
+        for name in removed:
+            print(f"[SkillMiddleware][热重载] 检测到技能已删除: {name}")
+            self._on_skill_removed(name)
+
+        # 3. 处理修改技能：重新加载元数据；如果该技能已加载，自动卸载让LLM下次重新加载
+        for name in modified:
+            print(f"[SkillMiddleware][热重载] 检测到技能已修改: {name}，重新加载元数据...")
+            new_meta = self.registry.loader.reload_skill(name)
+            if new_meta is not None and name in self._loaded_skills:
+                # 已加载的技能被修改，自动卸载，下次调用load_skill会拿到新版本
+                print(f"[SkillMiddleware][热重载] 技能 '{name}' 已加载且被修改，自动卸载，下次使用时将加载新版本。")
+                if name in self._loaded_skills:
+                    self._loaded_skills.remove(name)
+                self._unload_skill_internal(name)
+                # 如果技能声明的allowed_tools变了，这里已经通过_unload_skill_internal重算过白名单了
+
+        # 更新mtime快照
+        self._last_mtime_map = new_mtime_map
+
+    def reload_skills_now(self) -> str:
+        """【C14】手动触发一次全量增量重扫，立即检查变更（不等轮询间隔）"""
+        # 先增量重扫发现新增/删除
+        rescan_result = self.registry.loader.rescan_incremental()
+        added = rescan_result["added"]
+        removed = rescan_result["removed"]
+
+        # 再基于当前快照检测修改
+        if not hasattr(self, "_last_mtime_map"):
+            self._last_mtime_map = self.registry.loader._build_dir_mtime_map()
+        changes = self.registry.loader.detect_changes(self._last_mtime_map)
+        modified = changes["modified"]
+
+        # 应用变更（和自动轮询逻辑一样）
+        reload_count = 0
+        unload_count = 0
+
+        for name in removed:
+            self._on_skill_removed(name)
+            unload_count += 1
+
+        for name in modified:
+            new_meta = self.registry.loader.reload_skill(name)
+            if new_meta is not None and name in self._loaded_skills:
+                if name in self._loaded_skills:
+                    self._loaded_skills.remove(name)
+                self._unload_skill_internal(name)
+                reload_count += 1
+
+        self._last_mtime_map = changes["new_mtime_map"]
+
+        parts = ["技能手动重载完成："]
+        if added:
+            parts.append(f"- 新增技能：{', '.join(added)}")
+        if removed:
+            parts.append(f"- 删除技能：{', '.join(removed)}，已自动卸载 {unload_count} 个已加载技能")
+        if modified:
+            parts.append(f"- 修改技能：{', '.join(modified)}，其中已自动重载 {reload_count} 个已加载技能")
+        if not added and not removed and not modified:
+            parts.append("- 未检测到任何变更")
+        return "\n".join(parts)
+
+    def _on_skill_removed(self, skill_name: str) -> None:
+        """【C14】技能被删除时处理：从禁用列表移除、从已加载列表卸载、从索引清理"""
+        # 从禁用集合移除（如果被禁用过）
+        if skill_name in self.registry._disabled_skills:
+            self.registry._disabled_skills.remove(skill_name)
+        # 从已加载列表卸载
+        if skill_name in self._loaded_skills:
+            self._loaded_skills.remove(skill_name)
+            self._unload_skill_internal(skill_name)
+        # 从索引移除
+        if skill_name in self.registry.loader._skill_index:
+            del self.registry.loader._skill_index[skill_name]
+        # 从已加载内容缓存移除
+        if skill_name in self._loaded_content:
+            del self._loaded_content[skill_name]
