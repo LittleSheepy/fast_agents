@@ -1,3 +1,65 @@
-*/__pycache__/*
-*.pyc
-/.idea
+# ============================================================
+#  fast_agents · .gitignore
+#  只忽略「本地产物 / 临时文件 / IDE 配置」，源码与锁文件一律保留。
+#  说明：本文件按 .gitattributes 约定以 LF 存储（.gitignore text eol=lf）。
+# ============================================================
+
+# ---------- Python 字节码缓存 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---------- 编译 / 打包产物（误提交会污染仓库）----------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+*.whl
+*.tar.gz
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- 测试 / 静态检查缓存 ----------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ---------- 运行时落盘数据（记忆库 / trace 落盘 / 日志）----------
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+
+# ---------- IDE / 编辑器 ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- 操作系统 ----------
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ============================================================
+#  以下文件「必须提交」，请勿加入忽略（此处仅作提醒）：
+#    uv.lock            锁定依赖版本，保证换机 / CI 可复现
+#    requirements.txt / pyproject.toml
+#    .python-version    约定 Python 版本
+#    .gitattributes     换行符规则
+#    .skills/           随仓库分发的内置技能
+#    LICENSE / README.md / docs/ / tests/ / examples/
+# ============================================================
