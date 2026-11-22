@@ -2,7 +2,7 @@
 
 提供三个工具（对齐 memory_tool.py 的三工具模式）：
 - list_mcp_servers:     列出当前已注册/已连接的 MCP server 及其中可用工具
-- connect_mcp_server:   运行时动态连接一个 MCP server（stdio 命令串或 SSE URL）
+- connect_mcp_server:   运行时动态连接一个 MCP server（stdio 命令串或 HTTP(S) URL，默认 Streamable HTTP）
 - disconnect_mcp_server:断开一个已连接的 MCP server
 
 设计原则：
@@ -33,8 +33,8 @@ class ListMcpInput(BaseModel):
 
 class ConnectMcpInput(BaseModel):
     name: str = Field(description="给这个 MCP server 起一个别名，后续断开/查询用（只能包含字母、数字、下划线、连字符）")
-    target: str = Field(description="连接目标：stdio 命令串（如 'uvx mcp-server-filesystem D:/code'）或 SSE URL（http(s):// 开头）")
-    transport: str = Field(default="auto", description="传输类型：auto（自动判断，URL 开头用 SSE）/ stdio / sse")
+    target: str = Field(description="连接目标：stdio 命令串（如 'uvx mcp-server-filesystem D:/code'）或 HTTP(S) URL（http(s):// 开头，默认走 Streamable HTTP，兼容老 SSE 服务）")
+    transport: str = Field(default="auto", description="传输类型：auto（自动判断，URL 默认 streamable_http，命令串用 stdio）/ stdio / sse / streamable_http")
     expand: str = Field(default="fine", description="展开模式：fine 细粒度（每个远端工具独立，推荐）/ coarse 粗粒度（一个门脸工具）")
 
 
@@ -105,14 +105,17 @@ class ConnectMcpServerTool(ToolBase):
 
         ttype = transport.lower()
         if ttype == "auto":
-            ttype = "sse" if target.startswith(("http://", "https://")) else "stdio"
+            # http(s):// 默认走 streamable_http（MCP 2025 规范）；如需老 SSE 请显式指定 transport="sse"
+            ttype = "streamable_http" if target.startswith(("http://", "https://")) else "stdio"
         try:
             if ttype == "sse":
                 registry.add_sse(name, target)
+            elif ttype == "streamable_http":
+                registry.add_streamable_http(name, target)
             elif ttype == "stdio":
                 registry.add_stdio_cmd(name, target)
             else:
-                return ToolResult.fail(f"不支持的传输类型：{transport}")
+                return ToolResult.fail(f"不支持的传输类型：{transport}（支持 stdio/sse/streamable_http/auto）")
             added_names = registry.connect_and_expand(
                 name, self.agent.tool_registry, expand=expand,
             )
