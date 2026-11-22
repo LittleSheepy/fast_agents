@@ -189,7 +189,7 @@ class ContextWindow:
         for message in self.flatten():
             if message.role == "tool" and not previous_had_tool_calls:
                 problems.append(
-                    f"tool 消息缺少配对的 assistant(tool_calls)：{str(message.content)[:40]!r}"
+                    f"tool 消息缺少配对的 assistant(tool_calls)：{message.text[:40]!r}"
                 )
             previous_had_tool_calls = bool(message.tool_calls)
         return problems

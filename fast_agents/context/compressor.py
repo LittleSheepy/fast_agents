@@ -153,6 +153,9 @@ class ContextCompressor:
         offloader = self.offloader
         assert offloader is not None
         for message in layer.messages:
+            # 多模态消息暂不做offload，只处理纯文本内容
+            if not isinstance(message.content, str):
+                continue
             content = message.content or ""
             if not offloader.should_offload(content):
                 continue
@@ -219,7 +222,7 @@ class ContextCompressor:
         to_compress = groups[: len(groups) - self.keep_recent]
         keep = [m for group in groups[len(groups) - self.keep_recent:] for m in group]
         history_text = "\n".join(
-            f"{m.role}: {m.content}" for group in to_compress for m in group if m.content
+            f"{m.role}: {m.text}" for group in to_compress for m in group if m.text
         )
         if not history_text.strip():
             return
@@ -249,7 +252,7 @@ class ContextCompressor:
             response = self.llm.invoke(
                 [{"role": "user", "content": prompt}], temperature=0.0
             )
-            text = (response.content or "").strip()
+            text = (response.text or "").strip()
             if text:
                 return text
         except Exception as e:  # noqa: BLE001 —— 摘要失败不能拖垮对话
