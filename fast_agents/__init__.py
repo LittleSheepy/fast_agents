@@ -4,7 +4,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from .version import __version__, __author__, __email__, __description__
-from .llm import LLM
+from .llm import LLM, StreamChunk, RetryConfig
+from .messages import (
+    Message, Messages, Content, ContentPart,
+    TextPart, ImagePart, content_to_text, normalize_content, PartType,
+)
 from .agents.react_agent.react_agent import ReActAgent
 from .tools import (
     ToolBase, StructuredTool, tool, ToolResult, ToolStatus,
@@ -22,7 +26,8 @@ from .context import (
 from .mcp import (
     MCPRegistry, MCPClient, MCPToolAdapter, MCPServerTool,
     MCPError, MCPConnectionError, MCPProtocolError, MCPCallError,
-    StdioTransport, SSETransport, make_stdio,
+    StdioTransport, SSETransport, StreamableHTTPTransport,
+    make_stdio_transport, make_streamable_http_transport,
     MCPConfig,
 )
 from .database import (
@@ -41,13 +46,29 @@ from .skills import (
     SkillRegistry, SkillLoader, SkillMiddleware,
     SkillMetadata, SkillLoadResult,
 )
+from .guardrails import (
+    GuardrailBase, GuardrailResult, guardrail_creator,
+    list_guardrails, get_guardrail,
+    InputGuardrail, OutputGuardrail, ToolCallGuardrail,
+    ToolCallInfo, ToolResultInfo,
+    GuardrailMiddleware,
+    GuardrailError, InputGuardrailReject, OutputGuardrailReject,
+    ToolCallGuardrailReject, GuardrailConfigError,
+    log_guardrail_event,
+    preset as guardrail_presets,
+)
 
 __all__ = [
     # 版本信息
     "__version__", "__author__", "__email__", "__description__",
 
     # Agent范式
-    "LLM", "ReActAgent",
+    "LLM", "ReActAgent", "StreamChunk", "RetryConfig",
+
+    # 消息系统（多模态支持）
+    "Message", "Messages",
+    "Content", "ContentPart", "TextPart", "ImagePart",
+    "content_to_text", "normalize_content", "PartType",
 
     # 工具系统
     "ToolBase", "StructuredTool", "tool", "ToolResult", "ToolStatus",
@@ -67,7 +88,8 @@ __all__ = [
     # MCP
     "MCPRegistry", "MCPClient", "MCPToolAdapter", "MCPServerTool",
     "MCPError", "MCPConnectionError", "MCPProtocolError", "MCPCallError",
-    "StdioTransport", "SSETransport", "make_stdio", "MCPConfig",
+    "StdioTransport", "SSETransport", "StreamableHTTPTransport",
+    "make_stdio_transport", "make_streamable_http_transport", "MCPConfig",
 
     # Database（持久化层）
     "SQLiteClient", "MySQLClient", "DatabaseClientBase",
@@ -84,4 +106,15 @@ __all__ = [
     "BaseSkill", "skill",
     "SkillRegistry", "SkillLoader", "SkillMiddleware",
     "SkillMetadata", "SkillLoadResult",
+
+    # Guardrails 安全护栏（L系列，v2.58.0）
+    "GuardrailBase", "GuardrailResult", "guardrail_creator",
+    "list_guardrails", "get_guardrail",
+    "InputGuardrail", "OutputGuardrail", "ToolCallGuardrail",
+    "ToolCallInfo", "ToolResultInfo",
+    "GuardrailMiddleware",
+    "GuardrailError", "InputGuardrailReject", "OutputGuardrailReject",
+    "ToolCallGuardrailReject", "GuardrailConfigError",
+    "log_guardrail_event",
+    "guardrail_presets",
 ]
