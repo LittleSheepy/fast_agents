@@ -177,6 +177,40 @@ class SQLiteSessionStore(SessionStore):
     # ---------- 序列化 ----------
 
     @staticmethod
+    def _serialize_content(content) -> str:
+        """序列化content到TEXT字段：多模态列表转JSON，纯字符串直接存，兼容旧数据"""
+        if isinstance(content, str):
+            return content
+        # 多模态parts列表：序列化为JSON，每个part转成dict
+        parts = []
+        from ..messages.parts import ContentPart
+        for part in content:
+            if isinstance(part, ContentPart):
+                parts.append(part.to_dict())
+            else:
+                parts.append(part)
+        return json.dumps({"_mm": True, "parts": parts}, ensure_ascii=False)
+
+    @staticmethod
+    def _deserialize_content(content_raw: str):
+        """反序列化content字段：识别多模态JSON标记，还原为ContentPart列表；旧纯文本直接返回str"""
+        if not content_raw:
+            return ""
+        # 尝试解析多模态格式
+        try:
+            parsed = json.loads(content_raw)
+            if isinstance(parsed, dict) and parsed.get("_mm") is True:
+                from ..messages.parts import ContentPart
+                parts = []
+                for part_dict in parsed.get("parts", []):
+                    parts.append(ContentPart.from_dict(part_dict))
+                return parts
+        except (json.JSONDecodeError, TypeError, KeyError):
+            pass
+        # 不是多模态格式，直接返回原始字符串（兼容旧数据）
+        return content_raw
+
+    @staticmethod
     def _row_to_message(row) -> Message:
         """把一行 sessions 表记录还原为 Message（含 tool_calls / tool_results / metadata）
 
@@ -205,11 +239,11 @@ class SQLiteSessionStore(SessionStore):
         except (ValueError, TypeError):
             ts = cstnow()
 
-        # 还原 MsgToolCall / MsgToolResult（Message.__init__ 的 kwargs 里直接传 dict 列表即可，
+        # 还原MsgToolCall / MsgToolResult（Message.__init__ 的 kwargs 里直接传 dict 列表即可，
         # Pydantic 会自动转成对应的 BaseModel 实例）
         msg = Message(
             role=_get("role"),
-            content=_get("content") or "",
+            content=SQLiteSessionStore._deserialize_content(_get("content") or ""),
             timestamp=ts,
             metadata=metadata,
             tool_calls=tool_calls_raw,
@@ -230,7 +264,7 @@ class SQLiteSessionStore(SessionStore):
             "user_id": user_id,
             "session_id": session_id,
             "role": m.role,
-            "content": m.content or "",
+            "content": SQLiteSessionStore._serialize_content(m.content),
             "tool_calls": json.dumps(
                 [tc.model_dump() if hasattr(tc, "model_dump") else tc for tc in (m.tool_calls or [])],
                 ensure_ascii=False,

@@ -122,7 +122,7 @@ class BufferMemory:
 
     def _summarize(self, messages: List[Message], previous: str) -> str:
         """调用 LLM 生成摘要；调用失败时降级为拼接截断，保证不中断主流程"""
-        history = "\n".join(f"{m.role}: {m.content}" for m in messages if m.content)
+        history = "\n".join(f"{m.role}: {m.text}" for m in messages if m.text)
         if previous:
             history = f"（此前摘要：{previous}）\n{history}"
         if not self.llm:
@@ -133,7 +133,7 @@ class BufferMemory:
         )
         try:
             response = self.llm.invoke([{"role": "user", "content": prompt}])
-            text = (response.content or "").strip()
+            text = (response.text or "").strip()
             return text or previous
         except Exception as e:  # noqa: BLE001 —— 摘要失败不能拖垮对话
             print(f"⚠️ 摘要生成失败，降级为截断保存: {e}")
@@ -199,7 +199,7 @@ class BufferMemory:
         for m in self._messages:
             packets.append(
                 ContextPacket(
-                    content=f"{m.role}: {m.content}",
+                    content=f"{m.role}: {m.text}",
                     metadata={"type": "history", "source": "buffer", "required": False},
                 )
             )

@@ -277,7 +277,7 @@ class MemoryManager:
             self._extract_watermark = total
             return []
         conversation = "\n".join(
-            f"{m.role}: {m.content}" for m in new_messages if m.content
+            f"{m.role}: {m.text}" for m in new_messages if m.text
         )
         if not conversation.strip():
             # 新增消息全是空内容，推进水位线后直接返回
@@ -316,7 +316,7 @@ class MemoryManager:
                 [{"role": "user", "content": prompt}],
                 temperature=0.0,
             )
-            raw = (response.content or "").strip()
+            raw = (response.text or "").strip()
         except Exception as e:  # noqa: BLE001
             print(f"⚠️ 记忆抽取调用失败: {e}")
             return []
