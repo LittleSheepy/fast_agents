@@ -26,7 +26,8 @@ def main():
     print()
     
     # 创建注册表并注册技能
-    registry = SkillRegistry(extra_skill_paths=[])
+    # 演示场景只使用代码型技能，关闭默认路径扫描避免无关冲突告警
+    registry = SkillRegistry(extra_skill_paths=[], include_default_paths=False)
     registry.register(translate)
     
     # 创建中间件：最多同时加载2个技能，每轮对话结束后自动卸载

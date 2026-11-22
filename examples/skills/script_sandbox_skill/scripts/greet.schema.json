@@ -1,0 +1,29 @@
+{
+  "name": "greet.py",
+  "description": "根据名字和年龄打招呼",
+  "timeout": 10,
+  "params": [
+    {
+      "name": "name",
+      "type": "str",
+      "required": true,
+      "max_length": 50,
+      "description": "用户姓名"
+    },
+    {
+      "name": "age",
+      "type": "int",
+      "required": true,
+      "min": 0,
+      "max": 150,
+      "description": "年龄"
+    },
+    {
+      "name": "city",
+      "type": "str",
+      "required": false,
+      "default": "上海",
+      "description": "所在城市"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "export_report.py",
+  "description": "导出报告到tmp目录",
+  "timeout": 10,
+  "params": [
+    {
+      "name": "title",
+      "type": "str",
+      "required": true,
+      "max_length": 100,
+      "description": "报告标题"
+    },
+    {
+      "name": "format",
+      "type": "enum",
+      "required": false,
+      "default": "md",
+      "enum": ["md", "txt", "json"],
+      "description": "输出格式"
+    }
+  ]
+}

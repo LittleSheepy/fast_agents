@@ -41,8 +41,19 @@ class MockLLM:
         return Message("assistant", "", tool_calls=tool_calls)
 
     def stream_invoke(self, messages, tools=None, **kwargs):
-        m = self.invoke(messages, tools=tools, **kwargs)
-        return m.content or ""
+        from fast_agents.llm.models import StreamChunk
+        result = self.invoke(messages, tools=tools, **kwargs)
+        content = result.content or ""
+        # 逐字产出text分片，模拟真实流式
+        for char in content:
+            yield StreamChunk(type="text", text=char)
+        # 最终产出end片
+        yield StreamChunk(
+            type="end",
+            content=content,
+            tool_calls=result.tool_calls or [],
+            finish_reason="tool_calls" if result.tool_calls else "stop"
+        )
 
 
 def example_1_fine():

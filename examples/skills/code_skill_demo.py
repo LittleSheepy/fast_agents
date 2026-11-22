@@ -69,7 +69,8 @@ def main():
     print()
     
     # 创建注册表
-    registry = SkillRegistry(extra_skill_paths=[])
+    # 演示场景只使用代码型技能，关闭默认路径扫描避免无关冲突告警
+    registry = SkillRegistry(extra_skill_paths=[], include_default_paths=False)
     
     # 注册技能
     registry.register(DataAnalysisSkill)
