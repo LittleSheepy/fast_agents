@@ -507,8 +507,11 @@ class _FakeClient:
 
     def stream_invoke(self, messages, tools=None, **kwargs):
         self.calls.append(("stream", messages, tools, kwargs))
-        for ch in ["hello", " world"]:
-            yield ch
+        # 按 StreamChunk 三态契约 yield：两个 text 片 + end 片（无工具调用）
+        from fast_agents.llm.models import StreamChunk
+        yield StreamChunk(type="text", text="hello")
+        yield StreamChunk(type="text", text=" world")
+        yield StreamChunk(type="end", finish_reason="stop", content="hello world", tool_calls=[])
 
     def embed_query(self, text, usage_sink=None, **kwargs):
         self.calls.append(("embed_query", text, kwargs))
@@ -573,12 +576,18 @@ def test_llm_stream_invoke_with_tracer_records_span():
     llm = _make_fake_llm(tracer=t)
     with t.trace("llm-demo"):
         chunks = list(llm.stream_invoke([{"role": "user", "content": "hi"}]))
-    assert chunks == ["hello", " world"]
+    # 按 StreamChunk 契约：2个text片 + 1个end片
+    from fast_agents.llm.models import StreamChunk
+    assert len(chunks) == 3
+    assert chunks[0].type == "text" and chunks[0].text == "hello"
+    assert chunks[1].type == "text" and chunks[1].text == " world"
+    assert chunks[2].type == "end" and chunks[2].content == "hello world"
     spans = t.read_spans(kind="llm")
     assert len(spans) == 1
     assert spans[0].name == "llm.stream_invoke"
-    assert spans[0].output["chunks"] == 2
+    assert spans[0].output["chunks"] == 2  # text片数量
     assert spans[0].output["length"] == len("hello world")
+    assert spans[0].output["tool_calls_count"] == 0
     assert spans[0].metadata["stream"] is True
     t.close()
 
@@ -1704,6 +1713,103 @@ def test_explicit_end_time_keeps_wall_clock_duration():
     assert s.duration_ms == 1500000.0
 
 
+# ==================== attributes（框架标准属性） ====================
+
+def test_attributes_dict_default_empty_on_new_span():
+    """新建 Span 的 attributes 默认空 dict，不与 metadata 混淆。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.CUSTOM)
+    assert s.attributes == {}
+    assert s.metadata == {}
+
+
+def test_set_attribute_writes_single_key_value():
+    """set_attribute 写入命名空间风格键值。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.SKILL)
+    s.set_attribute("skill.name", "demo")
+    s.set_attribute("skill.cached", True)
+    s.set_attribute("asset.size_bytes", 1024)
+    assert s.attributes["skill.name"] == "demo"
+    assert s.attributes["skill.cached"] is True
+    assert s.attributes["asset.size_bytes"] == 1024
+    # metadata 不受影响
+    assert s.metadata == {}
+
+
+def test_set_attribute_swallows_invalid_inputs():
+    """非法键（非 str / 空串 / None）、非 dict 批量调用全部静默跳过，R6 不抛异常。"""
+    s = SpanRecord(trace_id="t1", name="n", kind=SpanKind.CUSTOM)
+    s.set_attribute("", "v")
+    s.set_attribute(None, "v")
+    s.set_attribute(123, "v")
+    s.set_attributes(None)
+    s.set_attributes("bad")
+    s.set_attributes({456: "x"})  # 非 str 键应被跳过
+    assert s.attributes == {}
+
+
+def test_start_span_accepts_attributes_and_roundtrips_jsonl():
+    """start_span(attributes=...) 与 finish(attributes=...) 的值会完整落盘 jsonl 并读回。
+    SQLite 后端的 attributes 落盘回读由 tests/trace/test_trace_sqlite_store.py 覆盖。
+    """
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "t.jsonl")
+        tracer = TraceLogger(store=JsonlStore(path))
+        with tracer.span("skill.load", kind=SpanKind.SKILL,
+                         attributes={"skill.name": "demo"}) as s:
+            s.set_attribute("skill.cached", False)
+            s.set_attribute("script.exit_code", 0)
+        tracer.store.flush() if hasattr(tracer.store, "flush") else None
+        tracer.store.close()
+
+        tracer2 = TraceLogger(store=JsonlStore(path))
+        spans = tracer2.replay()
+        assert len(spans) == 1
+        assert spans[0]["kind"] == "skill"
+        assert spans[0]["attributes"]["skill.name"] == "demo"
+        assert spans[0]["attributes"]["skill.cached"] is False
+        assert spans[0]["attributes"]["script.exit_code"] == 0
+        tracer2.store.close()
+
+
+def test_attributes_and_metadata_coexist_independently():
+    """metadata 装用户业务上下文，attributes 装框架标准属性，互不污染。"""
+    tracer = InMemoryTraceStore()
+    t = TraceLogger(store=tracer)
+    with t.span("x", kind=SpanKind.SKILL,
+               metadata={"user_id": "u1", "biz_id": "b1"},
+               attributes={"skill.name": "demo", "skill.cached": True}) as s:
+        s.set_attribute("script.args_count", 2)
+        s.metadata["step"] = 1
+    spans = t.replay()
+    assert spans[0]["metadata"] == {"user_id": "u1", "biz_id": "b1", "step": 1}
+    assert spans[0]["attributes"] == {"skill.name": "demo", "skill.cached": True, "script.args_count": 2}
+
+
+def test_build_tree_preserves_attributes_in_nodes_and_children():
+    """build_tree 每个节点（含 children）都带 attributes 字段。"""
+    tracer = InMemoryTraceStore()
+    t = TraceLogger(store=tracer)
+    with t.span("agent", kind=SpanKind.AGENT, attributes={"agent.name": "react"}) as root:
+        with t.span("skill.load", kind=SpanKind.SKILL,
+                   attributes={"skill.name": "calc"}) as child:
+            child.set_attribute("skill.cached", True)
+    roots = t.build_tree()
+    assert roots[0]["attributes"]["agent.name"] == "react"
+    assert len(roots[0]["children"]) == 1
+    assert roots[0]["children"][0]["attributes"]["skill.name"] == "calc"
+    assert roots[0]["children"][0]["attributes"]["skill.cached"] is True
+
+
+def test_disabled_tracer_set_attribute_does_not_raise():
+    """禁用 tracer 下 set_attribute 也不抛异常（R6：打点绝不阻塞主流程）。"""
+    t = TraceLogger(enabled=False)
+    s = t.start_span("x", kind=SpanKind.SKILL, attributes={"skill.name": "d"})
+    s.set_attribute("skill.cached", False)
+    s.set_attribute("asset.size_bytes", 100)
+    t.end_span(s, attributes={"ok": True})
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -1721,6 +1827,13 @@ def main_of_new_add():
 
     # AI新添加的测试(AI可以删除覆盖)
     test_build_tree_cycle_does_not_drop_or_duplicate_nodes()
+    test_attributes_dict_default_empty_on_new_span()
+    test_set_attribute_writes_single_key_value()
+    test_set_attribute_swallows_invalid_inputs()
+    test_start_span_accepts_attributes_and_roundtrips_jsonl()
+    test_attributes_and_metadata_coexist_independently()
+    test_build_tree_preserves_attributes_in_nodes_and_children()
+    test_disabled_tracer_set_attribute_does_not_raise()
     pass
 
 

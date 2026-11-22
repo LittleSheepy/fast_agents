@@ -1548,12 +1548,61 @@ def test_a26_caller_thread_hooks_keep_trace_parent_chain():
             [("t1", None), ("t2", None)], hooks_in_caller_thread=True,
         )
         spans = tracer.read_spans()
+        tracer.close()  # 先关闭 SQLite 连接，否则 Windows 下 TemporaryDirectory 清理会因 trace.db 被占用抛 WinError 267
 
     tool_spans = [s for s in spans if s.name.startswith("tool.")]
     assert len(tool_spans) == 2, f"应有 2 条工具 Span 落库，实际 {len(tool_spans)}：{[s.name for s in spans]}"
     assert {s.trace_id for s in tool_spans} == {parent_trace_id}, \
         f"工具 Span 丢失父链：{[ (s.name, s.trace_id) for s in tool_spans ]}"
     print("✅ A26 hook 回主线程后工具 Span 正常落库且父链正确通过")
+
+
+# ─────────────────────────────────────────────────────────
+# 搜索 provider 为可选依赖（extras: search）——缺包时返回安装提示而非抛异常
+# ─────────────────────────────────────────────────────────
+
+def test_search_missing_duckduckgo_dependency_returns_hint():
+    """未装 duckduckgo-search 时，SearchTool 返回安装提示而非抛异常"""
+    import sys as _sys
+    from fast_agents.tools.builtin.search_tool import SearchTool
+
+    saved = _sys.modules.get("duckduckgo_search")
+    _sys.modules["duckduckgo_search"] = None  # 令 `import duckduckgo_search` 触发 ImportError
+    try:
+        res = SearchTool(provider="duckduckgo").run("测试关键词")
+    finally:
+        if saved is not None:
+            _sys.modules["duckduckgo_search"] = saved
+        else:
+            _sys.modules.pop("duckduckgo_search", None)
+
+    assert isinstance(res, ToolResult) and res.is_error, f"缺包应返回失败结果而非异常: {res!r}"
+    out = str(res)
+    assert "duckduckgo-search" in out, f"应提示安装包名 duckduckgo-search: {out!r}"
+    assert "pip install" in out, f"应给出 pip 安装指引: {out!r}"
+    print("✅ 缺 duckduckgo-search 返回安装提示通过")
+
+
+def test_search_missing_tavily_dependency_returns_hint():
+    """未装 tavily-python 时，SearchTool 前置检查返回安装提示而非抛异常"""
+    import sys as _sys
+    from fast_agents.tools.builtin.search_tool import SearchTool
+
+    saved = _sys.modules.get("tavily")
+    _sys.modules["tavily"] = None
+    try:
+        res = SearchTool(provider="tavily", api_key="demo-key").run("测试")
+    finally:
+        if saved is not None:
+            _sys.modules["tavily"] = saved
+        else:
+            _sys.modules.pop("tavily", None)
+
+    assert isinstance(res, ToolResult) and res.is_error, f"缺包应返回失败结果而非异常: {res!r}"
+    out = str(res)
+    assert "tavily-python" in out, f"应提示安装包名 tavily-python: {out!r}"
+    assert "pip install" in out, f"应给出 pip 安装指引: {out!r}"
+    print("✅ 缺 tavily-python 返回安装提示通过")
 
 
 # ==================== 入口 ====================
@@ -1577,6 +1626,8 @@ def main_of_new_add():
     test_a11_tavily_with_key_ready()  # A11
     test_a26_concurrent_hooks_can_run_in_caller_thread()  # A26
     test_a26_caller_thread_hooks_keep_trace_parent_chain()  # A26
+    test_search_missing_duckduckgo_dependency_returns_hint()  # 可选依赖
+    test_search_missing_tavily_dependency_returns_hint()  # 可选依赖
 
 
 if __name__ == "__main__":

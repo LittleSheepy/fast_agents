@@ -45,6 +45,21 @@ class MockLLM:
         response = self.script[self.i]
         self.i += 1
         return response
+    
+    def stream_invoke(self, messages, tools=None, **kwargs):
+        from fast_agents.llm.models import StreamChunk
+        result = self.invoke(messages, tools=tools, **kwargs)
+        content = result.content or ""
+        # 一次性产出完整text，模拟流式
+        if content:
+            yield StreamChunk(type="text", text=content)
+        # 产出end片，带完整结果
+        yield StreamChunk(
+            type="end",
+            content=content,
+            tool_calls=getattr(result, "tool_calls", None) or [],
+            finish_reason="tool_calls" if (getattr(result, "tool_calls", None)) else "stop"
+        )
 
 
 def _system_messages(agent):
@@ -451,6 +466,79 @@ def test_return_direct_short_circuits_to_final_answer():
     assert llm.i == 1, f"return_direct 未短路，LLM 被调用 {llm.i} 次"
 
 
+def test_parallel_and_sequential_tool_paths_are_consistent():
+    """【重构回归】并发执行与顺序执行两条路径，产出的 tool 消息必须完全一致
+
+    重构把「observation 渲染 / 卸载 / 技能事件 / tool_call_id 挂载」抽成共用后处理，
+    这里用同一份脚本分别跑 parallel_tool_calls=True / False，逐条比对 tool 消息，
+    确保两条路径行为对齐（走并发不会再漏挂 tool_call_id 或漏渲染 observation）。
+    """
+
+    def _run(parallel: bool):
+        reg = ToolRegistry()
+        reg.register_tool(CalculatorTool())
+        llm = MockLLM([
+            Message(
+                "assistant",
+                "",
+                tool_calls=[
+                    MsgToolCall(name="python_calculator", arguments='{"expression": "1+2"}', id="c1"),
+                    MsgToolCall(name="python_calculator", arguments='{"expression": "3*4"}', id="c2"),
+                ],
+            ),
+            Message("assistant", "两个结果都算好了。"),
+        ])
+        agent = ReActAgent("一致助手", llm, tool_registry=reg, memory=MemoryManager(llm=llm),
+                           enable_skills=False, parallel_tool_calls=parallel)
+        answer = agent.run("1+2 和 3*4 分别等于多少")
+        tool_msgs = [m for m in agent.messages.get_messages() if m.role == "tool"]
+        return answer, [(m.metadata.get("tool_call_id"), m.content) for m in tool_msgs]
+
+    answer_seq, tools_seq = _run(parallel=False)
+    answer_par, tools_par = _run(parallel=True)
+
+    assert answer_seq == answer_par == "两个结果都算好了。"
+    # 两条路径都要产出 2 条 tool 消息，且 tool_call_id 严格按调用顺序对齐
+    assert [tid for tid, _ in tools_seq] == ["c1", "c2"], f"顺序路径 tool_call_id 未对齐: {tools_seq}"
+    assert [tid for tid, _ in tools_par] == ["c1", "c2"], f"并发路径 tool_call_id 未对齐: {tools_par}"
+    # observation 文本逐字一致（并发不会因为执行方式不同而漏渲染）
+    assert tools_seq == tools_par, f"并发与顺序产出的 tool 消息不一致:\n顺序={tools_seq}\n并发={tools_par}"
+    assert "3" in tools_seq[0][1] and "12" in tools_seq[1][1]
+    print("✅ test_parallel_and_sequential_tool_paths_are_consistent passed")
+
+
+def test_parallel_return_direct_short_circuits():
+    """【重构回归】并发分支同样走共用后处理，return_direct 仍能短路成最终答案"""
+    from fast_agents.tools.structured_tool import StructuredTool
+
+    def get_time() -> str:
+        """返回当前时间"""
+        return "现在是 2026-11-08 15:30"
+
+    reg = ToolRegistry()
+    reg.register_tool(StructuredTool.from_function(get_time, return_direct=True))
+    reg.register_tool(CalculatorTool())
+
+    llm = MockLLM([
+        Message(
+            "assistant",
+            "",
+            tool_calls=[
+                MsgToolCall(name="get_time", arguments="{}", id="t1"),
+                MsgToolCall(name="python_calculator", arguments='{"expression": "1+1"}', id="t2"),
+            ],
+        ),
+        Message("assistant", "unreachable-should-not-be-called"),
+    ])
+    agent = ReActAgent("测试助手", llm, tool_registry=reg, memory=MemoryManager(llm=llm),
+                       enable_skills=False, parallel_tool_calls=True)
+    answer = agent.run("现在几点")
+
+    assert answer == "现在是 2026-11-08 15:30", f"并发分支 return_direct 未短路: {answer!r}"
+    assert llm.i == 1, f"return_direct 未短路，LLM 被调用 {llm.i} 次"
+    print("✅ test_parallel_return_direct_short_circuits passed")
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -467,7 +555,8 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
-    pass
+    test_parallel_and_sequential_tool_paths_are_consistent()  # AI新加的测试
+    test_parallel_return_direct_short_circuits()  # AI新加的测试
 
 
 if __name__ == "__main__":

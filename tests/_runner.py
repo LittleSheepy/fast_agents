@@ -4,6 +4,7 @@
     - run_all(ns)：收集并运行 ns 中所有 test_ 开头的函数，按名字排序；
         * 自动识别参数签名，对应名字的本地函数若是 generator 则作为 yield fixture
           （yield 前构造、yield 后 teardown，和 pytest 的 @pytest.fixture 语义一致）；
+        * 自动识别 async def 测试函数，用 asyncio.run 执行；
         * 本地函数若名为 tmp_path/monkeypatch 则直接由运行器提供，不必自己定义。
     - run_prefix(ns, prefix)：只跑 ns 中以 prefix 开头的测试，供 AI 新写测试时快速验证。
     - raises(exc, match=None)：断言代码块抛出指定异常，用法 with raises(ValueError): ...
@@ -16,6 +17,7 @@ from __future__ import annotations
 import inspect
 import shutil
 import sys
+import asyncio
 import tempfile
 import traceback
 from contextlib import contextmanager
@@ -208,7 +210,10 @@ def _run(items, label):
         cms = []
         try:
             kwargs, cms = _build_kwargs(fn, fn.__globals__)
-            fn(**kwargs)
+            result = fn(**kwargs)
+            # 自动识别异步测试：返回 coroutine 时用 asyncio.run 执行
+            if inspect.iscoroutine(result):
+                asyncio.run(result)
             passed += 1
             print(f"  ✅ PASS: {name}")
         except Skip as s:

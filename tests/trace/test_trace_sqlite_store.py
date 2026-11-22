@@ -257,6 +257,27 @@ def test_create_seq_sqlite_roundtrip_metadata_clean():
 
 # ==================== 入口 ====================
 
+def test_sqlite_store_attributes_column_persists_and_reads_back():
+    """SQLite 后端 attributes 列随 schema 创建，落盘回读一致；老数据 attributes 默认空 dict。"""
+    with tmp_path() as tmpdir:
+        path = os.path.join(str(tmpdir), "a.db")
+        tracer = TraceLogger(store=SQLiteStore(path))
+        with tracer.span("skill.load", kind=SpanKind.SKILL,
+                         attributes={"skill.name": "demo"}) as s:
+            s.set_attribute("skill.cached", False)
+            s.set_attribute("script.exit_code", 0)
+        tracer.store.close()
+
+        tracer2 = TraceLogger(store=SQLiteStore(path))
+        spans = tracer2.replay()
+        assert len(spans) == 1
+        assert spans[0]["kind"] == "skill"
+        assert spans[0]["attributes"]["skill.name"] == "demo"
+        assert spans[0]["attributes"]["skill.cached"] is False
+        assert spans[0]["attributes"]["script.exit_code"] == 0
+        tracer2.store.close()
+
+
 def main():
     from tests._runner import run_all
     raise SystemExit(run_all(globals()))
@@ -274,6 +295,7 @@ def main_of_new_add():
     with tmp_path() as tmpdir:
         pass
     test_sqlite_store_file_persists_across_reopen()
+    test_sqlite_store_attributes_column_persists_and_reads_back()
     pass
 
 
