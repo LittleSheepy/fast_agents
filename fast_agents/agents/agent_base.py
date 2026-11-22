@@ -1,11 +1,13 @@
 """Agent基类"""
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Iterator, Optional
 
 from ..messages import Messages
 from ..messages.message import Message
 from ..llm import LLM
+from ..llm.models import StreamChunk
+
 
 class AgentBase(ABC):
     """Agent基类"""
@@ -18,7 +20,12 @@ class AgentBase(ABC):
 
     @abstractmethod
     def run(self, input_text: str, **kwargs) -> str:
-        """运行Agent"""
+        """运行Agent，返回最终答案字符串"""
+        pass
+    
+    @abstractmethod
+    def run_stream(self, input_text: str, **kwargs) -> Iterator[StreamChunk]:
+        """流式运行Agent，按StreamChunk契约产出事件，支持打字机效果"""
         pass
     
     def add_message(self, message: Message):
