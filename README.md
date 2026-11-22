@@ -55,7 +55,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | [`docs/Skill模块编写说明.md`](./docs/Skill模块编写说明.md) | `SKILL.md` 标准、三级渐进式加载、`@skill` / `BaseSkill` 两种写法、与 LangChain / Anthropic 的对比 |
 | [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md) | 零依赖 JSON-RPC 实现、**细粒度 vs 粗粒度展开**、`MCPConfig` 声明式配置、Windows 专项 |
 | [`docs/context模块编写说明.md`](./docs/context模块编写说明.md) | Token 预算与三级降级计数、五层拼装顺序、三级压缩策略、工具结果卸载与按需回读、与主流框架的取舍 |
-| [`docs/LLM模块编写说明.md`](./docs/LLM模块编写说明.md) | OpenAI 客户端轻封装、`invoke` / `stream_invoke`、embedding 分片并发与 query/document 语义区分、chat / embedding 模型独立配置、可选 `tracer` 打点与 token 用量元数据 |
+| [`docs/LLM模块编写说明.md`](./docs/LLM模块编写说明.md) | OpenAI 客户端轻封装、`invoke` / `stream_invoke`、embedding 分片并发与 query/document 语义区分、chat / embedding 模型独立配置、可选 `extra_body` 请求体扩展（默认不发送）、可选 `tracer` 打点与 token 用量元数据、**分层异常体系（errors.py，retryable 属性）**、**Structured Output（invoke_structured + strict 模式 + LLMStructuredOutputError）**、**自动重试/熔断（retry.py，Full Jitter 指数退避 + 线程安全三态断路器，默认开启可关闭）** |
 | [`docs/database模块编写说明.md`](./docs/database模块编写说明.md) | 关系型双后端（`SQLiteClient` 零依赖 + `MySQLClient` 可选，接口 100% 对齐）、三种声明式建表、谓词下推（9 种 FilterOp）、统一异常体系、向量后端（Chroma） |
 | [`docs/trace模块编写说明.md`](./docs/trace模块编写说明.md) | Span/Trace 模型、`TraceLogger` 门面、`InMemoryTraceStore` / `JsonlStore` / `SQLiteStore` 三后端、`ToolRegistry` 钩子打点、查询与回放、K3 离线评估器（指标聚合 + Token 成本日报）|
 | [`docs/演进路线图.md`](./docs/演进路线图.md) | 按模块（A~K）组织的后续规划，含优先级、依赖、验收标准 |
@@ -73,8 +73,8 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 🔧 **工具系统** | `ToolBase` 抽象基类 + `StructuredTool` / `@tool` 装饰器 + `ToolRegistry` 注册表，四种定义方式，schema 自动生成 |
 | 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关 |
 | 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **可选 Chroma 向量后端**（`ChromaMemoryStore`，阶段 2 已真实接入 `ChromaClient`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5）+ **记忆 TTL 到期回收**（B12，`remember(ttl=...)` 到期自动退出检索并回收）+ **增量抽取**（B10，只抽新增消息段、无新消息不调 LLM）+ **冲突检测与消解**（B13，写入前向量近邻查重、`newest_wins` 去重、词法 Jaccard 与向量通道始终叠加）+ **显式冲突上报**（B13，`remember(raise_on_conflict=True)` 命中有效重复时抛 `MemoryConflictError`；只读 `check_conflict()` 先探测）+ **统一北京时间 CST（UTC+8）时间基准**（B8），支持 Agent 主动读写 |
-| 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低 |
-| 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现 |
+| 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低；**脚本沙箱**（C6-2 参数 Schema 校验 + 注入防护 + 默认断网）、**技能依赖与前置检查**（C12）、**运行时启用 / 禁用**（C11）、**`allowed_tools` 工具白名单**（C10）、**技能热重载**（C14，默认关闭） |
+| 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现；`tools` / `resources` / `prompts` 三类能力齐备（D7） |
 | 🪟 **上下文工程** | Token 预算与三级降级计数、五层拼装（system / 记忆 / 历史 / 文件 / 本轮问题）、超长工具结果自动卸载落盘并按需回读、三级压缩（卸载 → 裁剪 → 摘要） |
 | 🗄 **持久化基础服务** | `SQLiteClient` 零依赖封装标准库 `sqlite3`（可选 `MySQLClient` / `ChromaClient`），提供连接管理、DDL / CRUD / 事务、三种声明式建表、幂等 migrate 补列、谓词下推（`select_where` / `select_one_where`）、`count` / `batch_insert` / `upsert`；统一异常体系（`DatabaseError` + 7 子类），标识符白名单 + 值参数化双重防注入 |
 | 🔍 **Trace 全链路追踪** | Trace/Span 模型 + TraceLogger 记录器，`store` 单入口按文件后缀自动识别后端：不传或 `:memory:` → `InMemoryTraceStore` 纯内存，`.jsonl` → `JsonlStore` 一行一条落盘，`.db` / `.sqlite` / `.sqlite3` → `SQLiteStore` 结构化落盘（幂等迁移、同 span_id 幂等覆盖），支持查询与回放；通过 `ToolRegistry.add_hook` 自动打点工具，LLM/Agent 仅新增 `tracer=None` 可选参数，默认行为零开销；LLM span 记录模型名与 token 用量元数据，tool span 读取工具真实耗时；状态栈为实例级 ContextVar，多 tracer 不串扰、async 协程天然隔离；另含 K3 离线评估器（`TraceEvaluator` 指标聚合 + Token 成本日报）|
@@ -126,9 +126,10 @@ docstring-parser>=0.18.0   # 从 docstring 提取参数说明
 PyYAML>=6.0.3              # 技能系统解析 SKILL.md 的 front matter
 ```
 
-**可选**
+**可选（内置 SearchTool 的搜索 provider，走 `[search]` extra）**
 
 ```text
+# 对应 pyproject 的 [search] extra：pip install fast-agents[search]
 duckduckgo-search>=8.1.1   # 内置 SearchTool 的默认 provider（免费、无需 Key）
 tavily-python>=0.8.5       # 内置 SearchTool 的生产级 provider（需要 TAVILY_API_KEY）
 requests                   # 只用 MCP 的 SSE 传输时才需要（stdio 不需要）
@@ -137,11 +138,12 @@ requests                   # 只用 MCP 的 SSE 传输时才需要（stdio 不�
 **可选后端（extras，按需安装）**
 
 ```text
+pip install fast-agents[search]   # 搜索 provider（duckduckgo-search + tavily-python）
 pip install fast-agents[mysql]    # MySQL 关系型后端 MySQLClient（需要 pymysql）
 pip install fast-agents[chroma]   # 向量后端 ChromaClient（需要 chromadb）
 ```
 
-> `uv` 用户如需可选后端，直接跑 `\第5_1步uv_sync_all.bat`（等价 `uv sync --extra mysql --extra chroma`）。
+> `uv` 用户如需搜索 provider 与可选后端，直接跑 `\第5_1步uv_sync_all.bat`（等价 `uv sync --extra search --extra mysql --extra chroma`）。
 
 > ✅ **技能系统依赖 `pyyaml`**：`fast_agents/skills/loader.py` 用 `yaml.safe_load` 解析 `SKILL.md` 的 front matter。它已列入 `requirements.txt`（`PyYAML>=6.0.3`）与 `pyproject.toml`，按依赖清单安装即可，通常无需手动补装（老环境若缺，`pip install pyyaml`）。
 
@@ -223,9 +225,13 @@ fast_agents/
 │   ├── __init__.py               # 顶层导出：LLM / ReActAgent / ToolRegistry / MemoryManager …
 │   ├── version.py                # 版本信息
 │   ├── llm/                      # ① LLM 客户端层
-│   │   ├── __init__.py
-│   │   ├── llm.py                #    LLM：invoke / stream_invoke / embed_query / embed_documents
-│   │   └── openai_client.py      #    对 OpenAI SDK 的封装
+│   │   ├── __init__.py           #    统一导出 LLM、重试配置与分层异常
+│   │   ├── llm.py                #    LLM 门面：invoke / stream_invoke / embed_query / embed_documents / invoke_structured，可配 retry
+│   │   ├── openai_client.py      #    对 OpenAI SDK 的封装（含异常映射、invoke_structured 协议）
+│   │   ├── models.py             #    StreamChunk 流式块数据模型
+│   │   ├── errors.py             #    分层异常体系（retryable 属性），对齐 AGENTS.md §5.1
+│   │   ├── retry.py              #    Full Jitter 指数退避 + 线程安全三态断路器，零新增依赖
+│   │   └── retry_errors.py       #    重试耗尽 LLMRetryExhaustedError / 熔断 LLMCircuitOpenError
 │   ├── messages/                 # ② 消息系统
 │   │   ├── __init__.py
 │   │   ├── message.py            #    Message：单条消息
@@ -264,11 +270,12 @@ fast_agents/
 │   │   └── manager.py            #    MemoryManager：短期 + 长期 + 画像的门面
 │   ├── skills/                   # ⑤ 技能系统
 │   │   ├── __init__.py
-│   │   ├── models.py             #    SkillMetadata / SkillLoadResult
+│   │   ├── models.py             #    SkillMetadata / SkillLoadResult（含 C12 依赖声明 / C6-2 脚本 Schema）
 │   │   ├── base.py               #    BaseSkill / @skill 装饰器
-│   │   ├── registry.py           #    SkillRegistry
-│   │   ├── loader.py             #    SkillLoader：扫描 / 加载 / 跑脚本
-│   │   ├── middleware.py         #    SkillMiddleware：索引注入 + 生命周期
+│   │   ├── errors.py             #    统一异常体系：SkillError + 10 个子类
+│   │   ├── registry.py           #    SkillRegistry：索引 / 加载 / 执行 + 启用禁用 + 依赖预检 + 12 个内置工具
+│   │   ├── loader.py             #    SkillLoader：扫描 / 加载 / 沙箱跑脚本（C6-2）/ 热重载增量检测（C14）
+│   │   ├── middleware.py         #    SkillMiddleware：索引注入 + 生命周期 + 工具白名单（C10）+ 热重载后台线程（C14）
 │   │   ├── agent_integration_example.py
 │   │   └── code_skill_example.py
 │   ├── mcp/                      # ⑥ MCP 扩展模块
@@ -276,7 +283,7 @@ fast_agents/
 │   │   ├── errors.py             #    三层异常
 │   │   ├── models.py             #    ToolInfo / CallResult / MCPConfig …
 │   │   ├── transports.py         #    StdioTransport / SSETransport
-│   │   ├── client.py             #    MCPClient：握手 / list_tools / call_tool
+│   │   ├── client.py             #    MCPClient：握手 / list_tools / call_tool + resources / prompts（D7）
 │   │   ├── registry.py           #    MCPRegistry：多 server 管理 + 工具展开
 │   │   └── tool.py               #    MCPToolAdapter（细粒度）/ MCPServerTool（粗粒度）
 │   ├── agents/                   # ⑦ 智能体
@@ -314,7 +321,7 @@ fast_agents/
 │   │   ├── sqlite_store.py       #    SQLiteStore：结构化 SQLite 落盘
 │   │   ├── evaluator.py          #    K3 TraceEvaluator：指标聚合 + Token 成本日报
 │   │   └── trace_logger.py       #    TraceLogger 门面
-│   └── utils/                    # ⑪ 通用工具（time_utils.py 北京时间 CST 基准 / database_utils.py）
+│   └── utils/                    # ⑪ 通用工具（time_utils.py 北京时间 CST 基准 / json_utils.py / utils.py）
 ├── .skills/                      # 项目级技能目录（默认扫描位置）
 │   └── web-research/
 │       ├── SKILL.md
@@ -325,13 +332,14 @@ fast_agents/
 ├── examples/
 │   ├── context/                  # context 示例（离线可跑，不需要 API Key）
 │   ├── database/                 # database 示例（内存/临时库，不需要 API Key）
-│   ├── mcp/                      # MCP 示例（echo_server / quickstart / agent demo）
+│   ├── mcp/                      # MCP 示例（echo_server / quickstart / agent demo / resources+prompts / 传输稳定性）
 │   ├── memory/                   # 记忆示例（会话落盘 / SQLite 长期记忆）
+│   ├── skills/                   # 技能示例（文件型 / 代码型 / 启用禁用 / 依赖检查 / 热重载 / 脚本沙箱 / 中间件）
 │   ├── tools/                    # 工具示例（file_tools_demo.py）
 │   └── trace/                    # trace 示例（内存 / jsonl / SQLite 落盘 + 树形回放 + K3 评估/成本日报/CSV 导出，离线可跑，不需要 API Key）
 ├── tests/                        # 测试（按模块分目录，配 tests/_runner.py 零依赖运行器，不用 pytest）
 │   ├── _runner.py                #    自研零依赖测试运行器（run_all / run_prefix / raises / importorskip）
-│   └── init/  agents/  context/  database/  mcp/  memory/  tools/  trace/
+│   └── init/  agents/  context/  database/  mcp/  memory/  skills/  tools/  trace/
 ├── pyproject.toml
 ├── requirements.txt
 ├── uv.lock
@@ -362,6 +370,11 @@ fast_agents/
 | `embed_documents` | `(texts, tracer=None, **kwargs) -> list[list[float]]` | 批量文本转向量（文档侧），自动 2048 分片并发、按 `index` 对齐顺序 |
 
 > 四个方法均可选传 `tracer`（`TraceLogger`）：非 `None` 时各记一条 LLM span，`metadata` 写 `model` + token 用量；默认 `None` 时不打点、行为与旧版一致。
+>
+> `LLM(extra_body={...})` 可传 provider 私有请求体扩展字段（如关闭 Qwen 思考模式的 `{"enable_thinking": False}`）；**默认不发送**，保证对原生 OpenAI 端点严格兼容。
+> `LLM(retry=RetryConfig(max_retries=3, base_delay=1.0))` 调整重试策略；**默认 `max_retries=2` 开启 Full Jitter 指数退避 + 按 `(base_url, model)` 维度的三态熔断**，`retry=None` 完全关闭。
+>
+> **异常分层（v1.1.2）**：所有运行时错误统一抛出 `fast_agents.llm.errors` 下的分层异常（基类 `LLMError`），每个子类带 `retryable: bool` 属性——连接失败 / 超时 / 限流 / 5xx 为 `True`（可重试），鉴权 / 配置 / 参数非法 / 模型不存在为 `False`（不可重试），直接为 I4（指数退避重试/熔断）按类型分流提供依据，上层无需再按字符串猜错误类型。入参错误（`TypeError` / `ValueError`）仍走原生异常，不纳入 LLMError 体系。
 
 ```python
 from fast_agents import LLM
@@ -370,6 +383,7 @@ llm = LLM(
     api_key="sk-...",                    # 不传则读 LLM_API_KEY
     base_url="https://api.openai.com/v1",# 不传则读 LLM_BASE_URL
     model="gpt-4o-mini",                 # 不传则读 LLM_MODEL_ID
+    # extra_body={"enable_thinking": False},  # 可选：provider 私有扩展，默认不发送
 )
 
 msg = llm.invoke([{"role": "user", "content": "你好"}])
@@ -532,7 +546,7 @@ from fast_agents import builtin
 
 registry.register_tools(
     builtin.CalculatorTool(),
-    builtin.SearchTool(),          # 需要 duckduckgo-search 或 tavily-python
+    builtin.SearchTool(),          # 需要搜索 provider（pip install fast-agents[search]）
     *builtin.build_file_tools(),   # 一次拿到 read_file / write_file / edit_file / multi_edit_file
 )
 ```
@@ -606,6 +620,8 @@ result.text / result.artifact / result.error
 | `enable_context` | `bool` | `False` | `True` 则每轮按 token 预算拼装上下文、超长工具结果落盘 |
 | `context_budget` | `Optional[int]` | `None` | 覆盖 `ctx` 自带的 token 预算 |
 | `context_offload_threshold` | `int` | `4_000` | 工具结果卸载的字符数阈值（单条工具输出超过该字符数即自动落盘，仅保留引用） |
+| `tracer` | `Optional[TraceLogger]` | `None` | 全链路追踪记录器（K1）；传入后自动给工具与 LLM 打点，默认 `None` 零开销 |
+| `parallel_tool_calls` | `bool` | `False` | 为真且本轮 `tool_calls` ≥ 2 时走并发执行入口（结果顺序与 `tool_calls` 严格对齐） |
 
 ```python
 agent = ReActAgent(
@@ -900,20 +916,23 @@ tags: ["demo"]
 
 | 组件 | 职责 |
 |------|------|
-| `SkillLoader` | 扫描目录、解析 front matter、读 reference、跑脚本 |
-| `SkillRegistry` | 持有全部技能元信息，生成索引文本与三个工具 |
-| `SkillMiddleware` | 在 `run()` 前后注入索引、捕获 `load_skill` 事件、记录已加载技能 |
+| `SkillLoader` | 扫描目录、解析 front matter、读 reference、沙箱跑脚本、热重载增量检测 |
+| `SkillRegistry` | 持有全部技能元信息，生成索引文本与内置工具，管理启用 / 禁用与依赖预检 |
+| `SkillMiddleware` | 在 `run()` 前后注入索引、捕获 `load_skill` 事件、记录已加载技能、工具白名单过滤、热重载后台线程 |
 | `SkillMetadata` / `SkillLoadResult` | 数据模型 |
+| `errors.py` | 统一异常体系（`SkillError` + 10 个子类） |
 
-#### 三个自动注册的工具
+#### 内置工具（基础三件套 + 扩展，共 12 个）
 
-`enable_skills=True` 时，Agent 会自动注册：
+`enable_skills=True` 时，Agent 会自动注册 12 个内置工具，其中基础三件套：
 
 | 工具 | 作用 |
 |------|------|
 | `load_skill` | 加载 `SKILL.md` 全文指令 |
 | `read_skill_reference` | 读 `references/` 下的参考文档 |
-| `run_skill_script` | 执行 `scripts/` 下的脚本（`.py` / `.ps1` / `.bat` / `.cmd` / `.sh` 自动选解释器） |
+| `run_skill_script` | 执行 `scripts/` 下的脚本（`.py` / `.ps1` / `.bat` / `.cmd` / `.sh` 自动选解释器，经沙箱校验） |
+
+另有：`list_loaded_skills`、启用 / 禁用 4 个（C11）、`check_skill_dependencies`（C12 依赖预检）、热重载 3 个（C14，默认关闭）。
 
 #### 两种代码里定义技能的方式
 
@@ -967,7 +986,7 @@ agent = ReActAgent(
 
 > **状态说明**：本模块已并入主分支（`fast_agents/mcp/` + `tools/builtin/mcp_tool.py` + `react_agent.py` 的 MCP 接入）。完整说明见 [`docs/MCP模块编写说明.md`](./docs/MCP模块编写说明.md)。
 
-让 Agent 连接**外部 MCP 工具服务器**，工具清单自动发现、参数 schema 自动转换。
+让 Agent 连接**外部 MCP 工具服务器**，工具清单自动发现、参数 schema 自动转换；除 `tools` 外，也已支持 `resources` / `prompts`（D7）。
 
 ```python
 from fast_agents.mcp import MCPConfig
@@ -1013,8 +1032,10 @@ agent = ReActAgent(name="助手", llm=llm, enable_mcp=True)
 #### 零依赖示例
 
 ```powershell
-python examples\mcp\mcp_quickstart.py           # 最小上手（不需要 LLM）
-python examples\mcp\mcp_react_agent_demo.py     # 5 个 Agent 集成场景
+python examples\mcp\mcp_quickstart.py              # 最小上手（不需要 LLM）
+python examples\mcp\mcp_react_agent_demo.py        # 5 个 Agent 集成场景
+python examples\mcp\mcp_resources_prompts_demo.py  # resources / prompts（D7，不需要 LLM）
+python examples\mcp\mcp_transport_stability_demo.py # 传输稳定性（stderr 捕获 / SSE 断线唤醒）
 ```
 
 > SSE 传输需要 `pip install requests`；stdio 不需要。
@@ -1267,6 +1288,7 @@ python tests\tools\test_tools.py
 python tests\tools\test_file_tool.py
 python tests\memory\test_memory.py
 python tests\memory\test_memory_chroma_store.py
+python tests\skills\test_skills.py
 python tests\context\test_context.py
 python tests\mcp\test_mcp.py
 python tests\database\test_database.py
@@ -1288,14 +1310,15 @@ python tests\trace\test_trace_cost.py
 |---------|------|------|
 | `tests/init/test_init.py` | ✅ 6/6 + 1 跳过 | 包级自检：`__all__` 完整、符号可导入、子模块可导入、版本一致；第 7 项「安装元数据版本」在未以 `fast-agents` 安装时自动跳过 |
 | `tests/agents/test_react_agent.py` | ✅ 17/17 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
-| `tests/tools/test_tools.py` | ✅ 66/66 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
+| `tests/tools/test_tools.py` | ✅ 68/68 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
 | `tests/memory/test_memory.py` | ✅ 51/51 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B10 增量抽取水位线（含窗口写满后仍持续抽取的回归）、B12 TTL 与到期回收、v1.8.3 向量通道批量缓存与 Chroma 阶段 2、B13 冲突检测与消解（含 v1.9.1 过期续期 / 取代、v1.9.2 显式冲突上报与只读 check_conflict）、B14 向量 meta 三端对齐（含 InMemory 值语义 / 批量向量落盘 / rebuild 复用三项修复） |
 | `tests/memory/test_memory_chroma_store.py` | ✅ 8/8 | ChromaMemoryStore 专项（含 2 项需真实 `chromadb`，未安装时自动跳过）：阶段 1 纯词法降级 CRUD/search、B5 方法代理、Manager 集成零感知、v1.8.3 集合名归一化与真实 `ChromaClient` 语义通道、B13 ANN 近邻冲突检测、stale 向量 `status` 过滤、update 内容变更 delete-then-add |
 | `tests/tools/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
 | `tests/context/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
-| `tests/mcp/test_mcp.py` | ✅ 10/10 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出 |
-| `tests/database/test_database.py` | ✅ 94/94 | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系；另有 `test_database_sqlite.py` 24 项、`test_database_mysql.py` 31 项（30 离线 + 1 真实 MySQL）、`test_database_chroma.py` 32 项（需 `pip install fast-agents[chroma]`），模块合计 182 项 |
-| `tests/trace/test_trace.py` | ✅ 74/74 | Span 模型、TraceLogger、LLM/Agent 打点、token 元数据、tool 真实耗时、生命周期与查询回放、预览截断可配置、replay/build_tree 树形聚合、error_type 自动分类、单调时钟耗时（抗墙钟跳变）、内存后端生命周期（close 不清空 / clear 主动清空）；同目录另有 `test_trace_jsonl_store.py` 12 项、`test_trace_sqlite_store.py` 11 项（老库自动迁移）、`test_trace_eval.py` 33 项（K3 评估）、`test_trace_cost.py` 19 项（K3 成本日报），模块合计 **149 项** |
+| `tests/skills/test_skills.py` | ⚠️ 60/64 | 技能系统专项（三级加载 / 基础三件套 / 启用禁用 / 依赖预检 / 脚本沙箱 / 中间件）；热重载 C14 有 4 项用例为已知待修（`reload_skill` 返回类型、`scan_skills`、`is_skill_loaded`、enable-disable 热重载） |
+| `tests/mcp/test_mcp.py` | ✅ 48/48 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出（10 项）；客户端状态机专项 10 项（连接 / 关闭幂等、notification 分发、并发按 id 分发、close 唤醒在途请求、握手超时回滚、handler 异常隔离）；transports 专项 7 项（stdio `stderr` 捕获、SSE 断线唤醒、close 幂等无僵尸）；schema→pydantic 转换专项 11 项；`resources` / `prompts` 专项 10 项（D7） |
+| `tests/database/test_database.py` | ✅ 94/94 | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系；另有 `test_database_sqlite.py` 24 项、`test_database_mysql.py` 34 项（33 离线 + 1 真实 MySQL）、`test_database_chroma.py` 32 项（需 `pip install fast-agents[chroma]`），模块合计 184 项 |
+| `tests/trace/test_trace.py` | ✅ 81/81 | Span 模型、TraceLogger、LLM/Agent 打点、token 元数据、tool 真实耗时、生命周期与查询回放、预览截断可配置、replay/build_tree 树形聚合、error_type 自动分类、单调时钟耗时（抗墙钟跳变）、内存后端生命周期（close 不清空 / clear 主动清空）；同目录另有 `test_trace_jsonl_store.py` 12 项、`test_trace_sqlite_store.py` 11 项（老库自动迁移）、`test_trace_eval.py` 33 项（K3 评估）、`test_trace_cost.py` 19 项（K3 成本日报），模块合计 **156 项** |
 
 `examples/demo.py` / `examples/memory/demo_memory.py` 是可读性更强的示例脚本，不是断言式测试。
 
@@ -1334,16 +1357,16 @@ python tests\trace\test_trace_cost.py
 
 | 模块 | 状态 | 下一步重点 |
 |------|------|-----------|
-| 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A15 测试护栏、A16 并发语义加固、A17 装饰器透出 `metadata`、A18 `return_direct`、A20 计算器 AST 迁移、A33 入参解析统一） | **P1**：RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：A26 主循环多 `tool_calls` 走并发入口、异步 `arun`、跨平台 Shell、`ToolRegistry` 清理、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
-| 🧩 **skill** | ✅ 已实现 | 脚本沙箱（C6）、默认扫描路径统一（C7）、技能依赖 / 版本管理（C8）、技能市场（C9）、`allowed_tools` 生效（C10） |
-| 🔌 **mcp** | ✅ 已实现 | `streamable-http` 传输（D6）、`resources` / `prompts`（D7）、图片透传（D8）、断线自动重连（D9）、stderr 消费（D10） |
+| 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A15 测试护栏、A16 并发语义加固、A17 装饰器透出 `metadata`、A18 `return_direct`、A20 计算器 AST 迁移、A26 主循环多 `tool_calls` 并发入口、A33 入参解析统一） | **P1**：RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：异步 `arun`、跨平台 Shell、`ToolRegistry` 清理与 `global_registry` 隔离（A22 / A34）、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
+| 🧩 **skill** | ✅ 已实现并完成多轮增强（C7 扫描路径统一、C6-2 脚本沙箱、C10 `allowed_tools`、C11 启用 / 禁用、C12 依赖与前置检查、C14 热重载；共 12 个内置工具） | 技能多版本共存与冲突消解（C8）、技能市场 / 远程安装（C9）、索引文本与 `assets/` 治理（C15） |
+| 🔌 **mcp** | ✅ 已实现（D2 适配器、D4 声明式配置、D6 `streamable-http` 传输（v3.3.0）、D7 `resources` / `prompts`、D10 `stderr` 消费均已落地） | 图片 / 二进制透传（D8）、断线自动重连（D9）、调用超时可配置（D11）、`close_all()` 后真正拦截（D12）、按 server 分别指定展开模式（D13） |
 | 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；「**记忆 v2**」已全部收口：B8 时间统一为北京时间 CST、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线（v1.8.2 修复窗口写满停摆）、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解（v1.9.0，v1.9.1 补过期场景、v1.9.2 接显式冲突上报）均已落地；另 B14 `ChromaMemoryStore` 阶段 1（v1.8.0）/ 阶段 2（v1.8.3 真实接入 `ChromaClient`）已完成 |
 | 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
-| 🪟 **context** | ✅ 已实现（v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、embedding 召回扩展位 |
-| 🗄 **database** | ✅ v1.1.0（关系型双后端 + 统一异常体系 + 向量后端） | 连接池 / 线程安全（J2）、Postgres 后端（J4 续）、多租户；memory / trace 后端已迁入（J3） |
-| 🛠 **trace** | ✅ K1 已实现并完成收尾（TraceLogger v1.0.0，含 InMemory / Jsonl / SQLite 三后端 + 预览截断可配置 / 树形回放 / error_type 分类 / 单调时钟耗时）、K3 评估器已落地；其余 ⏳ 规划中 | 异步并发（K2）、Web UI 可视化（K4）、外部上报 OTLP / Langfuse（K5）|
+| 🪟 **context** | ✅ 已实现（F1–F3、F5 已交付；v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、Run 内逐步预算守卫（F6）、工具 schema 计入预算（F7）、summary 层跨 run 回流（F8）、`validate()` 接入 `build()`（F9）、流式截断（F13）、卸载文件生命周期管理（F14） |
+| 🗄 **database** | ✅ v1.1.0（关系型双后端 + 统一异常体系 + 向量后端；J3 memory / trace 后端已迁入） | 连接池 / 线程安全（J2）、Postgres 后端（J4 续）、`Query.filters` 支持 OR / 嵌套条件组（J7） |
+| 🛠 **trace** | ✅ K1 已实现并完成收尾（TraceLogger v1.0.0，含 InMemory / Jsonl / SQLite 三后端 + 预览截断可配置 / 树形回放 / error_type 分类 / 单调时钟耗时）、K3 基础统计 + CSV 明细 + Token 成本日报已落地；其余 ⏳ 规划中 | 异步并发（K2）、K3 高阶（LLM Judge / Win Rate / 批量回归）、Web UI 可视化（K4）、外部上报 OTLP / Langfuse（K5）|
 
-**当前 P0 已清零**（A15 测试护栏、A16 并发语义加固均已归档）。**当前 P1 重点**：RAG 工具（A7）、`streamable-http`（D6）、PlanExecuteAgent（E1）；记忆侧 B 系列主体已收尾，「记忆 v2」（B8–B13）已全部收口，只余 B6 多租户。
+**当前 P0 已清零**（A15 测试护栏、A16 并发语义加固均已归档）。**当前 P1 重点**：RAG 工具（A7）、Tavily 打磨（A11）、PlanExecuteAgent（E1）（`streamable-http`（D6）已于 v3.3.0 交付）；记忆侧 B 系列主体已收尾，「记忆 v2」（B8–B13）已全部收口，只余 B6 多租户。
 
 ---
 
