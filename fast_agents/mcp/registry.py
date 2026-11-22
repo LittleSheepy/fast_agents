@@ -7,9 +7,15 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .client import MCPClient
 from .errors import MCPError
-from .models import MCPConfig, ToolInfo
+from .models import (
+    MCPConfig, ToolInfo,
+    ResourceInfo, ResourceTemplateInfo,
+    PromptInfo,
+)
 from .tool import MCPToolAdapter, MCPServerTool
-from .transports import SSETransport, StdioTransport, make_stdio
+from .transports import (
+    SSETransport, StdioTransport, StreamableHTTPTransport, make_stdio_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +36,9 @@ class MCPRegistry:
         self._factories: Dict[str, Callable[[], MCPClient]] = {}
         self._clients: Dict[str, MCPClient] = {}
         self._tools: Dict[str, List[ToolInfo]] = {}
+        self._resources: Dict[str, List[ResourceInfo]] = {}
+        self._resource_templates: Dict[str, List[ResourceTemplateInfo]] = {}
+        self._prompts: Dict[str, List[PromptInfo]] = {}
         # 记录每个 server 当前注册出去的工具名（用于断开 / 重新展开时清理）
         self._registered_names: Dict[str, List[str]] = {}
         self._expand_mode: Dict[str, str] = {}
@@ -52,6 +61,12 @@ class MCPRegistry:
             if not config.url:
                 raise MCPError(f"MCPConfig '{config.name}' (sse) 需要 url")
             self.add_sse(config.name, config.url, headers=config.headers, timeout=config.timeout)
+        elif config.transport == "streamable_http":
+            if not config.url:
+                raise MCPError(f"MCPConfig '{config.name}' (streamable_http) 需要 url")
+            self.add_streamable_http(
+                config.name, config.url, headers=config.headers, timeout=config.timeout,
+            )
         else:
             raise MCPError(f"未知 transport: {config.transport}")
 
@@ -69,12 +84,20 @@ class MCPRegistry:
 
     def add_stdio_cmd(self, name: str, command_str: str, cwd: Optional[str] = None) -> None:
         """便捷方法：直接传命令字符串，自动 shlex.split（Windows 用 posix=False）。"""
-        t = make_stdio(command_str, cwd=cwd)
+        t = make_stdio_transport(command_str, cwd=cwd)
         self._factories[name] = lambda t=t: MCPClient(t)
 
     def add_sse(self, name: str, url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0) -> None:
         def factory(url=url, headers=headers, timeout=timeout):
             t = SSETransport(url=url, headers=headers, timeout=timeout)
+            return MCPClient(t)
+        self._factories[name] = factory
+
+    def add_streamable_http(self, name: str, url: str, headers: Optional[Dict[str, str]] = None,
+                            timeout: float = 30.0) -> None:
+        """注册一个 Streamable HTTP 类型的 server（单端点 HTTP，MCP 2025 规范）。"""
+        def factory(url=url, headers=headers, timeout=timeout):
+            t = StreamableHTTPTransport(url=url, headers=headers, timeout=timeout)
             return MCPClient(t)
         self._factories[name] = factory
 
@@ -89,10 +112,23 @@ class MCPRegistry:
         init = client.connect(timeout=timeout)
         self._clients[name] = client
         self._tools[name] = client.list_tools(timeout=timeout)
+        # 加载资源和提示模板缓存（服务器不支持对应能力时自动返回空列表）
+        self._resources[name] = client.list_resources(timeout=timeout)
+        self._resource_templates[name] = client.list_resource_templates(timeout=timeout)
+        self._prompts[name] = client.list_prompts(timeout=timeout)
+        # 注册 list_changed 通知处理器，服务端工具/资源/提示变更时自动刷新本地缓存
+        caps = init.capabilities
+        if caps.tools and caps.tools.get("listChanged"):
+            client.on_notification("notifications/tools/list_changed", lambda _p, n=name: self._refresh_tools(n))
+        if caps.resources and caps.resources.get("listChanged"):
+            client.on_notification("notifications/resources/list_changed", lambda _p, n=name: self._refresh_resources(n))
+        if caps.prompts and caps.prompts.get("listChanged"):
+            client.on_notification("notifications/prompts/list_changed", lambda _p, n=name: self._refresh_prompts(n))
         logger.info(
-            "MCP[%s] 已连接：%s v%s，工具 %d 个",
+            "MCP[%s] 已连接：%s v%s，工具 %d 个，资源 %d 个，提示模板 %d 个",
             name, init.server_info.get("name", "unknown"),
             init.server_info.get("version", "?"), len(self._tools[name]),
+            len(self._resources[name]), len(self._prompts[name]),
         )
         return client
 
@@ -108,6 +144,9 @@ class MCPRegistry:
         if c:
             c.close()
         self._tools.pop(name, None)
+        self._resources.pop(name, None)
+        self._resource_templates.pop(name, None)
+        self._prompts.pop(name, None)
         self._registered_names.pop(name, None)
         self._expand_mode.pop(name, None)
         self._prefix_sep.pop(name, None)
@@ -116,6 +155,42 @@ class MCPRegistry:
         for name in list(self._clients.keys()):
             self.close(name)
         self._closed = True
+
+    # ── list_changed 缓存自动刷新 ────────────────────────────
+
+    def _refresh_tools(self, server_name: str) -> None:
+        """服务端推送 tools/list_changed 时刷新本地工具缓存，不自动重注册工具（避免打断正在执行的调用）。"""
+        client = self._clients.get(server_name)
+        if not client:
+            return
+        try:
+            self._tools[server_name] = client.list_tools(timeout=5.0)
+            logger.info("MCP[%s] 工具列表已刷新，共 %d 个工具", server_name, len(self._tools[server_name]))
+        except Exception as e:
+            logger.warning("MCP[%s] 刷新工具列表失败：%s", server_name, e)
+
+    def _refresh_resources(self, server_name: str) -> None:
+        """服务端推送 resources/list_changed 时刷新本地资源缓存。"""
+        client = self._clients.get(server_name)
+        if not client:
+            return
+        try:
+            self._resources[server_name] = client.list_resources(timeout=5.0)
+            self._resource_templates[server_name] = client.list_resource_templates(timeout=5.0)
+            logger.info("MCP[%s] 资源列表已刷新，共 %d 个资源", server_name, len(self._resources[server_name]))
+        except Exception as e:
+            logger.warning("MCP[%s] 刷新资源列表失败：%s", server_name, e)
+
+    def _refresh_prompts(self, server_name: str) -> None:
+        """服务端推送 prompts/list_changed 时刷新本地提示模板缓存。"""
+        client = self._clients.get(server_name)
+        if not client:
+            return
+        try:
+            self._prompts[server_name] = client.list_prompts(timeout=5.0)
+            logger.info("MCP[%s] 提示模板列表已刷新，共 %d 个模板", server_name, len(self._prompts[server_name]))
+        except Exception as e:
+            logger.warning("MCP[%s] 刷新提示模板列表失败：%s", server_name, e)
 
     # ── 查询 ─────────────────────────────────────────────────
 
@@ -134,6 +209,39 @@ class MCPRegistry:
         if server:
             return {server: self._tools.get(server, [])}
         return dict(self._tools)
+
+    def list_resources(self, server: Optional[str] = None) -> Dict[str, List[ResourceInfo]]:
+        """查询已连接 server 的资源列表，可指定单个 server 或返回全部。"""
+        if server:
+            return {server: self._resources.get(server, [])}
+        return dict(self._resources)
+
+    def list_resource_templates(self, server: Optional[str] = None) -> Dict[str, List[ResourceTemplateInfo]]:
+        """查询已连接 server 的参数化资源模板列表。"""
+        if server:
+            return {server: self._resource_templates.get(server, [])}
+        return dict(self._resource_templates)
+
+    def list_prompts(self, server: Optional[str] = None) -> Dict[str, List[PromptInfo]]:
+        """查询已连接 server 的提示模板列表。"""
+        if server:
+            return {server: self._prompts.get(server, [])}
+        return dict(self._prompts)
+
+    def read_resource(self, server_name: str, uri: str, timeout: float = 30.0):
+        """按 URI 读取指定 server 的资源。"""
+        client = self._clients.get(server_name)
+        if not client:
+            raise MCPError(f"MCP server '{server_name}' 未连接")
+        return client.read_resource(uri, timeout=timeout)
+
+    def get_prompt(self, server_name: str, prompt_name: str, arguments: Optional[Dict[str, str]] = None,
+                   timeout: float = 30.0):
+        """按名称渲染指定 server 的提示模板。"""
+        client = self._clients.get(server_name)
+        if not client:
+            raise MCPError(f"MCP server '{server_name}' 未连接")
+        return client.get_prompt(prompt_name, arguments=arguments, timeout=timeout)
 
     def _tool_names_for(self, server_name: str, tools: List[ToolInfo],
                         expand: str, prefix_sep: str) -> List[str]:

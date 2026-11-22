@@ -50,12 +50,129 @@ class CallResult(BaseModel):
                 parts.append(item.get("text", ""))
             elif t == "image":
                 mime = item.get("mimeType", "image")
-                parts.append(f"[图片：{mime}]")
+                data = item.get("data", "")
+                parts.append(f"[图片：{mime}, 长度={len(data)}]")
             elif t == "resource":
-                parts.append(f"[资源] {item.get('resource', {}).get('uri', '')}")
+                res = item.get("resource", {})
+                parts.append(f"[资源] {res.get('uri', '')}")
             else:
                 parts.append(str(item))
         return "\n".join(parts) if parts else "(无输出)"
+
+    def images(self) -> List[Dict[str, str]]:
+        """提取返回里的图片内容列表，每个元素含 mime/data(base64)。"""
+        out = []
+        for item in self.content:
+            if item.get("type") == "image":
+                out.append({
+                    "mime": item.get("mimeType", "image/png"),
+                    "data": item.get("data", ""),
+                })
+        return out
+
+    def raw_content(self) -> List[Dict[str, Any]]:
+        """返回 MCP 原始 content 列表（含 text/image/resource 等），供上层做多模态透传。"""
+        return list(self.content)
+
+
+# ==================== Resources（资源）相关模型 ====================
+
+
+class TextResourceContents(BaseModel):
+    """文本资源内容"""
+    uri: str
+    mimeType: str = "text/plain"
+    text: str
+
+
+class BlobResourceContents(BaseModel):
+    """二进制资源内容"""
+    uri: str
+    mimeType: str = "application/octet-stream"
+    blob: str  # base64
+
+
+class ResourceInfo(BaseModel):
+    """resources/list 返回的资源元信息"""
+    uri: str
+    name: str
+    description: str = ""
+    mimeType: Optional[str] = None
+    size: Optional[int] = None
+
+
+class ResourceTemplateInfo(BaseModel):
+    """resources/list 返回的资源模板（参数化 URI）"""
+    uriTemplate: str
+    name: str
+    description: str = ""
+    mimeType: Optional[str] = None
+
+
+class ReadResourceResult(BaseModel):
+    """resources/read 返回结果"""
+    contents: List[Dict[str, Any]] = Field(default_factory=list)
+
+    def as_text(self) -> str:
+        parts = []
+        for c in self.contents:
+            if "text" in c:
+                parts.append(c.get("text", ""))
+            else:
+                mime = c.get("mimeType", "binary")
+                uri = c.get("uri", "")
+                parts.append(f"[二进制资源：{uri} ({mime})]")
+        return "\n".join(parts) if parts else "(无内容)"
+
+
+# ==================== Prompts（提示模板）相关模型 ====================
+
+
+class PromptArgument(BaseModel):
+    """提示模板参数定义"""
+    name: str
+    description: str = ""
+    required: bool = False
+
+
+class PromptMessage(BaseModel):
+    """get_prompt 返回的单条消息"""
+    role: Literal["user", "assistant"]
+    content: Dict[str, Any]
+
+    def as_text(self) -> str:
+        t = self.content.get("type", "")
+        if t == "text":
+            return self.content.get("text", "")
+        elif t == "resource":
+            res = self.content.get("resource", {})
+            return f"[资源] {res.get('uri', '')}"
+        elif t == "image":
+            return f"[图片：{self.content.get('mimeType', '')}]"
+        return str(self.content)
+
+
+class PromptInfo(BaseModel):
+    """prompts/list 返回的提示模板元信息"""
+    name: str
+    description: str = ""
+    arguments: List[PromptArgument] = Field(default_factory=list)
+
+
+class GetPromptResult(BaseModel):
+    """prompts/get 返回结果"""
+    description: str = ""
+    messages: List[PromptMessage] = Field(default_factory=list)
+
+    def as_messages(self, role_prefix: bool = True) -> List[Dict[str, str]]:
+        """转成标准 {role, content} 消息列表，可直接塞给 LLM。"""
+        out = []
+        for m in self.messages:
+            out.append({"role": m.role, "content": m.as_text()})
+        return out
+
+    def as_text(self) -> str:
+        return "\n".join(m.as_text() for m in self.messages)
 
 
 class MCPConfig(BaseModel):
@@ -76,16 +193,16 @@ class MCPConfig(BaseModel):
     """
 
     name: str = Field(description="MCP server 别名")
-    transport: Literal["stdio", "sse"] = Field(description="传输类型")
+    transport: Literal["stdio", "sse", "streamable_http"] = Field(description="传输类型")
     # stdio 必填
     command: Optional[str] = Field(default=None, description="stdio：可执行文件路径/命令名")
     args: List[str] = Field(default_factory=list, description="stdio：命令参数列表")
     env: Optional[Dict[str, str]] = Field(default=None, description="stdio：额外环境变量")
     cwd: Optional[str] = Field(default=None, description="stdio：子进程工作目录")
     command_str: Optional[str] = Field(default=None, description="stdio：直接传完整命令串（自动 shlex.split，Windows 用 posix=False）")
-    # sse 必填
-    url: Optional[str] = Field(default=None, description="sse：服务端地址")
-    headers: Optional[Dict[str, str]] = Field(default=None, description="sse：HTTP 请求头")
+    # sse / streamable_http 必填
+    url: Optional[str] = Field(default=None, description="sse/streamable_http：服务端地址")
+    headers: Optional[Dict[str, str]] = Field(default=None, description="sse/streamable_http：HTTP 请求头")
     timeout: float = Field(default=30.0, description="连接超时秒数")
 
     @classmethod
@@ -97,6 +214,12 @@ class MCPConfig(BaseModel):
     def sse(cls, name: str, url: str, headers: Optional[Dict[str, str]] = None,
             timeout: float = 30.0) -> "MCPConfig":
         return cls(name=name, transport="sse", url=url, headers=headers, timeout=timeout)
+
+    @classmethod
+    def streamable_http(cls, name: str, url: str, headers: Optional[Dict[str, str]] = None,
+                        timeout: float = 30.0) -> "MCPConfig":
+        """声明式构造一个 Streamable HTTP 类型的 server（单端点 HTTP，MCP 2025 规范）。"""
+        return cls(name=name, transport="streamable_http", url=url, headers=headers, timeout=timeout)
 
     @classmethod
     def stdio_cmd(cls, name: str, command_str: str, cwd: Optional[str] = None) -> "MCPConfig":
