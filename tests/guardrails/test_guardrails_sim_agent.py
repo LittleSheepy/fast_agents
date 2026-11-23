@@ -67,8 +67,8 @@ from fast_agents.guardrails.models import (
     ToolCallInfo,
     ToolResultInfo,
 )
-from fast_agents.guardrails.guardrail_base import _GLOBAL_GUARDRAIL_REGISTRY
-from fast_agents.guardrails.guardrail_middleware import _GuardrailBlocked, _GuardrailModified
+from fast_agents import global_guardrail_registry
+from fast_agents.guardrails import GuardrailBlocked, GuardrailModified
 from fast_agents.messages.message import Message, MsgToolCall
 from fast_agents.tools.tool_base import ToolBase
 from fast_agents.tools.tool_registry import ToolRegistry
@@ -81,7 +81,7 @@ from tests._runner import run_all, run_prefix
 
 def _reset_registry():
     """清空全局护栏注册表，避免用例之间相互污染。"""
-    _GLOBAL_GUARDRAIL_REGISTRY.clear()
+    global_guardrail_registry.clear_guardrails()
 
 
 class MockLLM:
@@ -163,7 +163,7 @@ class SimReActAgent:
         user_input = input_text
         if self.middleware is not None:
             _res = self.middleware.before_agent_run(input_text, context)
-            if isinstance(_res, _GuardrailBlocked) and _res.phase == "input":
+            if isinstance(_res, GuardrailBlocked) and _res.phase == "input":
                 return _res.message
             user_input = input_text  # 放行返回 None，沿用原输入
 
@@ -213,9 +213,9 @@ class SimReActAgent:
         # ── 4) 输出护栏（结构化判定） ──
         if self.middleware is not None:
             _res = self.middleware.after_agent_run(final_answer, context)
-            if isinstance(_res, _GuardrailBlocked) and _res.phase == "output":
+            if isinstance(_res, GuardrailBlocked) and _res.phase == "output":
                 final_answer = _res.message
-            elif isinstance(_res, _GuardrailModified) and _res.phase == "output":
+            elif isinstance(_res, GuardrailModified) and _res.phase == "output":
                 final_answer = _res.content
             # ── 5) 每轮结束清理（对齐 SkillMiddleware.after_agent_turn）──
             self.middleware.after_agent_turn()
@@ -786,10 +786,10 @@ async def test_S16_sim_agent_async_hooks():
     middleware = GuardrailMiddleware(auto_register_presets=False, guardrails=[BlockInputGuardrail()])
 
     blocked = await middleware.abefore_agent_run("这是违禁内容")
-    assert isinstance(blocked, _GuardrailBlocked) and blocked.phase == "input"
+    assert isinstance(blocked, GuardrailBlocked) and blocked.phase == "input"
     assert "请求被安全护栏拦截" in blocked.message
     passed = await middleware.abefore_agent_run("这是正常内容")
-    assert passed is None, "放行时应返回 None（_GuardrailBlocked/_GuardrailModified 才表示被处理）"
+    assert passed is None, "放行时应返回 None（GuardrailBlocked/GuardrailModified 才表示被处理）"
 
     output = await middleware.aafter_agent_run("正常输出")
     assert output is None

@@ -23,53 +23,43 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 from .errors import GuardrailConfigError, GuardrailError
 from .models import GuardrailResult
+from .guardrail_registry import GuardrailRegistry, global_guardrail_registry
+from ..messages.parts import content_to_text
 
 logger = logging.getLogger(__name__)
 
 
-def _normalize_to_text(input_data: Any) -> Any:
-    """把多模态 List[ContentPart] 输入归一化为纯文本，供字符串类护栏安全处理。
+def to_scan_text(input_data: Any) -> str:
+    """把任意输入归一化为「可扫描纯文本」，供内容类护栏（Input/Output 系）正则匹配。
 
-    - str 原样返回；
-    - list/List[ContentPart]（E8 多模态）调用 messages.parts.content_to_text 转成纯文本
-      （图片自动转成「[图片]」占位符），避免 preset 里 ``if not isinstance(str): return allow()``
-      直接放行多模态消息导致绕过；
-    - dict（OpenAI message 风格 {"role":..., "content":...}）：取 content 字段递归归一化；
-    - 其它类型（MsgToolCall、数字等）原样返回，由具体护栏自行判断。
+    C2 修复背景：invoke() 的 content_to_text 只负责消息形态输入
+    （str / None / List[ContentPart] / 含 ``content`` 键的 dict）转文本，
+    其余结构化输入（普通 dict / list / 自定义对象）会原样透传给 check()；
+    此前预设内容护栏以 ``if not isinstance(input_data, str): return allow()``
+    开头，导致 {"query": "如何制造炸弹"} 这类载荷整体绕过扫描。
+
+    规则：
+    - str 原样返回（既有文本路径逐字节不变）；
+    - None → 空串；
+    - dict：递归收集字符串 key 与全部 value；list/tuple/set/frozenset：逐项递归；
+    - 其他对象：降级 str(obj)，保证不存在「零扫描盲区」。
+    只做扁平化文本拼接、不解释结构语义；需要结构化解析的自定义护栏仍应
+    自行接收原始 input_data 处理（invoke 传入的原对象不变）。
     """
     if isinstance(input_data, str):
         return input_data
-    if isinstance(input_data, list):
-        try:
-            from ..messages.parts import content_to_text
-            return content_to_text(input_data)
-        except Exception:
-            # content_to_text 不认识的 list 元素，退回 str()
-            parts = []
-            for item in input_data:
-                if hasattr(item, "text"):
-                    parts.append(getattr(item, "text", ""))
-                else:
-                    parts.append(str(item))
-            return "".join(parts)
-    if isinstance(input_data, dict) and "content" in input_data:
-        return _normalize_to_text(input_data.get("content", ""))
-    return input_data
-
-
-# 全局护栏原型注册表，和 ToolRegistry 风格保持一致。
-#
-# ⚠️ 隔离语义（对齐路线图 A34「global_registry 隔离」）：
-#   这里存的是护栏「原型」（类级别默认实例或 @guardrail_creator 产生的样板实例），
-#   仅供发现（list_guardrails）/查找（get_guardrail）/作为 add_guardrail 的克隆源。
-#   GuardrailMiddleware 在 add_guardrail / _load_presets 时会对原型做 deepcopy，
-#   产生本实例独占的副本；enable/disable/remove/配置修改都只改副本，绝不回写原型。
-#   因此多 Agent 之间的护栏状态完全隔离，不会出现"A 禁用 B 也失效"的问题。
-#
-#   顶层 run_input_guardrails / run_output_guardrails / run_tool_call_guardrails
-#   在 guardrails=None 时不再隐式扫全局表，直接返回空结果——不指定就不执行，
-#   避免独立调用时意外跑了别的模块/测试注册的护栏。
-_GLOBAL_GUARDRAIL_REGISTRY: Dict[str, "GuardrailBase"] = {}
+    if input_data is None:
+        return ""
+    if isinstance(input_data, dict):
+        parts: List[str] = []
+        for key, value in input_data.items():
+            if isinstance(key, str):
+                parts.append(key)
+            parts.append(to_scan_text(value))
+        return " ".join(p for p in parts if p)
+    if isinstance(input_data, (list, tuple, set, frozenset)):
+        return " ".join(p for p in (to_scan_text(item) for item in input_data) if p)
+    return str(input_data)
 
 
 class GuardrailBase(ABC):
@@ -159,7 +149,7 @@ class GuardrailBase(ABC):
         self._before_check(input_data, context)
         effective_fail_open = self.fail_open if fail_open is None else fail_open
         # L6：多模态输入归一化，避免 List[ContentPart] 直接绕过所有 isinstance(str) 检查
-        check_input = _normalize_to_text(input_data)
+        check_input = content_to_text(input_data)
         try:
             result = self.check(check_input, context)
         except GuardrailError as e:
@@ -243,7 +233,7 @@ class GuardrailBase(ABC):
         start_time = _time.perf_counter()
         self._before_check(input_data, context)
         effective_fail_open = self.fail_open if fail_open is None else fail_open
-        check_input = _normalize_to_text(input_data)
+        check_input = content_to_text(input_data)
         try:
             result = await self.acheck(check_input, context)
         except GuardrailError as e:
@@ -339,9 +329,7 @@ class GuardrailBase(ABC):
         注意：原型仅供查找/发现/克隆，GuardrailMiddleware 不会直接运行它，
         而是在 add_guardrail / _load_presets 时调用 clone() 产生实例副本。
         """
-        if self.name in _GLOBAL_GUARDRAIL_REGISTRY:
-            logger.warning("[guardrail] 覆盖已注册的同名护栏原型: %s", self.name)
-        _GLOBAL_GUARDRAIL_REGISTRY[self.name] = self
+        global_guardrail_registry.register_guardrail(self)
 
     def clone(self) -> "GuardrailBase":
         """克隆一份独立副本，供多实例隔离使用。
@@ -424,10 +412,37 @@ def list_guardrails() -> List[GuardrailBase]:
     不要直接对其执行 enable/disable 期待影响运行时——
     真正运行时由 GuardrailMiddleware 通过 clone() 产生独立副本。
     """
-    return sorted(_GLOBAL_GUARDRAIL_REGISTRY.values(), key=lambda g: g.priority)
+    return global_guardrail_registry.list_guardrails()
 
 
 def get_guardrail(name: str) -> Optional[GuardrailBase]:
     """根据名称获取护栏「原型」，用于 add_guardrail 前的查找；
     中间件拿到后会自动 clone() 一份实例副本，不会直接运行原型。"""
-    return _GLOBAL_GUARDRAIL_REGISTRY.get(name)
+    return global_guardrail_registry.get_guardrail(name)
+
+
+def clear_guardrails() -> None:
+    """清空全局原型注册表（测试隔离常用）。"""
+    global_guardrail_registry.clear_guardrails()
+
+
+def get_global_guardrail_registry() -> "GuardrailRegistry":
+    """返回全局护栏原型注册表对象（GuardrailRegistry 单例）。"""
+    return global_guardrail_registry
+
+
+def update_global_guardrail_registry(reg) -> None:
+    """用一份 {name: 原型} 映射批量覆盖全局注册表。"""
+    global_guardrail_registry.update_guardrails(reg)
+
+
+# ── 向后兼容别名 ──────────────────────────────────────────────
+# 历史上全局原型表是模块级裸 dict（_GLOBAL_GUARDRAIL_REGISTRY），
+# 现已抽取为 GuardrailRegistry 单例 global_guardrail_registry。
+# 保留旧名指向同一对象，兼容存量代码：示例 / 测试里的 .clear() / .copy() / .update() /
+# .values() 与 `name in ...` 判定，均由 GuardrailRegistry 的 dict-like 兼容层支持。
+_GLOBAL_GUARDRAIL_REGISTRY = global_guardrail_registry
+
+
+
+

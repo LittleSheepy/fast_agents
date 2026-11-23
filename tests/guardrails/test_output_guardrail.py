@@ -20,8 +20,8 @@ from tests._runner import raises, run_all
 
 # 保存初始全局注册表，每个测试后恢复避免污染
 def _reset_registry():
-    from fast_agents.guardrails.guardrail_base import _GLOBAL_GUARDRAIL_REGISTRY
-    _GLOBAL_GUARDRAIL_REGISTRY.clear()
+    from fast_agents import global_guardrail_registry
+    global_guardrail_registry.clear_guardrails()
 
 
 def test_output_guardrail_allow():

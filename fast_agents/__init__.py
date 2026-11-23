@@ -47,8 +47,12 @@ from .skills import (
     SkillMetadata, SkillLoadResult,
 )
 from .guardrails import (
+    GuardrailRegistry,
+    global_guardrail_registry,
+    GuardrailBlocked,
+    GuardrailModified,
     GuardrailBase, GuardrailResult, guardrail_creator,
-    list_guardrails, get_guardrail,
+    list_guardrails, get_guardrail, to_scan_text,
     InputGuardrail, OutputGuardrail, ToolCallGuardrail,
     ToolCallInfo, ToolResultInfo,
     GuardrailMiddleware,
@@ -109,10 +113,12 @@ __all__ = [
 
     # Guardrails 安全护栏（L系列，v2.58.0）
     "GuardrailBase", "GuardrailResult", "guardrail_creator",
-    "list_guardrails", "get_guardrail",
+    "list_guardrails", "get_guardrail", "to_scan_text",
+    "GuardrailRegistry", "global_guardrail_registry",
     "InputGuardrail", "OutputGuardrail", "ToolCallGuardrail",
     "ToolCallInfo", "ToolResultInfo",
     "GuardrailMiddleware",
+    "GuardrailBlocked", "GuardrailModified",
     "GuardrailError", "InputGuardrailReject", "OutputGuardrailReject",
     "ToolCallGuardrailReject", "GuardrailConfigError",
     "log_guardrail_event",

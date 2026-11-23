@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..input_guardrail import InputGuardrail
 from ..output_guardrail import OutputGuardrail
+from ..guardrail_base import to_scan_text
 from ..models import GuardrailResult
 
 
@@ -110,10 +111,11 @@ class BasicInputSafetyGuardrail(InputGuardrail):
         ]
 
     def check(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
-        if not isinstance(input_data, str):
+        # C2：非 str 的结构化输入（dict/list 等）递归展开为可扫描文本，不再
+        # 无脑放行；str 输入经 to_scan_text 原样返回，与修复前走同一路径、行为不变。
+        text = to_scan_text(input_data).lower()
+        if not text:
             return GuardrailResult.allow()
-
-        text = input_data.lower()
         for pattern, reason in self._compiled:
             if pattern.search(text):
                 return GuardrailResult.reject(f"内容违规：{reason}")
@@ -179,10 +181,10 @@ class BasicOutputSafetyGuardrail(OutputGuardrail):
         ]
 
     def check(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
-        if not isinstance(input_data, str):
+        # C2：同输入侧——非 str 结构化输入展开后可扫，不再无脑放行；str 路径行为不变。
+        text = to_scan_text(input_data).lower()
+        if not text:
             return GuardrailResult.allow()
-
-        text = input_data.lower()
         for pattern, reason in self._compiled:
             for match in pattern.finditer(text):
                 # 命中处附近有缓和语境（违法 / 拒绝 / 抱歉…）→ 视为科普或拒答，放行

@@ -17,6 +17,11 @@ from .guardrail_base import (
     guardrail_creator,
     list_guardrails,
     get_guardrail,
+    to_scan_text,
+)
+from .guardrail_registry import (
+    GuardrailRegistry,
+    global_guardrail_registry,
 )
 from .models import (
     GuardrailResult,
@@ -40,7 +45,7 @@ from .tool_call_guardrail import (
     arun_tool_call_guardrails,
     arun_tool_result_guardrails,
 )
-from .guardrail_middleware import GuardrailMiddleware
+from .guardrail_middleware import GuardrailMiddleware, GuardrailBlocked, GuardrailModified
 from .errors import (
     GuardrailError,
     InputGuardrailReject,
@@ -61,6 +66,11 @@ __all__ = [
     "guardrail_creator",
     "list_guardrails",
     "get_guardrail",
+    # 输入归一化工具（C2：内容类护栏扫描前把 dict/list 展开为纯文本）
+    "to_scan_text",
+    # 原型注册表
+    "GuardrailRegistry",
+    "global_guardrail_registry",
     # 三类护栏
     "InputGuardrail",
     "OutputGuardrail",
@@ -76,6 +86,9 @@ __all__ = [
     "arun_tool_result_guardrails",
     # 中间件
     "GuardrailMiddleware",
+    # 控制流信号（跨模块协作点：中间件→Agent 主循环的结构化返回值）
+    "GuardrailBlocked",
+    "GuardrailModified",
     # 异常
     "GuardrailError",
     "InputGuardrailReject",

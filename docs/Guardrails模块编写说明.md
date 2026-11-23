@@ -181,7 +181,7 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
   - 注册方法：`register()`/`unregister()`，支持全局注册/注销
 - 全局注册表：`_GLOBAL_GUARDRAIL_REGISTRY`，存储所有已注册护栏实例
 - `@guardrail_creator`装饰器：快速注册函数式护栏，对齐`@tool_creator`使用方式
-- 工具函数：`list_guardrails()`（按优先级排序列出所有护栏）、`get_guardrail(name)`（按名称获取护栏实例）
+- 工具函数：`list_guardrails()`（按优先级排序列出所有护栏）、`get_guardrail(name)`（按名称获取护栏实例）、`to_scan_text(input_data)`（C2：把任意结构化输入 dict/list/对象递归展开为可扫描纯文本，供内容类护栏使用；str 原样返回，不影响既有文本路径）
 
 ### 7.2 input_guardrail.py
 输入护栏实现：
@@ -207,9 +207,24 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
 中间件实现，对齐SkillMiddleware生命周期接口：
 - 核心方法：
   - `before_agent_run()`：Agent运行前执行输入护栏检查
-  - `before_tool_call()`：工具调用前执行工具前置护栏检查，返回True/False表示是否允许调用
-  - `after_tool_call()`：工具返回后执行工具后置护栏检查
-  - `after_agent_run()`：Agent返回结果前执行输出护栏检查，返回处理后的结果
+  - `before_tool_call()`：工具调用前执行工具前置护栏检查，返回 False 表示不允许调用。
+    返回 False（或钩子自身抛异常被主循环 fail-closed 兜底）时，主循环会为本批次**每一个**
+    `tool_call` 各生成一条 tool 消息：被拦的那条写拦截理由，同批其余未执行的写「未执行」占位，
+    以保证 assistant 消息声明的 tool_call_id 与 tool 消息严格配对（缺一条即 OpenAI 返回 400）。
+    主循环用 `_coerce_tool_args()` 把工具参数统一解析成 dict 后再传给钩子，保证护栏检查与实际
+    执行用同一份参数（避免「护栏看 dict、工具收字符串」的不一致漏洞）。
+    拦截统计：`run_*_guardrails` 抛出的 `ToolCallGuardrailReject` 异常已携带完整 `e.results`
+    （含拒绝项），中间件只遍历 `e.results` 记录一次，不再另造 `reject_result` 重复计数。
+    同一「不重复计数」规则现覆盖全部四类钩子（C1 修复，同步/异步严格一致）：
+    `before_agent_run`/`after_agent_run` 的 `InputGuardrailReject`/`OutputGuardrailReject`
+    分支也已只遍历 `e.results` 补记一次，每次拦截统计计 1 次、发 1 个 span
+  - `after_tool_call()`：工具返回后执行工具后置护栏检查；结果为 `str` 时替换 observation，
+    为 `None` 时表示未修改、主循环保留原始渲染结果
+  - `after_agent_run()`：Agent返回结果前执行输出护栏检查，返回处理后的结果。
+    主循环里**两条产出最终答案的路径都会走它**（C3 修复）：①模型直接给出文本；
+    ②`return_direct` 工具命中后直接短路的工具输出。修复前只有路径①调用本钩子，
+    `return_direct` 的工具原始输出会绕过全部输出护栏原样透传给用户；现两段判定收敛为
+    `ReActAgent._apply_output_guardrails()` 单一方法，两条路径共用，新增产出路径时只需调该方法。
 - 功能特性：
   - `auto_register_presets`：初始化时自动加载三个预设护栏
   - `fail_open`：护栏执行出错时是否放行，默认True（容错优先）
@@ -223,8 +238,8 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
 - 所有护栏通过/拦截事件自动上报，可在Trace链路中查询审计
 
 ### 7.7 preset/ 预设护栏
-- `safety_guardrail.py`：基础内容安全检查。输入侧（`DEFAULT_BLOCKED_PATTERNS`）识别用户「索取」违法/危险信息的请求；输出侧改用独立模式表（`DEFAULT_OUTPUT_BLOCKED_PATTERNS`），只拦截「确实在产出」可执行危害信息的表述，并叠加缓和语境豁免（命中附近出现「违法/禁止/抱歉/无法提供」等否定、警示、拒答词则放行），避免模型正常解释「如何制造毒品是违法的」被误拦。属高召回确定性基线，非高精度分类器。
-- `injection_guardrail.py`：Prompt注入检测。中英双语规则表（中文「忽略之前的指令」「越狱」等，英文 `ignore previous instructions` / `do anything now` / `jailbreak` 等），匹配前先做 NFKC 归一化 + 转小写 + 去零宽字符，并在「去空白/分隔符」的压缩串上二次匹配，可对抗大小写、全角同形字与加空格绕过。
+- `safety_guardrail.py`：基础内容安全检查。输入侧（`DEFAULT_BLOCKED_PATTERNS`）识别用户「索取」违法/危险信息的请求；输出侧改用独立模式表（`DEFAULT_OUTPUT_BLOCKED_PATTERNS`），只拦截「确实在产出」可执行危害信息的表述，并叠加缓和语境豁免（命中附近出现「违法/禁止/抱歉/无法提供」等否定、警示、拒答词则放行），避免模型正常解释「如何制造毒品是违法的」被误拦。属高召回确定性基线，非高精度分类器。C2 修复后，非 str 的结构化输入（如 `{"query": "如何制造炸弹"}`）不再直接放行，而是经 `to_scan_text` 递归展开后照常扫描。
+- `injection_guardrail.py`：Prompt注入检测。中英双语规则表（中文「忽略之前的指令」「越狱」等，英文 `ignore previous instructions` / `do anything now` / `jailbreak` 等），匹配前先做 NFKC 归一化 + 转小写 + 去零宽字符，并在「去空白/分隔符」的压缩串上二次匹配，可对抗大小写、全角同形字与加空格绕过；C2 修复后同样覆盖 dict/list 结构化载荷（先 `to_scan_text` 展开再进入双视图匹配）。
 - `permission_guardrail.py`：高危工具权限控制，优先读 `ToolRegistry` 的 `requires_approval` 元数据（单一事实源），默认拦截 shell 执行、敏感路径写入、危险命令等高危操作。
 
 ### 7.8 errors.py
@@ -341,8 +356,8 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
 | `enable_guardrail(name)` | 启用护栏 |
 | `disable_guardrail(name)` | 禁用护栏 |
 | `before_agent_run(user_input, context=None)` | 输入检查，返回处理后的输入 |
-| `before_tool_call(tool_name, tool_args, context=None)` | 工具前置检查，返回True/False |
-| `after_tool_call(tool_name, result, context=None)` | 工具后置检查 |
+| `before_tool_call(tool_name, tool_args, context=None)` | 工具前置检查，返回 True/False；False 时主循环为整批 tool_call 补齐响应消息 |
+| `after_tool_call(tool_name, success, output="", error="", context=None, **kwargs)` | 工具后置检查；`str` 替换 observation，`None` 表示未修改、保持原结果 |
 | `after_agent_run(agent_output, context=None)` | 输出检查，返回处理后的输出 |
 | `get_stats()` | 获取拦截/放行统计 |
 

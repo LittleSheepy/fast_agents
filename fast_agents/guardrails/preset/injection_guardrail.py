@@ -25,6 +25,7 @@ import unicodedata
 from typing import Any, Dict, List, Optional
 
 from ..input_guardrail import InputGuardrail
+from ..guardrail_base import to_scan_text
 from ..models import GuardrailResult
 
 
@@ -107,11 +108,14 @@ class PromptInjectionGuardrail(InputGuardrail):
         self.block_on_match = block_on_match
 
     def check(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
-        if not isinstance(input_data, str):
+        # C2：非 str 的结构化输入（dict/list 等）递归展开为可扫描文本，不再
+        # 无脑放行；str 输入经 to_scan_text 原样返回，与修复前行为逐字节一致。
+        scan_text = to_scan_text(input_data)
+        if not scan_text:
             return GuardrailResult.allow()
 
         # 两个视图：归一化串（保留词间空格）/ 压缩串（去掉全部空白与分隔符）
-        normalized = _normalize_text(input_data)
+        normalized = _normalize_text(scan_text)
         squeezed = _squeeze_text(normalized)
 
         matched: List[str] = []

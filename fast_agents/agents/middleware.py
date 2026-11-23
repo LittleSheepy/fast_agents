@@ -13,7 +13,7 @@ OpenTelemetry Middleware 的共同设计：所有挂载到 ReActAgent ``middlewa
   SkillMiddleware **不**继承本 ABC，也就不能被误塞进 ``middleware=[]``。
 - 所有钩子提供默认空实现，子类只需要覆盖需要的方法；
 - 同步/异步成对，默认异步通过 asyncio.to_thread 转同步，减少子类实现负担；
-- 返回值语义用 dataclass 明确（_GuardrailBlocked/_GuardrailModified 在
+- 返回值语义用 dataclass 明确（GuardrailBlocked/GuardrailModified 在
   guardrail_middleware 中定义，这里只声明 Any 返回类型以避免循环依赖）。
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ class AgentMiddleware(ABC):
       在用户输入进入推理循环前调用（输入护栏、审计等场景）。
       返回值：
         * ``None`` 放行；
-        * ``_GuardrailBlocked(phase="input", message=...)`` 拦截本轮，
+        * ``GuardrailBlocked(phase="input", message=...)`` 拦截本轮，
           message 作为最终回答直接返回给用户。
 
     - ``before_tool_call(tool_name, tool_args, context=None, **kwargs)``
@@ -57,8 +57,8 @@ class AgentMiddleware(ABC):
       Agent 产出最终回答、返回给用户前调用（输出护栏、后处理）。
       返回值：
         * ``None`` 放行；
-        * ``_GuardrailBlocked(phase="output", message=...)`` 拦截，message 替换最终答案；
-        * ``_GuardrailModified(phase="output", content=...)`` 修改/脱敏，content 替换最终答案。
+        * ``GuardrailBlocked(phase="output", message=...)`` 拦截，message 替换最终答案；
+        * ``GuardrailModified(phase="output", content=...)`` 修改/脱敏，content 替换最终答案。
 
     - ``after_agent_turn()``
       本轮对话结束后（finally 块中）调用，用于清理状态、卸载上下文、打点收尾等。

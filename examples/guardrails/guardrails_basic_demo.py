@@ -20,13 +20,14 @@ from fast_agents import (
     guardrail_creator,
     InputGuardrail, OutputGuardrail, ToolCallGuardrail,
     InputGuardrailReject, ToolCallGuardrailReject,
+    global_guardrail_registry,
 )
 from fast_agents.guardrails.models import (
     GuardrailResult, ToolCallInfo, ToolResultInfo,
 )
 from fast_agents.guardrails.input_guardrail import run_input_guardrails
 from fast_agents.guardrails.tool_call_guardrail import run_tool_call_guardrails
-from fast_agents.guardrails.guardrail_middleware import _GuardrailBlocked, _GuardrailModified
+from fast_agents.guardrails import GuardrailBlocked, GuardrailModified
 
 
 # -----------------------------------------------------------------------------
@@ -68,9 +69,8 @@ def demo_custom_input_guardrail():
             return GuardrailResult.allow()
 
     # 创建中间件，清空其他护栏避免干扰
-    from fast_agents.guardrails.guardrail_base import _GLOBAL_GUARDRAIL_REGISTRY
-    original_reg = _GLOBAL_GUARDRAIL_REGISTRY.copy()
-    _GLOBAL_GUARDRAIL_REGISTRY.clear()
+    original_reg = global_guardrail_registry.copy()
+    global_guardrail_registry.clear_guardrails()
     middleware = GuardrailMiddleware(auto_register_presets=False)
     middleware.add_guardrail(KeywordBlockGuardrail())
 
@@ -85,7 +85,7 @@ def demo_custom_input_guardrail():
     blocked_msg = result.message if result is not None else ""
     print(f"✅ 违规请求：'{blocked_input}' 被拦截，返回提示：{blocked_msg[:60]}...")
     print()
-    _GLOBAL_GUARDRAIL_REGISTRY.update(original_reg)
+    global_guardrail_registry.update_guardrails(original_reg)
 
 
 # -----------------------------------------------------------------------------
@@ -114,9 +114,8 @@ def demo_custom_tool_guardrail():
             return GuardrailResult.allow()
 
     # 创建中间件，清空其他护栏
-    from fast_agents.guardrails.guardrail_base import _GLOBAL_GUARDRAIL_REGISTRY
-    original_reg = _GLOBAL_GUARDRAIL_REGISTRY.copy()
-    _GLOBAL_GUARDRAIL_REGISTRY.clear()
+    original_reg = global_guardrail_registry.copy()
+    global_guardrail_registry.clear_guardrails()
     middleware = GuardrailMiddleware(auto_register_presets=False)
     middleware.add_guardrail(FileDeleteProtectGuardrail())
 
@@ -128,7 +127,7 @@ def demo_custom_tool_guardrail():
     allow = middleware.before_tool_call("delete_file", {"file_path": "/etc/passwd"})
     print("✅ 高危文件删除请求：'删除/etc/passwd' 被成功拦截" if not allow else "❌ 未拦截")
     print()
-    _GLOBAL_GUARDRAIL_REGISTRY.update(original_reg)
+    global_guardrail_registry.update_guardrails(original_reg)
 
 
 # -----------------------------------------------------------------------------
@@ -158,19 +157,18 @@ def demo_custom_output_guardrail():
             return GuardrailResult.allow()
 
     # 创建中间件
-    from fast_agents.guardrails.guardrail_base import _GLOBAL_GUARDRAIL_REGISTRY
-    original_reg = _GLOBAL_GUARDRAIL_REGISTRY.copy()
-    _GLOBAL_GUARDRAIL_REGISTRY.clear()
+    original_reg = global_guardrail_registry.copy()
+    global_guardrail_registry.clear_guardrails()
     middleware = GuardrailMiddleware(auto_register_presets=False)
     middleware.add_guardrail(PhoneDesensitizeGuardrail())
 
     original_output = "用户张三的手机号是13812345678，请注意查收验证码。"
     result = middleware.after_agent_run(original_output)
-    final_output = result.content if isinstance(result, _GuardrailModified) else original_output
+    final_output = result.content if isinstance(result, GuardrailModified) else original_output
     print(f"原始输出：{original_output}")
     print(f"护栏处理后输出：{final_output}")
     print("✅ 手机号已自动脱敏，符合数据安全要求\n")
-    _GLOBAL_GUARDRAIL_REGISTRY.update(original_reg)
+    global_guardrail_registry.update_guardrails(original_reg)
 
 
 # -----------------------------------------------------------------------------
@@ -194,7 +192,7 @@ def demo_prompt_injection_protection():
 
     for injection in injection_tests:
         result = middleware.before_agent_run(injection)
-        if isinstance(result, _GuardrailBlocked) and "请求被安全护栏拦截" in result.message:
+        if isinstance(result, GuardrailBlocked) and "请求被安全护栏拦截" in result.message:
             print(f"✅ 注入攻击已拦截：{injection[:30]}...")
         else:
             print(f"❌ 注入攻击未拦截：{injection[:20]}...")
@@ -216,9 +214,8 @@ def demo_decorator_usage():
     print("示例6：装饰器快速定义护栏 - @guardrail_creator")
     print("=" * 60)
 
-    from fast_agents.guardrails.guardrail_base import _GLOBAL_GUARDRAIL_REGISTRY
-    original_reg = _GLOBAL_GUARDRAIL_REGISTRY.copy()
-    _GLOBAL_GUARDRAIL_REGISTRY.clear()
+    original_reg = global_guardrail_registry.copy()
+    global_guardrail_registry.clear_guardrails()
 
     class LengthCheckGuardrail(InputGuardrail):
         name = "demo_length_check"
@@ -244,7 +241,7 @@ def demo_decorator_usage():
     except InputGuardrailReject as e:
         print(f"✅ 超长输入被成功拦截：{str(e)[:50]}...")
     print()
-    _GLOBAL_GUARDRAIL_REGISTRY.update(original_reg)
+    global_guardrail_registry.update_guardrails(original_reg)
 
 
 # -----------------------------------------------------------------------------

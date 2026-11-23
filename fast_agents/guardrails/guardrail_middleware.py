@@ -20,12 +20,13 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Union
 
 from ..agents.middleware import AgentMiddleware
-from .guardrail_base import GuardrailBase, _GLOBAL_GUARDRAIL_REGISTRY, _normalize_to_text
+from .guardrail_base import GuardrailBase
+from .guardrail_registry import global_guardrail_registry
 from .models import GuardrailResult, ToolCallInfo, ToolResultInfo
 from .input_guardrail import InputGuardrail, run_input_guardrails, arun_input_guardrails
 from .output_guardrail import OutputGuardrail, run_output_guardrails, arun_output_guardrails
 from .tool_call_guardrail import (
-    ToolCallGuardrail, ToolCallInfo, ToolResultInfo,
+    ToolCallGuardrail,
     run_tool_call_guardrails, run_tool_result_guardrails,
     arun_tool_call_guardrails, arun_tool_result_guardrails,
 )
@@ -36,8 +37,8 @@ _logger = logging.getLogger(__name__)
 
 
 @dataclass
-class _GuardrailBlocked:
-    """护栏拦截信号：phase=input/output，message 为给用户的提示文本。
+class GuardrailBlocked:
+    """护栏拦截信号：phase=input/tool_call/output，message 为给用户/LLM 的提示文本。
 
     中间件通过返回此结构化对象告诉 ReActAgent「这一轮被拦截了」，
     不再依赖对返回字符串做中文子串匹配，避免假阳性/假阴性/死条件。
@@ -55,7 +56,7 @@ class _GuardrailBlocked:
 
 
 @dataclass
-class _GuardrailModified:
+class GuardrailModified:
     """护栏修改信号：phase=output 时携带修改后的最终文本（脱敏/改写）。"""
 
     phase: str
@@ -186,7 +187,7 @@ class GuardrailMiddleware(AgentMiddleware):
         }
         for pn, proto in _prototypes.items():
             # 已存在就不重复注册，避免覆盖用户自定义的同名原型
-            if pn not in _GLOBAL_GUARDRAIL_REGISTRY:
+            if not global_guardrail_registry.is_registered(pn):
                 proto.register()
 
         preset_names = names if names is not None else list(_prototypes.keys())
@@ -311,7 +312,7 @@ class GuardrailMiddleware(AgentMiddleware):
         - 不把异常伪装成"规则命中"，独立计数到 ``__error__`` 键，避免故障率被淹没；
         - log_guardrail_event 的 metadata 显式标 ``is_error=True``、``reason_kind="error"``，
           与规则命中走同一个 SpanKind.GUARDRAIL 打点通道，但字段可被观测面区分；
-        - 调用方只负责构造结构化 _GuardrailBlocked（或 False/str 等原签名返回）返回主循环，
+        - 调用方只负责构造结构化 GuardrailBlocked（或 False/str 等原签名返回）返回主循环，
           不再 raise GuardrailError，避免被主循环 except Exception 静默吞掉。
         """
         _err_name = guardrail_name or "__guardrail_error__"
@@ -343,11 +344,11 @@ class GuardrailMiddleware(AgentMiddleware):
         self,
         user_input: Union[str, List[Any]],
         context: Optional[Dict[str, Any]] = None,
-    ) -> Optional[_GuardrailBlocked]:
+    ) -> Optional[GuardrailBlocked]:
         """用户输入进入推理前：执行输入护栏检查。
 
         S1（fail-closed 承诺真实兑现）：无论护栏内部是规则命中还是自身崩溃，
-        本钩子都只返回 ``_GuardrailBlocked``（拦截）或 ``None``（放行），
+        本钩子都只返回 ``GuardrailBlocked``（拦截）或 ``None``（放行），
         **不再向外抛异常**。主循环在 L5 之后不再用 ``except Exception`` 吞护栏异常，
         这里统一把 fail-closed 的组件故障转成结构化拦截返回，避免静默放行。
         """
@@ -367,7 +368,7 @@ class GuardrailMiddleware(AgentMiddleware):
                     _detail = str(r.reason)
                     self._record_guardrail_error(_gname, "input_check", RuntimeError(_detail), context=context)
                     _logger.error("输入护栏 %s 执行异常（fail-closed，已拦截请求）: %s", _gname, _detail)
-                    return _GuardrailBlocked(
+                    return GuardrailBlocked(
                         phase="input",
                         message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
                         reason_kind="error",
@@ -384,22 +385,20 @@ class GuardrailMiddleware(AgentMiddleware):
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "input_check", e, context=context)
                 _logger.error("输入护栏 %s 执行异常（fail-closed，已拦截请求）: %s", e.guardrail_name, e)
-                return _GuardrailBlocked(
+                return GuardrailBlocked(
                     phase="input",
                     message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
                     reason_kind="error",
                     detail=str(e),
                 )
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="input_check", context=context)
+            # C1（N4 同类问题在输入侧的残留）：e.results 已含拒绝项，上面的遍历已把
+            # 拦截记为 1 次统计 + 1 个 span；原先另造 reject_result 再记一次会导致
+            # 每次拦截计 2 次、发 2 个 span，此处删除重复记录，只保留遍历补记。
             if self.on_input_reject:
                 msg = self.on_input_reject(e)
             else:
                 msg = f"请求被安全护栏拦截：{e}"
-            return _GuardrailBlocked(phase="input", message=msg)
+            return GuardrailBlocked(phase="input", message=msg)
         except Exception as e:
             if self.fail_open:
                 _logger.warning("输入护栏整体异常（fail_open=True，放行）: %s", e)
@@ -407,7 +406,7 @@ class GuardrailMiddleware(AgentMiddleware):
             # fail-closed：组件自身异常（KeyError/TypeError 等），结构化返回拦截
             self._record_guardrail_error("__middleware__", "input_check", e, context=context)
             _logger.error("输入护栏整体执行异常（fail-closed，已拦截请求）: %s", e)
-            return _GuardrailBlocked(
+            return GuardrailBlocked(
                 phase="input",
                 message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
                 reason_kind="error",
@@ -418,7 +417,7 @@ class GuardrailMiddleware(AgentMiddleware):
         self,
         user_input: Union[str, List[Any]],
         context: Optional[Dict[str, Any]] = None,
-    ) -> Optional[_GuardrailBlocked]:
+    ) -> Optional[GuardrailBlocked]:
         """异步版本，语义同 before_agent_run（S1：不抛异常，只结构化返回）。"""
         try:
             input_guardrails = self._get_guardrails_by_type(InputGuardrail)
@@ -437,7 +436,7 @@ class GuardrailMiddleware(AgentMiddleware):
                     self._record_guardrail_error(_gname, "input_check", RuntimeError(_detail),
                                                  context={**(context or {})})
                     _logger.error("输入护栏（异步） %s 执行异常（fail-closed，已拦截请求）: %s", _gname, _detail)
-                    return _GuardrailBlocked(
+                    return GuardrailBlocked(
                         phase="input",
                         message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
                         reason_kind="error",
@@ -452,29 +451,27 @@ class GuardrailMiddleware(AgentMiddleware):
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "input_check", e, context=context)
                 _logger.error("输入护栏（异步）%s 执行异常（fail-closed，已拦截请求）: %s", e.guardrail_name, e)
-                return _GuardrailBlocked(
+                return GuardrailBlocked(
                     phase="input",
                     message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
                     reason_kind="error",
                     detail=str(e),
                 )
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="input_check", context=context)
+            # C1（N4 同类问题在输入侧的残留）：e.results 已含拒绝项，上面的遍历已把
+            # 拦截记为 1 次统计 + 1 个 span；原先另造 reject_result 再记一次会导致
+            # 每次拦截计 2 次、发 2 个 span，此处删除重复记录，只保留遍历补记。
             if self.on_input_reject:
                 msg = self.on_input_reject(e)
             else:
                 msg = f"请求被安全护栏拦截：{e}"
-            return _GuardrailBlocked(phase="input", message=msg)
+            return GuardrailBlocked(phase="input", message=msg)
         except Exception as e:
             if self.fail_open:
                 _logger.warning("输入护栏整体异步异常（fail_open=True，放行）: %s", e)
                 return None
             self._record_guardrail_error("__middleware__", "input_check", e, context=context)
             _logger.error("输入护栏（异步）整体执行异常（fail-closed，已拦截请求）: %s", e)
-            return _GuardrailBlocked(
+            return GuardrailBlocked(
                 phase="input",
                 message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
                 reason_kind="error",
@@ -523,24 +520,18 @@ class GuardrailMiddleware(AgentMiddleware):
             return True
         except ToolCallGuardrailReject as e:
             _details = e.details or {}
-            # S5：补记录异常抛出之前已通过的护栏结果
+            # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
+            _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
-                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_pre_check", context=context)
+                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_pre_check", context=_reject_ctx)
             if _details.get("is_error"):
-                self._record_guardrail_error(e.guardrail_name, "tool_pre_check", e,
-                                             context={**(context or {}), "tool_name": tool_name})
+                self._record_guardrail_error(e.guardrail_name, "tool_pre_check", e, context=_reject_ctx)
                 _logger.error("工具前置护栏 %s 执行异常（fail-closed，已拦截调用 %s）: %s",
                               e.guardrail_name, tool_name, e)
                 self._last_tool_reject_reason = (
                     f"工具 {tool_name} 调用被安全护栏拦截：工具安全检查发生内部错误，为保证安全已拒绝本次调用。"
                 )
                 return False
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="tool_pre_check",
-                                context={**(context or {}), "tool_name": tool_name})
             if self.on_tool_reject:
                 self._last_tool_reject_reason = self.on_tool_reject(e)
             else:
@@ -596,24 +587,18 @@ class GuardrailMiddleware(AgentMiddleware):
             return True
         except ToolCallGuardrailReject as e:
             _details = e.details or {}
-            # S5：补记录异常抛出之前已通过的护栏结果
+            # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
+            _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
-                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_pre_check", context=context)
+                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_pre_check", context=_reject_ctx)
             if _details.get("is_error"):
-                self._record_guardrail_error(e.guardrail_name, "tool_pre_check", e,
-                                             context={**(context or {}), "tool_name": tool_name})
+                self._record_guardrail_error(e.guardrail_name, "tool_pre_check", e, context=_reject_ctx)
                 _logger.error("[guardrail] 工具前置护栏（异步）%s 异常（fail-closed，已拦截调用 %s）: %s",
                               e.guardrail_name, tool_name, e)
                 self._last_tool_reject_reason = (
                     f"工具 {tool_name} 调用被安全护栏拦截：工具安全检查发生内部错误，为保证安全已拒绝本次调用。"
                 )
                 return False
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="tool_pre_check",
-                                context={**(context or {}), "tool_name": tool_name})
             if self.on_tool_reject:
                 self._last_tool_reject_reason = self.on_tool_reject(e)
             else:
@@ -644,6 +629,12 @@ class GuardrailMiddleware(AgentMiddleware):
 
         S1：fail-closed 路径不抛异常，而是返回一段拦截占位 observation 替换掉真实输出，
         主循环把它写回 tool 消息喂给 LLM，既不静默放行真实结果、也不崩溃流程。
+
+        N1：后置护栏未对结果做任何修改、且入参 output 为空串时返回 ``None``（=「结果不变」），
+        不再回传空串。因为主循环对**失败工具**传的是 ``output=result.output or ""``
+        （错误文案走独立的 ``error=`` 参数），一旦回传空串，主循环的
+        ``isinstance(new_obs, str)`` 判定成立，会把 ``_render_observation`` 生成的
+        错误前缀整体覆盖掉，LLM 再也看不到工具失败原因。
         """
         try:
             post_guardrails = [g for g in self._get_guardrails_by_type(ToolCallGuardrail) if g.check_result]
@@ -672,35 +663,36 @@ class GuardrailMiddleware(AgentMiddleware):
                     _logger.error("工具后置护栏 %s 执行异常（fail-closed，已拦截结果 %s）: %s", _gname, tool_name, _detail)
                     return "工具执行结果被安全护栏拦截：结果检查发生内部错误，为保证安全已拦截。"
             # 未修改时返回原始 output（保持向后兼容）；修改后返回新的 output 字符串
+            # N1：内容未变化且为空串时必须返回 None 而非空串，否则主循环会把
+            # 失败工具渲染好的错误 observation（含「错误: ...」前缀）覆盖成空白。
             new_output = getattr(new_result, "output", new_result) if new_result is not None else output
-            return new_output or output
+            if new_output == output:
+                # 未被修改：非空仍原样回传（保持既有行为），空串则交回主循环保留原 observation
+                return output if output else None
+            # 已修改（含护栏原地改写 result_info.output 的情况）：忠实返回修改后的文本
+            return new_output
         except ToolCallGuardrailReject as e:
             _details = e.details or {}
-            # S5：补记录异常抛出之前已通过的护栏结果
+            # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
+            _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
-                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_post_check", context=context)
+                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_post_check", context=_reject_ctx)
             if _details.get("is_error"):
-                self._record_guardrail_error(e.guardrail_name, "tool_post_check", e,
-                                             context={**(context or {}), "tool_name": tool_name})
+                self._record_guardrail_error(e.guardrail_name, "tool_post_check", e, context=_reject_ctx)
                 _logger.error("[guardrail] 工具后置护栏 %s 异常（fail-closed，已拦截结果 %s）: %s",
                               e.guardrail_name, tool_name, e)
                 return (
                     f"工具 {tool_name} 执行结果被安全护栏拦截：结果安全检查发生内部错误，"
                     f"为保证安全已屏蔽原始结果。"
                 )
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="tool_post_check",
-                                context={**(context or {}), "tool_name": tool_name})
             if self.on_tool_reject:
                 return self.on_tool_reject(e)
             return f"工具执行结果被安全护栏拦截：{e}"
         except Exception as e:
             if self.fail_open:
                 _logger.warning("[guardrail] 工具后置护栏异常（fail_open=True，放行 %s）: %s", tool_name, e)
-                return output or ""
+                # N1：放行=不改动结果，空串同样返回 None，避免把原始 observation 覆盖成空白
+                return output if output else None
             self._record_guardrail_error("__middleware__", "tool_post_check", e,
                                          context={**(context or {}), "tool_name": tool_name})
             _logger.error("[guardrail] 工具后置护栏整体异常（fail-closed，已拦截结果 %s）: %s", tool_name, e)
@@ -744,35 +736,35 @@ class GuardrailMiddleware(AgentMiddleware):
                                                  context={**(context or {}), "tool_name": tool_name, "success": success})
                     _logger.error("[guardrail] 工具后置护栏（异步） %s 执行异常（fail-closed，已拦截结果 %s）: %s", _gname, tool_name, _detail)
                     return "工具执行结果被安全护栏拦截：结果检查发生内部错误，为保证安全已拦截。"
+            # 未修改时返回原始 output（保持向后兼容）；修改后返回新的 output 字符串
+            # N1：与同步版 after_tool_call 语义严格一致——内容未变化且为空串时返回 None，
+            # 不回传空串，否则主循环会把失败工具的错误 observation 覆盖成空白。
             new_output = getattr(new_result, "output", new_result) if new_result is not None else output
-            return new_output or output
+            if new_output == output:
+                return output if output else None
+            return new_output
         except ToolCallGuardrailReject as e:
             _details = e.details or {}
-            # S5：补记录异常抛出之前已通过的护栏结果
+            # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
+            _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
-                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_post_check", context=context)
+                self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_post_check", context=_reject_ctx)
             if _details.get("is_error"):
-                self._record_guardrail_error(e.guardrail_name, "tool_post_check", e,
-                                             context={**(context or {}), "tool_name": tool_name})
+                self._record_guardrail_error(e.guardrail_name, "tool_post_check", e, context=_reject_ctx)
                 _logger.error("[guardrail] 工具后置护栏（异步）%s 异常（fail-closed，已拦截结果 %s）: %s",
                               e.guardrail_name, tool_name, e)
                 return (
                     f"工具 {tool_name} 执行结果被安全护栏拦截：结果安全检查发生内部错误，"
                     f"为保证安全已屏蔽原始结果。"
                 )
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="tool_post_check",
-                                context={**(context or {}), "tool_name": tool_name})
             if self.on_tool_reject:
                 return self.on_tool_reject(e)
             return f"工具执行结果被安全护栏拦截：{e}"
         except Exception as e:
             if self.fail_open:
                 _logger.warning("[guardrail] 工具后置护栏异步异常（fail_open=True，放行 %s）: %s", tool_name, e)
-                return output or ""
+                # N1：与同步版一致，放行时空串返回 None，不覆盖原始 observation
+                return output if output else None
             self._record_guardrail_error("__middleware__", "tool_post_check", e,
                                          context={**(context or {}), "tool_name": tool_name})
             _logger.error("[guardrail] 工具后置护栏（异步）整体异常（fail-closed，已拦截结果 %s）: %s", tool_name, e)
@@ -785,10 +777,10 @@ class GuardrailMiddleware(AgentMiddleware):
         self,
         agent_output: Union[str, List[Any], Dict[str, Any]],
         context: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Union[_GuardrailBlocked, _GuardrailModified]]:
+    ) -> Optional[Union[GuardrailBlocked, GuardrailModified]]:
         """Agent最终输出后：执行输出护栏，支持拦截或修改（脱敏）。
 
-        S1：fail-closed 路径不抛异常，直接返回 _GuardrailBlocked(phase="output", reason_kind="error")，
+        S1：fail-closed 路径不抛异常，直接返回 GuardrailBlocked(phase="output", reason_kind="error")，
         主循环会用 message 替换 final_answer，保证拦截文案能走到用户侧。
         """
         try:
@@ -808,7 +800,7 @@ class GuardrailMiddleware(AgentMiddleware):
                     self._record_guardrail_error(_gname, "output_check", RuntimeError(_detail),
                                                  context={**(context or {})})
                     _logger.error("输出护栏 %s 执行异常（fail-closed，已拦截输出）: %s", _gname, _detail)
-                    return _GuardrailBlocked(
+                    return GuardrailBlocked(
                         phase="output",
                         message="请求被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拦截输出。",
                         reason_kind="error",
@@ -816,7 +808,7 @@ class GuardrailMiddleware(AgentMiddleware):
                     )
             if final_output == agent_output:
                 return None
-            return _GuardrailModified(phase="output", content=final_output)
+            return GuardrailModified(phase="output", content=final_output)
         except OutputGuardrailReject as e:
             _details = e.details or {}
             # S5：补记录异常抛出之前已通过的护栏结果
@@ -825,29 +817,27 @@ class GuardrailMiddleware(AgentMiddleware):
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "output_check", e, context=context)
                 _logger.error("输出护栏 %s 执行异常（fail-closed，已拦截输出）: %s", e.guardrail_name, e)
-                return _GuardrailBlocked(
+                return GuardrailBlocked(
                     phase="output",
                     message="输出被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拒绝展示原始输出。",
                     reason_kind="error",
                     detail=str(e),
                 )
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="output_check", context=context)
+            # C1（N4 同类问题在输出侧的残留）：e.results 已含拒绝项，上面的遍历已把
+            # 拦截记为 1 次统计 + 1 个 span；原先另造 reject_result 再记一次会导致
+            # 每次拦截计 2 次、发 2 个 span，此处删除重复记录，只保留遍历补记。
             if self.on_output_reject:
                 msg = self.on_output_reject(e)
             else:
                 msg = f"输出被安全护栏拦截：{e}"
-            return _GuardrailBlocked(phase="output", message=msg)
+            return GuardrailBlocked(phase="output", message=msg)
         except Exception as e:
             if self.fail_open:
                 _logger.warning("输出护栏执行异常（fail_open=True，放行）: %s", e)
                 return None
             self._record_guardrail_error("__middleware__", "output_check", e, context=context)
             _logger.error("输出护栏整体执行异常（fail-closed，已拦截输出）: %s", e)
-            return _GuardrailBlocked(
+            return GuardrailBlocked(
                 phase="output",
                 message="输出被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拒绝展示原始输出。",
                 reason_kind="error",
@@ -858,7 +848,7 @@ class GuardrailMiddleware(AgentMiddleware):
         self,
         agent_output: Union[str, List[Any], Dict[str, Any]],
         context: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Union[_GuardrailBlocked, _GuardrailModified]]:
+    ) -> Optional[Union[GuardrailBlocked, GuardrailModified]]:
         """异步版本：Agent最终输出后检查，返回语义同 after_agent_run（S1：不抛异常）。"""
         try:
             output_guardrails = self._get_guardrails_by_type(OutputGuardrail)
@@ -877,7 +867,7 @@ class GuardrailMiddleware(AgentMiddleware):
                     self._record_guardrail_error(_gname, "output_check", RuntimeError(_detail),
                                                  context={**(context or {})})
                     _logger.error("输出护栏（异步） %s 执行异常（fail-closed，已拦截输出）: %s", _gname, _detail)
-                    return _GuardrailBlocked(
+                    return GuardrailBlocked(
                         phase="output",
                         message="请求被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拦截输出。",
                         reason_kind="error",
@@ -885,7 +875,7 @@ class GuardrailMiddleware(AgentMiddleware):
                     )
             if final_output == agent_output:
                 return None
-            return _GuardrailModified(phase="output", content=final_output)
+            return GuardrailModified(phase="output", content=final_output)
         except OutputGuardrailReject as e:
             _details = e.details or {}
             # S5：补记录异常抛出之前已通过的护栏结果
@@ -894,29 +884,27 @@ class GuardrailMiddleware(AgentMiddleware):
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "output_check", e, context=context)
                 _logger.error("输出护栏（异步）%s 异常（fail-closed，已拦截输出）: %s", e.guardrail_name, e)
-                return _GuardrailBlocked(
+                return GuardrailBlocked(
                     phase="output",
                     message="输出被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拒绝展示原始输出。",
                     reason_kind="error",
                     detail=str(e),
                 )
-            reject_result = GuardrailResult(
-                allowed=False, reason=str(e),
-                metadata={"guardrail_name": e.guardrail_name, "duration_ms": _details.get("duration_ms"), **_details},
-            )
-            self._record_result(e.guardrail_name, reject_result, phase="output_check", context=context)
+            # C1（N4 同类问题在输出侧的残留）：e.results 已含拒绝项，上面的遍历已把
+            # 拦截记为 1 次统计 + 1 个 span；原先另造 reject_result 再记一次会导致
+            # 每次拦截计 2 次、发 2 个 span，此处删除重复记录，只保留遍历补记。
             if self.on_output_reject:
                 msg = self.on_output_reject(e)
             else:
                 msg = f"输出被安全护栏拦截：{e}"
-            return _GuardrailBlocked(phase="output", message=msg)
+            return GuardrailBlocked(phase="output", message=msg)
         except Exception as e:
             if self.fail_open:
                 _logger.warning("输出护栏异步执行异常（fail_open=True，放行）: %s", e)
                 return None
             self._record_guardrail_error("__middleware__", "output_check", e, context=context)
             _logger.error("输出护栏（异步）整体执行异常（fail-closed，已拦截输出）: %s", e)
-            return _GuardrailBlocked(
+            return GuardrailBlocked(
                 phase="output",
                 message="输出被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拒绝展示原始输出。",
                 reason_kind="error",

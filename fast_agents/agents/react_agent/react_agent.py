@@ -49,7 +49,7 @@ from ...tools.builtin.mcp_tool import build_mcp_tools
 from ...tools.structured_tool import StructuredTool
 from ...tools.tool_base import ToolBase
 from ..middleware import AgentMiddleware
-from ...guardrails.guardrail_middleware import _GuardrailBlocked, _GuardrailModified, GuardrailMiddleware
+from ...guardrails import GuardrailBlocked, GuardrailModified, GuardrailMiddleware
 from ...tools.tool_registry import ToolRegistry
 from ...tools.tool_result import ToolStatus
 from ...trace import TraceLogger  # G1 tracer（可选依赖，默认 None 不引入任何开销）
@@ -120,30 +120,30 @@ class ReActAgent(AgentBase):
     """
 
     def __init__(
-        self,
-        name: str,
-        llm: LLM,
-        tool_registry: Optional[ToolRegistry] = None,
-        system_prompt: Optional[str] = None,
-        max_steps: int = 10,
-        custom_prompt: Optional[str] = None,
-        memory: Optional[MemoryManager] = None,
-        enable_memory: bool = True,
-        memory_limit: int = 5,
-        skill_registry: Optional[SkillRegistry] = None,
-        skill_paths: Optional[List] = None,
-        enable_skills: bool = True,
-        mcp_registry: Optional[MCPRegistry] = None,
-        mcp_configs: Optional[List[MCPConfig]] = None,
-        enable_mcp: bool = False,
-        mcp_expand_mode: str = "fine",
-        ctx: Optional["ContextBuilder"] = None,
-        enable_context: bool = False,
-        context_budget: Optional[int] = None,
-        context_offload_threshold: int = 4_000,
-        tracer: Optional["TraceLogger"] = None,
-        parallel_tool_calls: bool = False,
-        middleware: Optional[List] = None,
+            self,
+            name: str,
+            llm: LLM,
+            tool_registry: Optional[ToolRegistry] = None,
+            system_prompt: Optional[str] = None,
+            max_steps: int = 10,
+            custom_prompt: Optional[str] = None,
+            memory: Optional[MemoryManager] = None,
+            enable_memory: bool = True,
+            memory_limit: int = 5,
+            skill_registry: Optional[SkillRegistry] = None,
+            skill_paths: Optional[List] = None,
+            enable_skills: bool = True,
+            mcp_registry: Optional[MCPRegistry] = None,
+            mcp_configs: Optional[List[MCPConfig]] = None,
+            enable_mcp: bool = False,
+            mcp_expand_mode: str = "fine",
+            ctx: Optional["ContextBuilder"] = None,
+            enable_context: bool = False,
+            context_budget: Optional[int] = None,
+            context_offload_threshold: int = 4_000,
+            tracer: Optional["TraceLogger"] = None,
+            parallel_tool_calls: bool = False,
+            middleware: Optional[List] = None,
     ):
         """
         初始化ReActAgent
@@ -281,7 +281,7 @@ class ReActAgent(AgentBase):
 
         系统提示词只在构造时注入一次，因此工具变更后需要调用本方法同步提示词里的
         工具清单；本方法只改写已有的那条 system 消息，不会新增消息。
-        
+
         【C10】技能加载/卸载后会自动调用本方法，同步allowed_tools过滤后的工具清单。
 
         用户画像不在这里拼进 prompt——它属于跨轮可能变化的信息（通过 update_user_profile
@@ -293,7 +293,7 @@ class ReActAgent(AgentBase):
             tools_desc = self.skill_middleware.get_filtered_tools_description()
         if tools_desc is None:
             tools_desc = self.tool_registry.get_tools_description()
-        
+
         prompt = self.system_prompt_template.format(tools=tools_desc)
         # 追加技能索引（Level 1）与已加载技能详情（Level 2）+ 工具限制提示
         if self.skill_middleware is not None:
@@ -324,9 +324,9 @@ class ReActAgent(AgentBase):
     # ---------- 技能 ----------
 
     def _init_skills(
-        self,
-        skill_registry: Optional[SkillRegistry],
-        skill_paths: Optional[List],
+            self,
+            skill_registry: Optional[SkillRegistry],
+            skill_paths: Optional[List],
     ) -> None:
         """初始化技能系统：
 
@@ -366,10 +366,10 @@ class ReActAgent(AgentBase):
     # ---------- MCP ----------
 
     def _init_mcp(
-        self,
-        mcp_registry: Optional[MCPRegistry],
-        mcp_configs: Optional[List[MCPConfig]],
-        expand_mode: str,
+            self,
+            mcp_registry: Optional[MCPRegistry],
+            mcp_configs: Optional[List[MCPConfig]],
+            expand_mode: str,
     ) -> None:
         """初始化 MCP 系统（对齐 _init_skills 的结构）：
 
@@ -522,10 +522,10 @@ class ReActAgent(AgentBase):
     # ---------- 上下文工程 ----------
 
     def _init_context(
-        self,
-        ctx: Optional["ContextBuilder"],
-        budget: Optional[int],
-        offload_threshold: int,
+            self,
+            ctx: Optional["ContextBuilder"],
+            budget: Optional[int],
+            offload_threshold: int,
     ) -> None:
         """初始化上下文工程：
 
@@ -632,7 +632,7 @@ class ReActAgent(AgentBase):
             tokens = report.tokens
             print(f"🧭 {self.ctx.budget.describe(tokens)}")
             if report.compression is not None and (
-                report.compression.offloaded or report.compression.trimmed
+                    report.compression.offloaded or report.compression.trimmed
             ):
                 print(f"🧭 {report.compression.summary_line()}")
             for w in report.warnings:
@@ -650,6 +650,51 @@ class ReActAgent(AgentBase):
         except Exception as e:  # noqa: BLE001 —— 卸载失败必须退回原文，不能让工具链断掉
             print(f"⚠️ 工具结果卸载失败，保留原文：{e}")
             return observation
+
+    def _apply_output_guardrails(
+        self,
+        final_answer: Optional[str],
+        final_finish_reason: str,
+    ) -> tuple[Optional[str], str]:
+        """把「最终答案」过一遍所有中间件的 after_agent_run 钩子（输出护栏）。
+
+        C3 修复背景：这段判定原先只内联在「模型直接给出文本」的分支里，
+        return_direct 工具命中后直接 break 跳出推理循环，工具原始输出从不经过
+        输出护栏，敏感/违规内容可以原样透传给用户。现抽成公共方法，两条产出
+        最终答案的路径（模型文本 / return_direct 工具结果）共用同一套检查，
+        避免改一处漏一处。
+
+        钩子返回值语义（对齐 AgentMiddleware.after_agent_run 契约）：
+        - None               放行，答案与 finish_reason 均不变；
+        - GuardrailBlocked   输出被拦截，message 替换最终答案，finish_reason 置 guardrail_block；
+        - GuardrailModified  输出被脱敏/改写，content 替换最终答案；
+        - 钩子自身抛异常      fail-closed，替换为拦截占位文案并置 guardrail_block。
+
+        未挂载任何中间件时逐字节返回入参，与修复前行为完全一致。
+        """
+        for _mw in self._middleware_list:
+            try:
+                _hook_result = _mw.after_agent_run(final_answer)
+                if isinstance(_hook_result,
+                              GuardrailBlocked) and _hook_result.phase == "output":
+                    final_answer = _hook_result.message
+                    final_finish_reason = "guardrail_block"
+                elif isinstance(_hook_result,
+                                GuardrailModified) and _hook_result.phase == "output":
+                    final_answer = _hook_result.content
+            except Exception as _mw_err:
+                # S1 兜底：输出侧中间件抛异常 → fail-closed，替换最终答案为拦截文案，
+                # 绝不把模型原始输出透传给用户。
+                import logging
+                logging.getLogger(__name__).error(
+                    "中间件 after_agent_run 异常（fail-closed，拦截输出）: %s", _mw_err
+                )
+                final_answer = (
+                    "输出被安全护栏拦截：输出安全检查发生内部错误，"
+                    "为保证安全已拒绝展示原始输出。"
+                )
+                final_finish_reason = "guardrail_block"
+        return final_answer, final_finish_reason
 
     # ---------- 主循环 ----------
 
@@ -705,7 +750,8 @@ class ReActAgent(AgentBase):
             _agent_span = _tracer.start_span(
                 name=f"agent.run",
                 kind=SpanKind.AGENT,
-                input={"user_input": _tracer.truncate_preview(input_text, 500, is_input=True), "agent": self.name, "max_steps": self.max_steps},
+                input={"user_input": _tracer.truncate_preview(input_text, 500, is_input=True), "agent": self.name,
+                       "max_steps": self.max_steps},
                 metadata={"agent": self.name},
             )
 
@@ -724,13 +770,13 @@ class ReActAgent(AgentBase):
 
             # 调用所有中间件的before_agent_run钩子（输入检查）
             # L5：AgentMiddleware 协议基类保证钩子签名统一，不再用 hasattr 鸭子分发。
-            # 结构化判定：before_agent_run 返回 _GuardrailBlocked 才视为拦截，
+            # 结构化判定：before_agent_run 返回 GuardrailBlocked 才视为拦截，
             # None 表示放行；不再用中文字符串子串匹配，彻底消除假阳性/假阴性。
             input_blocked = False
             for _mw in self._middleware_list:
                 try:
                     _hook_result = _mw.before_agent_run(user_input)
-                    if isinstance(_hook_result, _GuardrailBlocked) and _hook_result.phase == "input":
+                    if isinstance(_hook_result, GuardrailBlocked) and _hook_result.phase == "input":
                         final_answer = _hook_result.message
                         final_finish_reason = "guardrail_block"
                         # 先 yield text 分片让流式前端看到拦截提示，再走统一 end 事件
@@ -774,7 +820,8 @@ class ReActAgent(AgentBase):
                             _dec_span = _tracer.start_span(
                                 name=f"decision.step{current_step}",
                                 kind=SpanKind.DECISION,
-                                input={"step": current_step, "user_input_for_step": user_input if current_step == 1 else None},
+                                input={"step": current_step,
+                                       "user_input_for_step": user_input if current_step == 1 else None},
                                 metadata={"step": current_step, "agent": self.name},
                             )
 
@@ -791,7 +838,7 @@ class ReActAgent(AgentBase):
                             if current_step == 1 and not (self.enable_context and self.ctx is not None):
                                 self.messages.append_user(user_input)
                             messages = self.messages.to_openai_messages()
-                            
+
                             # 流式调用LLM，透传所有text/tool_call分片，收集最终结果
                             text_buf = []
                             final_tool_calls = []
@@ -805,7 +852,7 @@ class ReActAgent(AgentBase):
                                 elif chunk.type == "end":
                                     final_tool_calls = chunk.tool_calls
                                     final_finish_reason = chunk.finish_reason
-                            
+
                             # 构造和invoke路径完全一致的response消息
                             response = Message(
                                 role="assistant",
@@ -818,21 +865,36 @@ class ReActAgent(AgentBase):
                             if response.tool_calls:
                                 tool_names = [tc.name for tc in response.tool_calls]
                                 return_direct_answer: Optional[str] = None
-                                
+
                                 # 工具调用前调用所有中间件的before_tool_call钩子，拦截非法调用。
                                 # L5：AgentMiddleware 协议保证签名 (tool_name, tool_args, ...) -> bool，
                                 # 不再 hasattr 鸭子分发；与 SkillMiddleware 同名但签名不同的钩子彻底隔离。
                                 tool_blocked = False
+                                # N2：记录本批次里「已经生成 tool 消息」的 tool_call_id 与被拦截的工具名。
+                                # assistant 消息（L815）已带上整批 tool_calls，OpenAI 要求每个 tool_call_id
+                                # 都必须有一条对应的 tool 消息；只要有一条缺失，下一次请求就会 400，
+                                # 而且这批孤儿会永久留在 self.messages 里，把整个会话历史打挂。
+                                _responded_ids = set()
+                                _blocked_tool_name: Optional[str] = None
+                                # N3：缓存每个 tool_call 的解析结果，保证护栏检查与实际执行用同一份参数。
+                                # 避免 L905/L917 重复解析（性能）或用原始值（安全：护栏检查 dict，执行用字符串会不一致）。
+                                _coerced_args_cache = {}  # tc.id -> coerced_args
                                 for tc in response.tool_calls:
                                     _coerced_args = _coerce_tool_args(tc.arguments)
+                                    _coerced_args_cache[tc.id] = _coerced_args
                                     for m in self._middleware_list:
                                         try:
                                             allowed = m.before_tool_call(tc.name, _coerced_args)
                                             if not allowed:
-                                                observation = getattr(m, '_last_tool_reject_reason', f"工具 {tc.name} 调用被安全护栏拦截")
+                                                observation = getattr(m, '_last_tool_reject_reason',
+                                                                      f"工具 {tc.name} 调用被安全护栏拦截")
                                                 tool_msg = Message("tool", observation)
                                                 tool_msg.metadata = {"tool_call_id": tc.id, "name": tc.name}
                                                 self.messages.append(tool_msg)
+                                                # N2：该 tool_call 已有响应，登记 id 并记下拦截来源，
+                                                # 收尾时只给「未响应」的调用补占位消息
+                                                _responded_ids.add(tc.id)
+                                                _blocked_tool_name = tc.name
                                                 tool_blocked = True
                                                 break
                                         except Exception as _mw_err:
@@ -850,11 +912,34 @@ class ReActAgent(AgentBase):
                                             tool_msg = Message("tool", observation)
                                             tool_msg.metadata = {"tool_call_id": tc.id, "name": tc.name}
                                             self.messages.append(tool_msg)
+                                            # N2：异常兜底分支与正常拦截分支保持同一套配对登记
+                                            _responded_ids.add(tc.id)
+                                            _blocked_tool_name = tc.name
                                             tool_blocked = True
                                             break
                                     if tool_blocked:
                                         break
                                 if tool_blocked:
+                                    # N2：给本批次中「既没执行、也没消息」的 tool_call 补齐占位响应，
+                                    # 保证 assistant.tool_calls 与 tool 消息严格一一对应。
+                                    # 单工具批次不会进到这个循环（唯一那条已登记），行为与改动前逐字节一致。
+                                    # 文案显式给出下一步该怎么做：模型若原样重复发起同一批调用会被再次整批
+                                    # 拦截，白白烧掉 max_steps，所以要点名「单独重发」和「移除被拦工具」。
+                                    for pending_tc in response.tool_calls:
+                                        if pending_tc.id in _responded_ids:
+                                            continue
+                                        _placeholder = (
+                                            f"未执行：本批次中工具 {_blocked_tool_name} 的调用被安全护栏拦截，"
+                                            f"按「一批中任一调用被拦则整批不执行」的规则，"
+                                            f"{pending_tc.name} 也没有被执行、没有结果。"
+                                            f"下一步：如需继续，请单独重新发起 {pending_tc.name}"
+                                            f"（不要与 {_blocked_tool_name} 放在同一批），"
+                                            f"并从后续计划中移除被拦截的 {_blocked_tool_name}。"
+                                        )
+                                        _ph_msg = Message("tool", _placeholder)
+                                        _ph_msg.metadata = {"tool_call_id": pending_tc.id, "name": pending_tc.name}
+                                        self.messages.append(_ph_msg)
+                                        _responded_ids.add(pending_tc.id)
                                     # 本轮工具被拦截，直接进入下一轮推理，让LLM看到拦截提示
                                     continue
 
@@ -866,7 +951,7 @@ class ReActAgent(AgentBase):
                                     # 组装并发调用入参（统一规整成 dict），hooks回主线程避免trace链路断/跨线程写库问题
                                     results = self.tool_registry.invoke_tools_concurrent(
                                         calls=[
-                                            (tc.name, _coerce_tool_args(tc.arguments))
+                                            (tc.name, _coerced_args_cache[tc.id])
                                             for tc in response.tool_calls
                                         ],
                                         hooks_in_caller_thread=True,
@@ -878,7 +963,7 @@ class ReActAgent(AgentBase):
                                     # 统一通过 invoke_tool 获取 ToolResult（含参数校验 / 错误捕获 / 截断），
                                     # 用生成器表达式保持「执行一个、处理一个」的原有语义
                                     executed = (
-                                        (tc, self.tool_registry.invoke_tool(tc.name, tc.arguments))
+                                        (tc, self.tool_registry.invoke_tool(tc.name, _coerced_args_cache[tc.id]))
                                         for tc in response.tool_calls
                                     )
 
@@ -886,7 +971,8 @@ class ReActAgent(AgentBase):
                                 for tool_call, result in executed:
                                     # return_direct：工具标记「结果直接作为最终答案返回」，不再进下一轮推理
                                     tool_obj = self.tool_registry.get_tool(tool_call.name)
-                                    if tool_obj is not None and getattr(tool_obj, "return_direct", False) and result.succeeded:
+                                    if tool_obj is not None and getattr(tool_obj, "return_direct",
+                                                                        False) and result.succeeded:
                                         return_direct_answer = result.output
                                     # 给不同 status 加上显式前缀，帮助模型理解结果性质
                                     observation = _render_observation(result)
@@ -932,13 +1018,19 @@ class ReActAgent(AgentBase):
                                         imgs = result.artifact.get("images") or []
                                         for img in imgs:
                                             data = img.get("data", "") if isinstance(img, dict) else ""
-                                            mime = img.get("mime", "image/png") if isinstance(img, dict) else "image/png"
+                                            mime = img.get("mime", "image/png") if isinstance(img,
+                                                                                              dict) else "image/png"
                                             if data:
                                                 tool_msg.add_image_base64(data, mime)
                                     self.messages.append(tool_msg)
                                 # return_direct 命中：本轮不再把 tool 结果喂给模型，直接作为最终答案返回
                                 if return_direct_answer is not None:
                                     final_answer = return_direct_answer
+                                    # C3：工具直接返回的答案同样要过输出护栏，否则工具原始输出
+                                    # 会绕过全部 OutputGuardrail 原样透传给用户
+                                    final_answer, final_finish_reason = self._apply_output_guardrails(
+                                        final_answer, final_finish_reason,
+                                    )
                                     if _dec_span is not None:
                                         _tracer.end_span(
                                             _dec_span,
@@ -960,28 +1052,13 @@ class ReActAgent(AgentBase):
                                 final_answer = response.text
                                 # 最终输出后调用所有中间件的after_agent_run钩子（结构化返回）：
                                 # - None 放行
-                                # - _GuardrailBlocked  输出被拦截，message 替换最终答案
-                                # - _GuardrailModified 输出被脱敏/改写，content 替换最终答案
-                                for _mw in self._middleware_list:
-                                    try:
-                                        _hook_result = _mw.after_agent_run(final_answer)
-                                        if isinstance(_hook_result, _GuardrailBlocked) and _hook_result.phase == "output":
-                                            final_answer = _hook_result.message
-                                            final_finish_reason = "guardrail_block"
-                                        elif isinstance(_hook_result, _GuardrailModified) and _hook_result.phase == "output":
-                                            final_answer = _hook_result.content
-                                    except Exception as _mw_err:
-                                        # S1 兜底：输出侧中间件抛异常 → fail-closed，替换最终答案为拦截文案，
-                                        # 绝不把模型原始输出透传给用户。
-                                        import logging
-                                        logging.getLogger(__name__).error(
-                                            "中间件 after_agent_run 异常（fail-closed，拦截输出）: %s", _mw_err
-                                        )
-                                        final_answer = (
-                                            "输出被安全护栏拦截：输出安全检查发生内部错误，"
-                                            "为保证安全已拒绝展示原始输出。"
-                                        )
-                                        final_finish_reason = "guardrail_block"
+                                # - GuardrailBlocked  输出被拦截，message 替换最终答案
+                                # - GuardrailModified 输出被脱敏/改写，content 替换最终答案
+                                # 具体判定与 fail-closed 兜底已抽到 _apply_output_guardrails，
+                                # 与 return_direct 分支共用（C3），改一处不会漏另一处。
+                                final_answer, final_finish_reason = self._apply_output_guardrails(
+                                    final_answer, final_finish_reason,
+                                )
                                 if _dec_span is not None:
                                     _tracer.end_span(
                                         _dec_span,
@@ -1013,9 +1090,11 @@ class ReActAgent(AgentBase):
             if _agent_span is not None and _tracer is not None:
                 _tracer.end_span(
                     _agent_span,
-                    output={"final_answer_preview": (_tracer.truncate_preview(final_answer, 300) if final_answer else None), "steps": current_step},
+                    output={
+                        "final_answer_preview": (_tracer.truncate_preview(final_answer, 300) if final_answer else None),
+                        "steps": current_step},
                 )
-            
+
             # 最终产出end事件，携带完整最终答案
             yield StreamChunk(
                 type="end",
