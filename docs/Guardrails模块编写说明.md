@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents Guardrails 安全护栏系统，参考 **LangChain Guardrails**、**OpenAI Agents SDK Guardrails**、**LlamaIndex Guardrails**、**Anthropic Claude Guardrails**、**Microsoft MCP 安全规范** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.0.0 · 2026-11-19 · 初版落地，零新增依赖、零破坏性改动
-> 适用版本：`fast_agents.guardrails` v1.0.0
-> 配套代码：`fast_agents/guardrails/`（9 个核心文件 + 3 个预设护栏）+ `tests/guardrails/test_guardrails.py`（63 项测试全绿（32 基础 + 16 模拟 Agent 链路 + 15 真实 ReActAgent 端到端））+ `examples/guardrails/guardrails_basic_demo.py`（无API Key可运行示例），均已实测通过。
+> 版本：v1.0.3 · 2026-11-23 · P1 缺陷修复：`@guardrail_creator` 新增 `guardrail_type` 参数（input/output/tool_call，默认 input），函数式护栏按类型真正参与中间件与 use_global 分派（此前被 isinstance 过滤静默忽略）；装饰类恢复 passthrough；非法类型值创建时即抛 `GuardrailConfigError`
+> 适用版本：`fast_agents.guardrails` v1.0.3
+> 配套代码：`fast_agents/guardrails/`（9 个核心文件 + 3 个预设护栏）+ `tests/guardrails/`（10 个文件共 113 项测试全绿：51 主用例 + 19 真实 ReActAgent 端到端 + 16 模拟 Agent 链路 + 27 分项）+ `examples/guardrails/guardrails_basic_demo.py`（无API Key可运行示例），均已实测通过。
 > 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：零新增依赖，完全复用现有核心抽象。
 
 ## 目录
@@ -30,7 +30,11 @@
 
 | 版本 | 日期 | 变更内容 | 破坏性 |
 |------|------|----------|--------|
+| v1.0.3 | 2026-11-23 | P1 修复：`@guardrail_creator` 新增 `guardrail_type` 参数（`input` 默认 / `output` / `tool_call`），生成的护栏按类型继承对应基类、真正参与 `GuardrailMiddleware` 阶段分派与 `use_global=True` 扫描（此前「注册成功却永不执行」）；`tool_call` 型沿用 before/after 分发且后置受 `check_result` 约束；装饰 GuardrailBase 子类恢复原样返回（此前被误包装、检查即报配置错误）；非法 `guardrail_type` 创建时即抛 `GuardrailConfigError` | **行为变化（正向修复）**：此前静默不执行的函数式护栏现在会在对应阶段真正执行 |
+| v1.0.2 | 2026-11-23 | 四个统计/观测层缺陷修复（均不改放行/拦截控制流）：**P2**（观测）护栏 fail-closed 崩溃在 `except XxxGuardrailReject` 补记循环里被 `_record_result` 计一次、又由 `_record_guardrail_error` 计一次，同一次崩溃产生 `{name:1, name__error:1}` 双计数并发两个 span——补记循环对 `is_error` 的拒绝项改为 `continue`，交由 `_record_guardrail_error` 单记（C1 对规则命中路径的去重逻辑保留不变）；**P3**（统计）禁用护栏仍被 invoke，命中 `if not self.enabled: return allow()` 早退分支不写 `guardrail_name`，导致 `stats["pass"][""] += 1` 空名污染 pass_count——`_get_guardrails_by_type` 增加 `and g.enabled` 过滤，禁用护栏彻底不参与执行；**P4**（观测）fail-open 护栏崩溃 `allowed=True, is_error=True` 被当成完全健康的通过静默放行、运维无感知——`_record_result` 对任何 `is_error` 结果按 `{name}__error` 补记一条独立 error 计数（放行判定不变）；**P5**（语义）`GuardrailConfigError`（如 `allow_modify=False` 却调用 `modify()`）继承自 `GuardrailError`，被 invoke 的 `except GuardrailError` 当作普通内容拦截（`reason_kind="rule"`），把配置 bug 伪装成安全拦截——拆出独立 `except GuardrailConfigError` 分支按组件故障观测（`is_error=True` + 尊重 fail_open 姿态）。同步补 4 个行为回归测试到 `main_of_new_add`。P1（`@guardrail_creator` 装饰器护栏因不属三类子类，被 `_get_guardrails_by_type`/`run_*` 的 `isinstance` 过滤静默忽略，等于挂载即失效）属真实功能行为变更且装饰器分类方案需先定，本轮缓做、登记演进路线图 | 低：P2/P3/P4/P5 只改统计与观测维度，放行/拦截决策与钩子返回值语义逐字节不变；既有断言多用 `>= 1`（C1/N4/test_L6 等）不受影响 |
+| v1.0.1 | 2026-11-23 | 六个缺陷修复：**Bug1**（安全）`GuardrailBase.invoke/ainvoke` 改用 `to_scan_text` 全量扁平化，含 `content` 键的 dict 不再只扫描 content 值而绕过其余字段（`ToolCallGuardrail` 靠 `_normalize_input=False` 保留原始 pydantic 对象）；**Bug2**（可观测）`log_guardrail_event` 仅在真实拦截时置 span ERROR，fail-open 放行不再因空 `error=""` 被误标为错误；**Bug3**（并发正确性）`before_tool_call` 拦截时返回 `ToolDecision(False, 原因)` 二元组，拦截原因随返回值携带，不再依赖实例共享属性 `_last_tool_reject_reason`；**Bug4**（死代码）删除 `invoke/ainvoke` 写入但从未被读取的控制流标记 `metadata["_raise_reject"]`，并修正声称它驱动聚合层的误导性注释；**Bug5**（文档与行为不一致）`run_input_guardrails` 等聚合函数 docstring 声称「返回所有结果 / 经过所有护栏处理后的最终输出」，而实现是 **fail-fast**（命中第一条 allowed=False 即 raise、剩余护栏不跑）——逐个修正 8 个执行函数（含 4 个异步版）与两个护栏基类的 docstring；**Bug6**（字段契约不对称）`tags`/`metadata` 是 `GuardrailBase` 上唯一没在类体声明默认值的元数据字段，`__init__` 只能靠 `hasattr(type(self), ...)` 探测子类——子类覆盖 `__init__` 且漏调 `super()` 时 `to_dict()`/`clone()` 直接 `AttributeError`（已实跑复现），且发 `py.typed` 后静态检查看不到字段契约；改为类体声明 `tags: List[str] = []` / `metadata: Dict[str, Any] = {}` 并删掉 hasattr 分支（类值仅作兜底、`__init__` 依旧逐实例拷贝）；附带修正文档里“基类有 `unregister()`”的不存在 API 描述 | 低：钩子返回值语义扩展，旧式 `bool` 实现与主循环 `if not ret:` 判定均仍兼容（`ToolDecision` 重写 `__bool__`）；仅直接断言 `is False` 的测试需改为 `not ret`；Bug4 只移除私有键，Bug5 只改注释/docstring，Bug6 只补齐原本就等价的类默认值（无子类声明 tags 时新旧结果完全相同），三者公开行为逐字节不变 |
 | v1.0.0 | 2026-11-19 | 初版落地：核心基类GuardrailBase、三层护栏（输入/输出/工具调用）、中间件接入、三个预设规则、全局注册表、装饰器、异常体系、可观测埋点、63项单元测试、使用示例、模块文档 | 无 |
+
 
 ---
 
@@ -141,6 +145,21 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
 - `GuardrailResult.allow(metadata=None)`：构造放行结果
 - `GuardrailResult.reject(reason, metadata=None)`：构造拦截结果
 
+`metadata` 由 `invoke()`/`ainvoke()` 统一补齐的约定字段（均为**只供观测的诊断字段，不参与控制流**）：
+
+| 键 | 写入时机 | 说明 |
+|------|----------|------|
+| `duration_ms` | 所有路径 | 本次检查耗时（毫秒） |
+| `guardrail_name` | 所有路径 | 护栏名，中间件据此归类统计与打点 |
+| `is_error` / `guardrail_error` / `guardrail_error_type` | 护栏自身异常 | 区分「组件故障 fail-closed」与「规则命中」，中间件只读 `is_error` |
+| `rejected_via_exception` / `exception_type` | 作者主动抛 `GuardrailError` | 标记拦截来自异常式写法，仅供诊断 |
+| （护栏作者自带键） | `raise XxxReject(details=...)` | `details` 被合并进 metadata，再经 `e.details` 透传回上层 |
+
+⚠️ **Bug4 约定**：往 `metadata` 里只写「给人看 / 给回调看」的诊断字段，**不写下划线开头的私有控制流标记**。
+历史上 `invoke()` 曾写 `metadata["_raise_reject"] = True` 并声称「由聚合层转换成 XxxGuardrailReject」，
+但聚合层只看 `not result.allowed`、从不读它，而 metadata 会作为 `e.details` 透传给用户回调，
+等于把私有字段泄漏到公开面——现已删除。
+
 ### 6.2 ToolCallInfo
 工具调用信息结构体，作为工具护栏前置检查输入：
 | 字段 | 类型 | 说明 |
@@ -176,39 +195,63 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
 核心基类与基础设施：
 - `GuardrailBase`：所有护栏的抽象基类，定义统一接口
   - 核心方法：`check()`（子类实现同步检查）、`acheck()`（子类实现异步检查）、`invoke()`（带错误处理的同步入口）、`ainvoke()`（带错误处理的异步入口）
-  - 元数据：`name`/`description`/`priority`/`tags`/`enabled`，用于注册和排序
+    —— Bug1 修复：`invoke`/`ainvoke` 在调用 `check()` 前用 `to_scan_text()` 而非 `content_to_text()`
+    归一化输入：前者对任意 dict/list/对象全量扁平化，不会丢掉非 `content` 字段；
+    类开关 `_normalize_input: bool = True`（默认全量扫描），依赖原始 pydantic 对象做 isinstance 分发的
+    护栏（如 `ToolCallGuardrail`）覆盖为 `False`，拿到未文本化的原对象。
+    —— Bug4 修复：「作者主动抛 `GuardrailError`」分支归一为 `GuardrailResult(allowed=False)` 后，
+    不再往 metadata 里写无人消费的控制流标记 `_raise_reject`（聚合层只看 `not allowed`）；
+    异常式与返回式两种拦截写法经 `invoke` 后链路完全一致（已由 L7 测试锁定）。
+  - 元数据：`name`/`description`/`priority`/`enabled`/`fail_open`/`tags`/`metadata`，用于注册、排序与扩展
+    —— Bug6 修复：这七个字段全部在 `GuardrailBase` **类体显式声明默认值**，子类只覆盖自己需要的即可
+    （可以直接写 `tags = ["audit"]`）。此前 `tags`/`metadata` 是唯一没声明的两个，`__init__` 只能靠
+    `hasattr(type(self), 'tags')` 探测子类：子类一旦覆盖 `__init__` 又漏调 `super().__init__()`，
+    其余字段能从类默认值兜住，而 `tags`/`metadata` 直接 `AttributeError`（`to_dict()` / `clone()` 就炸）。
+    类级值只作共享兜底常量，`__init__` 一律 `list()`/`dict()` 拷贝成实例属性，实例之间、实例与类之间不串扰。
   - hooks机制：`before_check()`/`after_check()`/`on_error()`，可扩展自定义逻辑
-  - 注册方法：`register()`/`unregister()`，支持全局注册/注销
+  - 注册：实例只有 `register()`（把当前实例登记为全局原型）；**基类没有 `unregister()`**，
+    反注册在注册表层：`global_guardrail_registry.unregister_guardrail(实例或名称)`；
+    中间件层面的移除用 `GuardrailMiddleware.remove_guardrail(name)`
 - 全局注册表：`_GLOBAL_GUARDRAIL_REGISTRY`，存储所有已注册护栏实例
-- `@guardrail_creator`装饰器：快速注册函数式护栏，对齐`@tool_creator`使用方式
+- `@guardrail_creator`装饰器：快速注册函数式护栏，对齐`@tool_creator`使用方式；v1.0.3 起支持 `guardrail_type="input"/"output"/"tool_call"`（默认 input）决定继承基类与参与阶段；装饰 GuardrailBase 子类时原样返回（类型由类的继承决定）
 - 工具函数：`list_guardrails()`（按优先级排序列出所有护栏）、`get_guardrail(name)`（按名称获取护栏实例）、`to_scan_text(input_data)`（C2：把任意结构化输入 dict/list/对象递归展开为可扫描纯文本，供内容类护栏使用；str 原样返回，不影响既有文本路径）
 
 ### 7.2 input_guardrail.py
 输入护栏实现：
 - `InputGuardrail`：继承GuardrailBase，所有输入检查护栏的基类
-- 执行函数：`run_input_guardrails()`（同步）、`arun_input_guardrails()`（异步），按优先级执行所有输入护栏，拦截时抛出InputGuardrailReject异常
+- 执行函数：`run_input_guardrails()`（同步）、`arun_input_guardrails()`（异步），按 priority 升序**逐个**执行；**fail-fast**：命中第一条拦截即抛 `InputGuardrailReject`、剩余护栏不再跑，因此只有全部放行时才会返回结果列表（已完成的部分挂在 `e.results`，见 S5）
 
 ### 7.3 output_guardrail.py
 输出护栏实现：
 - `OutputGuardrail`：继承GuardrailBase，所有输出检查护栏的基类，支持`allow_modify`开关允许修改输出内容
-  - 快捷方法：`reject()`（直接抛出拦截异常）、`modify()`（返回修改后的输出内容）
-- 执行函数：`run_output_guardrails()`（同步）、`arun_output_guardrails()`（异步），执行所有输出护栏，支持自动替换修改后的内容，拦截时抛出OutputGuardrailReject异常
+  - 快捷方法：`reject()`（返回 `allowed=False` 的结果；在 `check()` 里直接 `raise OutputGuardrailReject` 也支持）、
+    `modify()`（需 `allow_modify=True`，把新内容写进 `metadata["modified_output"]` 后返回放行结果）
+- 执行函数：`run_output_guardrails()`（同步）、`arun_output_guardrails()`（异步），按 priority 升序**逐个**执行并自动叠加 `modify()` 的改写结果；同样是 **fail-fast**——一旦拦截即抛 `OutputGuardrailReject`，**排在后面的脱敏/改写护栏没机会执行**（有意的 fail-fast 姿态，不是遗漏）
 
 ### 7.4 tool_call_guardrail.py
 工具调用护栏实现：
 - `ToolCallGuardrail`：继承GuardrailBase，所有工具检查护栏的基类，支持`check_result`开关控制是否执行后置结果检查
+  - `_normalize_input = False`（Bug1）：`check()` 依赖 `isinstance(input_data, ToolCallInfo/ToolResultInfo)` 分发，
+    因此不能被基类文本化，必须拿到原始 pydantic 对象
   - 钩子方法：`before_call()`（前置检查，子类实现）、`after_call()`（后置检查，子类实现）
-- 执行函数：
-  - 前置：`run_tool_call_guardrails()`/`arun_tool_call_guardrails()`，工具调用前执行检查
-  - 后置：`run_tool_result_guardrails()`/`arun_tool_result_guardrails()`，工具返回结果后执行检查
-  - 拦截时抛出ToolCallGuardrailReject异常
+- 执行函数（全部 **fail-fast**，与 Bug5 修正后的 docstring 一致）：
+  - 前置：`run_tool_call_guardrails()`/`arun_tool_call_guardrails()`，工具调用前执行检查，全部放行才返回结果列表
+  - 后置：`run_tool_result_guardrails()`/`arun_tool_result_guardrails()`，工具返回结果后执行检查，
+    返回 `(current_result, results)`，`current_result` 为依次叠加护栏改写后的结果
+  - 命中**第一条** `allowed=False` 即抛 `ToolCallGuardrailReject`，剩余护栏不再执行；
+    `details` 额外携带 `tool_name`（前置还带 `tool_args`），`results` 只含已执行项（见 S5）
 
 ### 7.5 guardrail_middleware.py
 中间件实现，对齐SkillMiddleware生命周期接口：
 - 核心方法：
   - `before_agent_run()`：Agent运行前执行输入护栏检查
-  - `before_tool_call()`：工具调用前执行工具前置护栏检查，返回 False 表示不允许调用。
-    返回 False（或钩子自身抛异常被主循环 fail-closed 兜底）时，主循环会为本批次**每一个**
+  - `before_tool_call()`：工具调用前执行工具前置护栏检查。放行返回 `True`；拦截返回
+    `ToolDecision(False, 原因)` 二元组（Bug3 修复）——拦截原因随返回值携带，同一 middleware 实例被
+    多线程 / 多 Agent 并发调用时，主循环读到的永远是本次调用自己的原因，消除共享属性竞态；
+    `_last_tool_reject_reason` 仍同步写入，但仅供观测/调试与旧式 `bool` 调用方回退，不再是正确性依赖。
+    `ToolDecision` 继承 `tuple` 并重写 `__bool__` 委派给 `allowed`，因此旧调用方的
+    `if not ret:` 判定对拦截元组同样成立（裸 tuple 是 truthy，不重写会把 `(False, "原因")` 误判为放行）。
+    拦截（或钩子自身抛异常被主循环 fail-closed 兜底）时，主循环会为本批次**每一个**
     `tool_call` 各生成一条 tool 消息：被拦的那条写拦截理由，同批其余未执行的写「未执行」占位，
     以保证 assistant 消息声明的 tool_call_id 与 tool 消息严格配对（缺一条即 OpenAI 返回 400）。
     主循环用 `_coerce_tool_args()` 把工具参数统一解析成 dict 后再传给钩子，保证护栏检查与实际
@@ -343,9 +386,11 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
 | `acheck(input_data, context=None)` | 异步检查逻辑，子类实现 |
 | `invoke(input_data, context=None)` | 同步执行入口，带错误处理 |
 | `ainvoke(input_data, context=None)` | 异步执行入口，带错误处理 |
-| `register()` | 注册到全局注册表 |
-| `unregister()` | 从全局注册表注销 |
-| `to_dict()` | 序列化为字典 |
+| `register()` | 注册到全局注册表（基类只有这个方法） |
+| `clone()` | 深拷贝独立副本，供多实例隔离 |
+| `to_dict()` | 序列化为字典（含 `tags`/`metadata`） |
+
+> 反注册不在 `GuardrailBase` 上：请用 `global_guardrail_registry.unregister_guardrail(实例或名称)`（不存在时返回 `False`，不抛 KeyError）。
 
 ### GuardrailMiddleware 中间件
 | 方法/参数 | 说明 |
@@ -356,10 +401,18 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
 | `enable_guardrail(name)` | 启用护栏 |
 | `disable_guardrail(name)` | 禁用护栏 |
 | `before_agent_run(user_input, context=None)` | 输入检查，返回处理后的输入 |
-| `before_tool_call(tool_name, tool_args, context=None)` | 工具前置检查，返回 True/False；False 时主循环为整批 tool_call 补齐响应消息 |
+| `before_tool_call(tool_name, tool_args, context=None)` | 工具前置检查；放行返回 `True`，拦截返回 `ToolDecision(False, 原因)`（旧式 `bool` 实现仍兼容）；拦截时主循环为整批 tool_call 补齐响应消息 |
 | `after_tool_call(tool_name, success, output="", error="", context=None, **kwargs)` | 工具后置检查；`str` 替换 observation，`None` 表示未修改、保持原结果 |
 | `after_agent_run(agent_output, context=None)` | 输出检查，返回处理后的输出 |
 | `get_stats()` | 获取拦截/放行统计 |
+
+### ToolDecision（Bug3：线程安全的拦截返回值）
+| 字段/方法 | 说明 |
+|-----------|------|
+| `ToolDecision(allowed, reason="")` | `before_tool_call` 的二元组返回值，继承自 `tuple`，可直接解包为 `(allowed, reason)` |
+| `.allowed` | 等价于 `self[0]`，`False` 表示拦截 |
+| `.reason` | 等价于 `self[1]`，拦截原因文本，随返回值一同传递 |
+| `__bool__` | 重写为 `bool(allowed)`，保证 `if not ret:` / `assert not ret` 对拦截元组成立 |
 
 ---
 
@@ -396,6 +449,19 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
 4. **自定义异步护栏必须实现acheck方法**
    - 默认acheck会调用同步check，异步场景下建议重写实现真正的异步逻辑，避免阻塞事件循环
 
+5. **写自己的中间件时，别用裸 tuple 做 `before_tool_call` 的拦截返回值**
+   - 裸 `(False, "原因")` 是 truthy，`if not ret:` 会把它当成放行，直接打开安全口子；
+     要么返回 `ToolDecision(False, "原因")`（已重写 `__bool__`），要么返回纯 `bool`
+   - 主循环侧不依赖 `bool(tuple)`，而是取 `_ret[0]` 判定，两种写法都能正确拦截
+
+6. **多个 Agent 共用一个 `GuardrailMiddleware` 实例时，不要读 `_last_tool_reject_reason` 做业务判断**
+   - 该属性是实例级共享状态，并发下会被别的线程覆盖；拦截原因请取返回值 `ToolDecision.reason`
+
+7. **不要指望 `run_*_guardrails` 能拿到全部护栏结果**（Bug5）
+   - 它是 **fail-fast**：命中第一条拦截即抛异常，后面的护栏根本不跑，`e.results` 只含已执行项；
+     需要「跑完全部再汇总」时请自己逐个 `g.invoke(...)` 收集
+   - 同理，把“后置脱敏/改写护栏”的 `priority` 排在“拦截护栏”之后，一旦拦截就不会脱敏——顺序要按意图设计
+
 ### 10.3 跨平台注意事项
 - 所有路径判断统一使用os.path处理，Windows反斜杠路径自动兼容
 - 正则表达式默认开启re.IGNORECASE，大小写不敏感匹配
@@ -406,17 +472,41 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
 ## 十一、测试与验证
 
 ### 11.1 测试覆盖范围
-单元测试共63项，覆盖：
+单元测试共 **113 项**（`tests/guardrails/` 下 10 个文件：51 主用例 + 19 真实 ReActAgent 端到端
++ 16 模拟 Agent 链路 + 27 分项），覆盖：
 - 基类功能：GuardrailResult结构体、装饰器注册、优先级排序、序列化
 - 三类护栏：输入/输出/工具护栏的放行/拦截/修改逻辑
 - 预设护栏：注册、Prompt注入检测、高危工具拦截、正常内容放行
 - 中间件：初始化、动态添加/移除护栏、fail_open模式、统计功能
 - 异常体系：继承关系、属性正确性
+- 缺陷回归（v1.0.1）：
+  - **Bug1** `test_BUG1_dict_with_content_key_does_not_bypass_scan`：含 `content` 键的 dict 其余字段不得绕过扫描（输入/输出两侧）
+  - **Bug2** fail-open 放行的护栏 span 必须为 SUCCESS，不被空 `error=""` 误标为 ERROR
+  - **Bug3** `test_BUG3_reject_reason_travels_with_return_value`：`ToolDecision` 的 tuple/`__bool__` 协议语义、
+    拦截原因随返回值携带、8 线程共用同一 middleware 不串扰、放行路径仍返回裸 `True`
+  - **Bug4** `test_BUG4_no_dead_control_flag_in_reject_metadata`：`metadata`/`e.details` 不再出现下划线开头的
+    私有控制键，诊断字段保留，异常式与返回式拦截行为逐项一致
+  - **Bug5** `test_BUG5_run_guardrails_fail_fast_matches_docstring`：输入/输出/工具前置/工具后置四层聚合函数
+    均为 fail-fast（拦截项之后的护栏不被调用、`results` 只含已执行项、全放行才返回列表且叠加 `modify()`），
+    同步与异步语义严格一致——把修正后的 docstring 锁在测试里，防止再次漂移
+  - **Bug6** `test_BUG6_tags_metadata_are_declared_class_attributes`：`tags`/`metadata` 与其他五个元数据字段
+    一样在类体声明并出现在 `__annotations__`；子类覆盖 `__init__` 漏调 `super()` 时 `to_dict()`/`clone()`
+    不再 `AttributeError`（修复前已实跑复现）；实例级 `append`/`update` 不串扰其它实例、不回污染类默认值；
+    构造器显式传参优先级最高
+- 缺陷回归（v1.0.3）：
+  - **P1** `test_P1_function_guardrail_participates_in_dispatch`：`@guardrail_creator` 生成的函数式护栏按
+    `guardrail_type` 继承对应基类，中间件输入/工具阶段与 `use_global=True` 扫描均真正执行；非法类型值创建时
+    即抛 `GuardrailConfigError`；装饰类原样返回不被误包装。同步翻转 `test_guardrails_sim_agent.py` S15
+    （「现状记录 not_dispatched」→ dispatched），修正 `test_tool_call_guardrail.py::test_tool_call_allow`
+    空转断言为显式注册 + 真实执行
 
 ### 11.2 运行测试命令
-```bash
+本仓库测试不依赖 pytest，逐文件直接运行即可：
+```powershell
 cd fast_agents
-python -m pytest tests/guardrails/test_guardrails.py -v
+python tests\guardrails\test_guardrails.py
+python tests\guardrails\test_guardrails_real_agent.py
+python tests\guardrails\test_guardrails_sim_agent.py
 ```
 
 ### 11.3 运行示例验证
