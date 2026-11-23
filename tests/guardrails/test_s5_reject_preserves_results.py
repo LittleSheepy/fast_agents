@@ -118,14 +118,15 @@ def test_s5_2_output_reject_records_preceding_passes():
 
 
 def test_s5_3_tool_pre_reject_records_preceding_passes():
-    """工具前置护栏：B 拦截时 A 必须被记录，且 before_tool_call 返回 False。"""
+    """工具前置护栏：B 拦截时 A 必须被记录，且 before_tool_call 返回拦截。"""
     mw = GuardrailMiddleware(enable_presets=False)
     mw.add_guardrail(PassToolA())
     mw.add_guardrail(RejectToolB())
 
     info = ToolCallInfo(tool_name="any_tool", tool_args={})
     result = mw.before_tool_call(info.tool_name, info.tool_args)
-    assert result is False, "工具前置应被拦截"
+    # Bug3 协议升级：拦截返回 ToolDecision(False, 原因)，`not result` 与旧 `result is False` 语义等价
+    assert not result, "工具前置应被拦截"
 
     stats = mw.get_stats()
     assert stats["pass"].get("pass_tool_a") == 1, \
@@ -133,6 +134,8 @@ def test_s5_3_tool_pre_reject_records_preceding_passes():
     assert stats["reject"].get("reject_tool_b", 0) >= 1
     # 拦截原因已写入
     assert "TB blocks it" in mw._last_tool_reject_reason
+    # Bug3：同样的原因必须随返回值携带（不依赖共享属性）
+    assert "TB blocks it" in result[1], f"Bug3：拦截原因应随返回值携带，实际 {result!r}"
 
 
 def test_s5_4_all_pass_no_regression():

@@ -17,7 +17,6 @@ from fast_agents.guardrails.models import (
     GuardrailResult, ToolCallInfo, ToolResultInfo,
 )
 from fast_agents.guardrails.errors import ToolCallGuardrailReject
-from fast_agents.guardrails.guardrail_base import guardrail_creator
 from tests._runner import raises, run_all
 
 
@@ -28,16 +27,19 @@ def _reset_registry():
 
 
 def test_tool_call_allow():
-    """测试工具调用放行正常操作"""
+    """测试工具调用放行正常操作（P1 修正：装饰器对类做 passthrough 不注册，改为显式注册）"""
     _reset_registry()
 
-    @guardrail_creator(name="tool_call_allow_test", description="工具放行测试")
     class AllowToolGuardrail(ToolCallGuardrail):
+        name = "tool_call_allow_test"
+        description = "工具放行测试"
         def before_call(self, tool_call: ToolCallInfo, context=None):
             return GuardrailResult.allow()
+    AllowToolGuardrail().register()
 
     tool_info = ToolCallInfo(tool_name="calculator", tool_args={"expression": "1+1"})
     results = run_tool_call_guardrails(tool_info, use_global=True)
+    assert len(results) >= 1, f"应至少执行到 1 个工具护栏，实际 results={results}"
     assert all(r.allowed for r in results)
     print("✅ 工具调用放行正常操作通过")
 
@@ -99,7 +101,8 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
-    pass
+    test_tool_call_reject_high_risk()
+    test_tool_call_allow()  # P1：空转测试修正，真正注册并执行到工具护栏
 
 if __name__ == "__main__":
     print("")

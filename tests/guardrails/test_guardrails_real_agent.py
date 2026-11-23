@@ -715,7 +715,7 @@ def test_N3_guardrail_and_execution_use_same_parsed_args():
         """记录 before_tool_call 看到的参数类型"""
         name = "inspect_args_middleware_n3"
 
-        def before_tool_call(self, tool_name, tool_args):
+        def before_tool_call(self, tool_name, tool_args, context=None, **kwargs):
             guardrail_saw.append((
                 tool_name,
                 type(tool_args).__name__,

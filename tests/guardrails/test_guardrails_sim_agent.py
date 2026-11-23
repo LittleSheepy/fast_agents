@@ -734,16 +734,15 @@ def test_S14_sim_agent_stage_dispatch():
 
 
 # ─────────────────────────────────────────────────────────
-# S15 现状记录：@guardrail_creator 护栏不参与按类型分发
+# S15 P1 修复翻转：@guardrail_creator 护栏按类型参与阶段分派
 # ─────────────────────────────────────────────────────────
 
-def test_S15_sim_agent_decorator_guardrail_not_dispatched():
-    """S15 现状记录：@guardrail_creator 生成的护栏没有阶段归属，不参与按类型分发
+def test_S15_sim_agent_decorator_guardrail_dispatched():
+    """S15（P1 修复翻转）：@guardrail_creator 默认 guardrail_type="input"，
+    生成的护栏是 InputGuardrail 子类，真正参与阶段分派并拦截。
 
-    说明：装饰器生成的实例直接继承 GuardrailBase，不是 InputGuardrail /
-    OutputGuardrail / ToolCallGuardrail 的子类，因此 middleware 按类型筛选时
-    一定筛不到它，加进 middleware 也不会在任何阶段执行。本用例把这一「现状」
-    固定下来，供接入决策时对照（是否要为装饰器补 guardrail_type 归属）。
+    修复前本用例是「现状记录」（装饰器护栏无阶段归属，加进 middleware 也不会执行）；
+    P1 修复后翻转为正确行为：输入阶段执行一次、短路 LLM。
     """
     _reset_registry()
     calls = {"n": 0}
@@ -761,9 +760,10 @@ def test_S15_sim_agent_decorator_guardrail_not_dispatched():
 
     answer = agent.run("任意输入")
 
-    assert calls["n"] == 0, "装饰器护栏当前不会进入阶段分发"
-    assert answer == "正常回答"
-    print("✅ S15 装饰器护栏未被阶段分发（当前行为已记录）")
+    assert calls["n"] == 1, f"装饰器护栏应在输入阶段执行一次，实际 {calls['n']} 次"
+    assert "请求被安全护栏拦截" in answer, f"应返回拦截文案：{answer!r}"
+    assert len(llm.calls) == 0, "输入被拦截后不应进入 LLM 推理"
+    print("✅ S15 装饰器护栏参与输入阶段分派（P1 修复翻转）通过")
 
 
 # ─────────────────────────────────────────────────────────
@@ -822,7 +822,7 @@ def main_of_new_add():
     test_S12_sim_agent_multi_instance_isolation()
     test_S13_sim_agent_preset_guardrails()
     test_S14_sim_agent_stage_dispatch()
-    test_S15_sim_agent_decorator_guardrail_not_dispatched()
+    test_S15_sim_agent_decorator_guardrail_dispatched()  # P1 修复：由 not_dispatched 现状记录翻转为真正参与分派
     asyncio.run(test_S16_sim_agent_async_hooks())
 
 

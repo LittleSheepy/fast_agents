@@ -7,7 +7,7 @@ Guardrails S4 bug 复现测试：tool_registry 晚注入不传播到 preset 副�
   s4_2  注册了 requires_approval=True 的工具，BasicPermissionGuardrail.before_call 应拦截
   s4_3  构造 middleware 时显式传 tool_registry=... 的对照用例（应通过，证明路径代码本身正确）
   s4_4  动态给 middleware.tool_registry 赋值时，应同步传播到已挂载的 BasicPermissionGuardrail
-  s4_5  端到端：经 middleware.before_tool_call 对 requires_approval 工具应返回 False 并写 reject 原因
+  s4_5  端到端：经 middleware.before_tool_call 对 requires_approval 工具应拦截并携带 reject 原因
 运行：python tests/guardrails/test_s4_tool_registry_injection.py
 """
 import os
@@ -131,7 +131,7 @@ def test_s4_4_setter_propagates_to_existing_presets_and_external_guards():
 
 def test_s4_5_manual_tool_registry_assignment_before_run_blocks_in_agent_loop():
     """S4_5：端到端模拟主循环——构造 middleware 不传 registry、手动赋值后再调 before_tool_call，
-    requires_approval 工具应被拦截（返回 False 并写入 _last_tool_reject_reason）。"""
+    requires_approval 工具应被拦截（原因随返回值携带并写入 _last_tool_reject_reason）。"""
     mw = GuardrailMiddleware(presets=("basic_permission",))
     registry = ToolRegistry()
     registry.register_tool(_AnotherDangerousTool())
@@ -142,10 +142,12 @@ def test_s4_5_manual_tool_registry_assignment_before_run_blocks_in_agent_loop():
         tool_args={"op": "exfiltrate"},
         context={},
     )
-    assert ok is False, (
-        f"middleware.before_tool_call 对 requires_approval=True 工具应返回 False 拦截，实际返回 {ok!r}；"
+    # Bug3 协议升级：拦截返回 ToolDecision(False, 原因)，`not ok` 与旧 `ok is False` 语义等价
+    assert not ok, (
+        f"middleware.before_tool_call 对 requires_approval=True 工具应拦截，实际返回 {ok!r}；"
         f"_last_tool_reject_reason={mw._last_tool_reject_reason!r}"
     )
+    assert ok[1] and "my_secret_op" in ok[1], f"Bug3：拦截原因必须随返回值携带，实际 {ok!r}"
     assert mw._last_tool_reject_reason is not None
     assert "my_secret_op" in mw._last_tool_reject_reason
 
