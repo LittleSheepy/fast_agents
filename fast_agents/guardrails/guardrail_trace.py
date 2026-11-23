@@ -66,11 +66,15 @@ def log_guardrail_event(
                 **(context or {}),
             },
         )
-        is_err = (not result.allowed) or result.metadata.get("is_error", False)
+        # Bug2 修复：仅在护栏实际拦截（not allowed）时才标记 span 为 ERROR。
+        # fail_open=True 路径：护栏出错但放行（allowed=True, is_error=True, reason=""），
+        # 若传 error="" 给 end_span，因 "" is not None → True，会错误置 span.status=ERROR，
+        # 误导监控面板的护栏错误率统计。正确做法：放行就是放行，is_error 留在 metadata 供诊断。
+        _has_error = (not result.allowed) and bool(result.reason)
         tracer.end_span(
             span,
             output={"allowed": result.allowed},
-            error=result.reason if is_err else None,
+            error=result.reason if _has_error else None,
         )
     except Exception as _e:
         # Trace 埋点失败不影响主流程，但记录 warning 避免静默空转

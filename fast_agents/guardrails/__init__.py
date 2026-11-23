@@ -45,7 +45,7 @@ from .tool_call_guardrail import (
     arun_tool_call_guardrails,
     arun_tool_result_guardrails,
 )
-from .guardrail_middleware import GuardrailMiddleware, GuardrailBlocked, GuardrailModified
+from .guardrail_middleware import GuardrailMiddleware, GuardrailBlocked, GuardrailModified, ToolDecision
 from .errors import (
     GuardrailError,
     InputGuardrailReject,
@@ -89,6 +89,7 @@ __all__ = [
     # 控制流信号（跨模块协作点：中间件→Agent 主循环的结构化返回值）
     "GuardrailBlocked",
     "GuardrailModified",
+    "ToolDecision",
     # 异常
     "GuardrailError",
     "InputGuardrailReject",

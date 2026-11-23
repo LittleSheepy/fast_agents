@@ -51,6 +51,7 @@ from .guardrails import (
     global_guardrail_registry,
     GuardrailBlocked,
     GuardrailModified,
+    ToolDecision,
     GuardrailBase, GuardrailResult, guardrail_creator,
     list_guardrails, get_guardrail, to_scan_text,
     InputGuardrail, OutputGuardrail, ToolCallGuardrail,
@@ -119,6 +120,7 @@ __all__ = [
     "ToolCallInfo", "ToolResultInfo",
     "GuardrailMiddleware",
     "GuardrailBlocked", "GuardrailModified",
+    "ToolDecision",  # Bug3：before_tool_call 的线程安全拦截返回值（allowed, reason）
     "GuardrailError", "InputGuardrailReject", "OutputGuardrailReject",
     "ToolCallGuardrailReject", "GuardrailConfigError",
     "log_guardrail_event",

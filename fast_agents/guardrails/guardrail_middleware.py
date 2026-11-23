@@ -63,6 +63,35 @@ class GuardrailModified:
     content: str
 
 
+class ToolDecision(tuple):
+    """before_tool_call 的线程安全返回值：``(allowed, reason)`` 二元组（Bug3 修复）。
+
+    继承 tuple 保证 isinstance(x, tuple) / 索引 / 解包全部可用；
+    重写 ``__bool__`` 委托给 allowed——旧调用方的 ``if not ret:`` 判定
+    对拦截元组同样成立（裸 tuple 是 truthy，不重写会把 (False, "原因") 误判为放行）。
+
+    拦截原因随返回值携带，不再依赖实例共享属性 ``_last_tool_reject_reason``：
+    多线程/多 Agent 并发调用同一 middleware 实例时，主循环读到的永远是自己
+    那次调用的原因，消除跨线程串扰。``_last_tool_reject_reason`` 仍会同步写入，
+    仅供观测/调试与旧式 bool 调用方回退使用，不再是正确性依赖。
+    """
+    __slots__ = ()
+
+    def __new__(cls, allowed: bool, reason: str = "") -> "ToolDecision":
+        return super().__new__(cls, (bool(allowed), str(reason)))
+
+    @property
+    def allowed(self) -> bool:
+        return self[0]
+
+    @property
+    def reason(self) -> str:
+        return self[1]
+
+    def __bool__(self) -> bool:
+        return self[0]
+
+
 class GuardrailMiddleware(AgentMiddleware):
     """
     Guardrail中间件：在Agent全流程自动执行护栏检查
@@ -275,7 +304,11 @@ class GuardrailMiddleware(AgentMiddleware):
         return stats
 
     def _get_guardrails_by_type(self, guardrail_type: type) -> List[GuardrailBase]:
-        return [g for g in self._instance_guardrails if isinstance(g, guardrail_type)]
+        # P3 修复：禁用的护栏不参与执行。此前 disabled 护栏仍被 invoke，命中
+        # `if not self.enabled: return GuardrailResult.allow()` 早退分支，该分支不写 guardrail_name，
+        # 导致每次运行都往 pass_stats 里落一个空名计数（stats["pass"][""] += 1）并污染 pass_count。
+        # 直接在分发层过滤掉 enabled=False 的实例，既消除脏数据，又不改变放行/拦截决策。
+        return [g for g in self._instance_guardrails if isinstance(g, guardrail_type) and g.enabled]
 
     def _record_result(
         self,
@@ -290,6 +323,15 @@ class GuardrailMiddleware(AgentMiddleware):
         else:
             self._pass_count += 1
             self._pass_stats[guardrail_name] = self._pass_stats.get(guardrail_name, 0) + 1
+        # P4 修复：组件自身故障（is_error）无论放行（fail-open）还是拦截（fail-closed），
+        # 都要留一条独立的 error 观测。历史 fail-open 崩溃返回 allowed=True，
+        # 被当成完全健康的通过静默放行，运维无法感知护栏悄悄挂掉。这里按 __error
+        # 后缀单独计数，与「规则命中」区分，不影响本次放行判定本身。
+        # fail-closed 崩溃走的是 except XxxReject 补记路径（已由 P2 让 _record_guardrail_error 单记），
+        # 不会重复进入本分支的 error 计数，故无双记。
+        if result.metadata.get("is_error"):
+            _err_key = f"{guardrail_name or '__guardrail_error__'}__error"
+            self._reject_stats[_err_key] = self._reject_stats.get(_err_key, 0) + 1
         # L7/L8：唯一打点入口，SpanKind=GUARDRAIL，字段统一，不重复写 start_span/end_span
         log_guardrail_event(
             self.tracer,
@@ -359,26 +401,17 @@ class GuardrailMiddleware(AgentMiddleware):
             )
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="input_check", context=context)
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛 InputGuardrailReject，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "input_check", RuntimeError(_detail), context=context)
-                    _logger.error("输入护栏 %s 执行异常（fail-closed，已拦截请求）: %s", _gname, _detail)
-                    return GuardrailBlocked(
-                        phase="input",
-                        message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
-                        reason_kind="error",
-                        detail=_detail,
-                    )
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             return None  # 放行
         except InputGuardrailReject as e:
             _details = e.details or {}
             # S5：先补记录异常抛出之前已通过的护栏结果，避免 _pass_stats / trace span 丢失
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="input_check", context=context)
             # is_error=True 表示护栏自身崩溃（fail-closed 才会走到这里，fail-open 在 invoke 里已 allowed=True），
             # 不看 self.fail_open——实例级姿态优先，这里结构化拦截 + 独立错误打点
@@ -426,27 +459,17 @@ class GuardrailMiddleware(AgentMiddleware):
             )
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="input_check", context=context)
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛对应 Reject 异常，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "input_check", RuntimeError(_detail),
-                                                 context={**(context or {})})
-                    _logger.error("输入护栏（异步） %s 执行异常（fail-closed，已拦截请求）: %s", _gname, _detail)
-                    return GuardrailBlocked(
-                        phase="input",
-                        message="请求被安全护栏拦截：输入安全检查发生内部错误，为保证安全已拒绝本次请求。",
-                        reason_kind="error",
-                        detail=_detail,
-                    )
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             return None
         except InputGuardrailReject as e:
             _details = e.details or {}
             # S5：补记录异常抛出之前已通过的护栏结果
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="input_check", context=context)
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "input_check", e, context=context)
@@ -484,11 +507,14 @@ class GuardrailMiddleware(AgentMiddleware):
         tool_args: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> bool:
-        """工具调用前：执行工具前置护栏。返回 True=放行，False=拦截（原因写入 _last_tool_reject_reason）。
+    ) -> Union[bool, ToolDecision]:
+        """工具调用前：执行工具前置护栏。放行返回 True；拦截返回 ToolDecision(False, 原因)。
 
-        S1：护栏自身崩溃（fail-closed）不再 raise，改为返回 False + 把错误文案写入
-        ``_last_tool_reject_reason``，主循环读取该属性走正常拦截分支，确保工具不会被静默放行。
+        S1：护栏自身崩溃（fail-closed）不抛异常，拦截返回值携带安全文案，
+        主循环直接取用，确保工具不会被静默放行。
+
+        Bug3：拦截原因随 ToolDecision 返回值携带（线程安全）；同时仍写入
+        ``_last_tool_reject_reason`` 供观测与旧式 bool 调用方回退，不再作为正确性依赖。
         """
         self._last_tool_reject_reason = None
         try:
@@ -506,49 +532,47 @@ class GuardrailMiddleware(AgentMiddleware):
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="tool_pre_check",
                                     context={**(context or {}), "tool_name": tool_name})
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛对应 Reject 异常，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "tool_pre_check", RuntimeError(_detail),
-                                                 context={**(context or {}), "tool_name": tool_name})
-                    _logger.error("工具前置护栏 %s 执行异常（fail-closed，已拦截调用 %s）: %s", _gname, tool_name, _detail)
-                    return False
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             return True
         except ToolCallGuardrailReject as e:
             _details = e.details or {}
             # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
             _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_pre_check", context=_reject_ctx)
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "tool_pre_check", e, context=_reject_ctx)
                 _logger.error("工具前置护栏 %s 执行异常（fail-closed，已拦截调用 %s）: %s",
                               e.guardrail_name, tool_name, e)
-                self._last_tool_reject_reason = (
+                _reason = (
                     f"工具 {tool_name} 调用被安全护栏拦截：工具安全检查发生内部错误，为保证安全已拒绝本次调用。"
                 )
-                return False
+                self._last_tool_reject_reason = _reason
+                return ToolDecision(False, _reason)
             if self.on_tool_reject:
-                self._last_tool_reject_reason = self.on_tool_reject(e)
+                _reason = self.on_tool_reject(e)
             else:
-                self._last_tool_reject_reason = f"工具调用被安全护栏拦截：{e}"
-            return False
+                _reason = f"工具调用被安全护栏拦截：{e}"
+            self._last_tool_reject_reason = _reason
+            return ToolDecision(False, _reason)
         except Exception as e:
             if self.fail_open:
                 _logger.warning("[guardrail] 工具前置护栏整体异常（fail_open=True，放行 %s）: %s", tool_name, e)
                 return True
-            # fail-closed：组件崩溃 → 返回 False（拦截），写入固定文案，主循环会读 _last_tool_reject_reason
+            # fail-closed：组件崩溃 → 拦截，原因随 ToolDecision 返回（Bug3），主循环直接取用
             self._record_guardrail_error("__middleware__", "tool_pre_check", e,
                                          context={**(context or {}), "tool_name": tool_name})
             _logger.error("[guardrail] 工具前置护栏整体异常（fail-closed，已拦截调用 %s）: %s", tool_name, e)
-            self._last_tool_reject_reason = (
+            _reason = (
                 f"工具 {tool_name} 调用被安全护栏拦截：工具安全检查发生内部错误，为保证安全已拒绝本次调用。"
             )
-            return False
+            self._last_tool_reject_reason = _reason
+            return ToolDecision(False, _reason)
 
     async def abefore_tool_call(
         self,
@@ -556,7 +580,8 @@ class GuardrailMiddleware(AgentMiddleware):
         tool_args: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> bool:
+    ) -> Union[bool, ToolDecision]:
+        """异步版本，语义同 before_tool_call（Bug3：拦截原因随 ToolDecision 返回）。"""
         self._last_tool_reject_reason = None
         try:
             pre_guardrails = self._get_guardrails_by_type(ToolCallGuardrail)
@@ -573,37 +598,34 @@ class GuardrailMiddleware(AgentMiddleware):
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="tool_pre_check",
                                     context={**(context or {}), "tool_name": tool_name})
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛对应 Reject 异常，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "tool_pre_check", RuntimeError(_detail),
-                                                 context={**(context or {}), "tool_name": tool_name})
-                    _logger.error("[guardrail] 工具前置护栏（异步） %s 执行异常（fail-closed，已拦截调用 %s）: %s", _gname, tool_name, _detail)
-                    return False
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             return True
         except ToolCallGuardrailReject as e:
             _details = e.details or {}
             # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
             _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_pre_check", context=_reject_ctx)
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "tool_pre_check", e, context=_reject_ctx)
                 _logger.error("[guardrail] 工具前置护栏（异步）%s 异常（fail-closed，已拦截调用 %s）: %s",
                               e.guardrail_name, tool_name, e)
-                self._last_tool_reject_reason = (
+                _reason = (
                     f"工具 {tool_name} 调用被安全护栏拦截：工具安全检查发生内部错误，为保证安全已拒绝本次调用。"
                 )
-                return False
+                self._last_tool_reject_reason = _reason
+                return ToolDecision(False, _reason)
             if self.on_tool_reject:
-                self._last_tool_reject_reason = self.on_tool_reject(e)
+                _reason = self.on_tool_reject(e)
             else:
-                self._last_tool_reject_reason = f"工具调用被安全护栏拦截：{e}"
-            return False
+                _reason = f"工具调用被安全护栏拦截：{e}"
+            self._last_tool_reject_reason = _reason
+            return ToolDecision(False, _reason)
         except Exception as e:
             if self.fail_open:
                 _logger.warning("[guardrail] 工具前置护栏异步整体异常（fail_open=True，放行 %s）: %s", tool_name, e)
@@ -611,10 +633,11 @@ class GuardrailMiddleware(AgentMiddleware):
             self._record_guardrail_error("__middleware__", "tool_pre_check", e,
                                          context={**(context or {}), "tool_name": tool_name})
             _logger.error("[guardrail] 工具前置护栏（异步）整体异常（fail-closed，已拦截调用 %s）: %s", tool_name, e)
-            self._last_tool_reject_reason = (
+            _reason = (
                 f"工具 {tool_name} 调用被安全护栏拦截：工具安全检查发生内部错误，为保证安全已拒绝本次调用。"
             )
-            return False
+            self._last_tool_reject_reason = _reason
+            return ToolDecision(False, _reason)
 
     def after_tool_call(
         self,
@@ -651,17 +674,7 @@ class GuardrailMiddleware(AgentMiddleware):
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="tool_post_check",
                                     context={**(context or {}), "tool_name": tool_name, "success": success})
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛对应 Reject 异常，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "tool_post_check", RuntimeError(_detail),
-                                                 context={**(context or {}), "tool_name": tool_name, "success": success})
-                    _logger.error("工具后置护栏 %s 执行异常（fail-closed，已拦截结果 %s）: %s", _gname, tool_name, _detail)
-                    return "工具执行结果被安全护栏拦截：结果检查发生内部错误，为保证安全已拦截。"
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             # 未修改时返回原始 output（保持向后兼容）；修改后返回新的 output 字符串
             # N1：内容未变化且为空串时必须返回 None 而非空串，否则主循环会把
             # 失败工具渲染好的错误 observation（含「错误: ...」前缀）覆盖成空白。
@@ -676,6 +689,11 @@ class GuardrailMiddleware(AgentMiddleware):
             # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
             _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_post_check", context=_reject_ctx)
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "tool_post_check", e, context=_reject_ctx)
@@ -725,17 +743,7 @@ class GuardrailMiddleware(AgentMiddleware):
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="tool_post_check",
                                     context={**(context or {}), "tool_name": tool_name, "success": success})
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛对应 Reject 异常，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "tool_post_check", RuntimeError(_detail),
-                                                 context={**(context or {}), "tool_name": tool_name, "success": success})
-                    _logger.error("[guardrail] 工具后置护栏（异步） %s 执行异常（fail-closed，已拦截结果 %s）: %s", _gname, tool_name, _detail)
-                    return "工具执行结果被安全护栏拦截：结果检查发生内部错误，为保证安全已拦截。"
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             # 未修改时返回原始 output（保持向后兼容）；修改后返回新的 output 字符串
             # N1：与同步版 after_tool_call 语义严格一致——内容未变化且为空串时返回 None，
             # 不回传空串，否则主循环会把失败工具的错误 observation 覆盖成空白。
@@ -748,6 +756,11 @@ class GuardrailMiddleware(AgentMiddleware):
             # N4：e.results 已含拒绝项，统一遍历一次即可，不再另造 reject_result 重复计数
             _reject_ctx = {**(context or {}), "tool_name": tool_name}
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="tool_post_check", context=_reject_ctx)
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "tool_post_check", e, context=_reject_ctx)
@@ -790,22 +803,7 @@ class GuardrailMiddleware(AgentMiddleware):
             )
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="output_check", context=context)
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛对应 Reject 异常，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "output_check", RuntimeError(_detail),
-                                                 context={**(context or {})})
-                    _logger.error("输出护栏 %s 执行异常（fail-closed，已拦截输出）: %s", _gname, _detail)
-                    return GuardrailBlocked(
-                        phase="output",
-                        message="请求被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拦截输出。",
-                        reason_kind="error",
-                        detail=_detail,
-                    )
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             if final_output == agent_output:
                 return None
             return GuardrailModified(phase="output", content=final_output)
@@ -813,6 +811,11 @@ class GuardrailMiddleware(AgentMiddleware):
             _details = e.details or {}
             # S5：补记录异常抛出之前已通过的护栏结果
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="output_check", context=context)
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "output_check", e, context=context)
@@ -857,22 +860,7 @@ class GuardrailMiddleware(AgentMiddleware):
             )
             for r in results:
                 self._record_result(r.metadata.get("guardrail_name", ""), r, phase="output_check", context=context)
-                # 防御性双重检查：聚合层理论上会在第一条 not allowed 处抛对应 Reject 异常，
-                # 这里保留显式的 is_error 判定，防止未来聚合层行为变化时静默放行。
-                # 姿态判断交给 r.allowed（invoke 已把实例级 fail_open 编码进来），
-                # 不再用 self.fail_open 二次覆盖，避免实例显式 True 被 middleware 压回 False。
-                if r.metadata.get("is_error") and not r.allowed:
-                    _gname = r.metadata.get("guardrail_name", "")
-                    _detail = str(r.reason)
-                    self._record_guardrail_error(_gname, "output_check", RuntimeError(_detail),
-                                                 context={**(context or {})})
-                    _logger.error("输出护栏（异步） %s 执行异常（fail-closed，已拦截输出）: %s", _gname, _detail)
-                    return GuardrailBlocked(
-                        phase="output",
-                        message="请求被安全护栏拦截：输出安全检查发生内部错误，为保证安全已拦截输出。",
-                        reason_kind="error",
-                        detail=_detail,
-                    )
+                # Bug6: 聚合层 fail-fast，进入此循环体时 r.allowed 恒为 True，原 is_error 双重检查为死代码已删除。
             if final_output == agent_output:
                 return None
             return GuardrailModified(phase="output", content=final_output)
@@ -880,6 +868,11 @@ class GuardrailMiddleware(AgentMiddleware):
             _details = e.details or {}
             # S5：补记录异常抛出之前已通过的护栏结果
             for _r in getattr(e, "results", []) or []:
+                # P2 修复：fail-closed 组件故障（is_error）时，拒绝项交给下方 _record_guardrail_error
+                # 单记一次，这里跳过它，避免同一崩溃在 reject_stats 被计两次、发两个 span。
+                # 规则命中（非 is_error）路径保持原样：拒绝项仍在此记一次（C1 语义不变）。
+                if _details.get("is_error") and not _r.allowed:
+                    continue
                 self._record_result(_r.metadata.get("guardrail_name", ""), _r, phase="output_check", context=context)
             if _details.get("is_error"):
                 self._record_guardrail_error(e.guardrail_name, "output_check", e, context=context)

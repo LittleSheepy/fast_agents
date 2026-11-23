@@ -37,7 +37,7 @@ def run_input_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> List[GuardrailResult]:
-    """执行输入护栏检查，返回所有结果。
+    """执行输入护栏检查（**fail-fast**：命中即抛异常，不会跑完全部护栏）。
 
     Args:
         user_input: 用户输入，可以是字符串、消息列表或结构化输入
@@ -50,7 +50,14 @@ def run_input_guardrails(
             GuardrailMiddleware 调用时传入 self.fail_open。
 
     Returns:
-        所有护栏的检查结果列表，按priority排序
+        仅在**全部护栏都放行**时才返回列表，元素按 priority 升序逐个执行的结果；
+        只要有一条不放行，就不会返回任何结果。
+
+    Raises:
+        InputGuardrailReject: 按 priority 遍历时遇到**第一条** allowed=False 就立即抛出，
+            剩余护栏**不再执行**（不是"跑完全部再汇总"）。
+            异常携带：`guardrail_name`=触发拦截的护栏名、`details`=该结果的 metadata、
+            `results`=已执行完的结果（含拒绝项自身，供上层补记统计与 Trace，见 S5）。
     """
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, InputGuardrail)] if use_global else []
@@ -78,7 +85,10 @@ async def arun_input_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> List[GuardrailResult]:
-    """异步版本的输入护栏执行。"""
+    """异步版本的输入护栏执行，语义与 run_input_guardrails 严格一致（同样 fail-fast）。
+
+    Returns: 全部放行时返回结果列表；Raises: InputGuardrailReject（命中第一条拦截即抛出）。
+    """
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, InputGuardrail)] if use_global else []
 

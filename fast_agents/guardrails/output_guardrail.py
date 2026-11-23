@@ -15,8 +15,12 @@ from .errors import OutputGuardrailReject, GuardrailConfigError
 class OutputGuardrail(GuardrailBase):
     """输出护栏基类，所有Agent输出检查护栏都继承自此类。
 
-    输出护栏可以选择直接拦截抛出异常，也可以返回修改后的输出内容
-    （通过metadata["modified_output"]字段传递修改结果）。
+    子类有两种写法（推荐返回，两种写法经 invoke() 归一后链路完全一致）：
+    - 拦截：`return self.reject(原因)`（allowed=False）；在 check() 里直接
+      `raise OutputGuardrailReject` 也支持；
+    - 改写/脱敏：先置 `allow_modify=True`，再 `return self.modify(新内容)`，
+      新内容由 modify() 写进 metadata["modified_output"] 与 metadata["modified"]，
+      由 run_output_guardrails 按 priority 顺序依次叠加。
     """
 
     # 是否允许修改输出，True时检查通过后可以返回修改后的内容
@@ -52,7 +56,7 @@ def run_output_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> Tuple[Union[str, List[Any], Dict[str, Any]], List[GuardrailResult]]:
-    """执行输出护栏检查，返回（最终输出，检查结果列表）。
+    """执行输出护栏检查（**fail-fast**：命中即抛异常，不会跑完全部护栏）。
 
     Args:
         agent_output: Agent原始输出
@@ -61,7 +65,15 @@ def run_output_guardrails(
         use_global: guardrails=None 时是否回退扫描全局注册表，默认 False。
 
     Returns:
-        (final_output, results): 经过所有护栏处理后的最终输出，以及所有检查结果
+        (final_output, results)：仅在**全部护栏都放行**时才返回。
+        final_output 为依次叠加各护栏 modify() 后的结果（无任何修改时与 agent_output 同一对象），
+        results 按 priority 升序逐护栏收集；只要有一条不放行就不会返回。
+
+    Raises:
+        OutputGuardrailReject: 遇到**第一条** allowed=False 立即抛出，剩余护栏不再执行
+            （因此排在后面的脱敏/改写没机会跑，这是有意的 fail-fast 姿态）。
+            异常携带：`guardrail_name`=触发拦截的护栏名、`details`=该结果的 metadata、
+            `results`=已执行完的结果（含拒绝项自身，见 S5）。
     """
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, OutputGuardrail)] if use_global else []
@@ -96,7 +108,10 @@ async def arun_output_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> Tuple[Union[str, List[Any], Dict[str, Any]], List[GuardrailResult]]:
-    """异步版本的输出护栏执行。"""
+    """异步版本的输出护栏执行，语义与 run_output_guardrails 严格一致（同样 fail-fast）。
+
+    Returns: 全部放行时返回 (final_output, results)；Raises: OutputGuardrailReject。
+    """
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, OutputGuardrail)] if use_global else []
 

@@ -42,10 +42,13 @@ class AgentMiddleware(ABC):
 
     - ``before_tool_call(tool_name, tool_args, context=None, **kwargs)``
       每次工具调用前调用。
-      返回值：
+      返回值（Bug3 协议升级，兼容两种形态）：
         * ``True`` 允许调用；
         * ``False`` 拦截调用，Agent 会把 ``_last_tool_reject_reason``
-          作为工具结果喂回 LLM（不终止本轮对话）。
+          作为工具结果喂回 LLM（不终止本轮对话）；
+        * ``(allowed, reason)`` 二元组（推荐）：拦截原因随返回值携带，
+          并发调用同一中间件实例时不存在共享属性竞态；旧式 bool 实现仍兼容。
+          实现类需重写 ``__bool__``，保证 ``if not ret:`` 对拦截元组同样成立。
 
     - ``after_tool_call(tool_name, success, output="", error="", context=None, **kwargs)``
       工具返回结果后调用（结果脱敏、审计、内容过滤等）。
@@ -91,8 +94,12 @@ class AgentMiddleware(ABC):
         tool_args: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> bool:
-        """工具调用前钩子。返回 True 放行，False 拦截。默认放行。"""
+    ) -> Union[bool, "tuple[bool, str]"]:
+        """工具调用前钩子。返回 True 放行，False/(False, 原因) 拦截。默认放行。
+
+        Bug3：推荐返回 ``(allowed, reason)`` 二元组把拦截原因随返回值携带（线程安全），
+        旧式 bool 返回仍兼容（原因回退 ``_last_tool_reject_reason`` 属性/默认文案）。
+        """
         return True
 
     async def abefore_tool_call(
@@ -101,7 +108,7 @@ class AgentMiddleware(ABC):
         tool_args: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> bool:
+    ) -> Union[bool, "tuple[bool, str]"]:
         """异步版本。"""
         return await asyncio.to_thread(self.before_tool_call, tool_name, tool_args, context, **kwargs)
 

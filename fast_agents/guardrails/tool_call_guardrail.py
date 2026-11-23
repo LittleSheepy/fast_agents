@@ -19,7 +19,15 @@ class ToolCallGuardrail(GuardrailBase):
 
     支持前置检查（before_call）和后置检查（after_call）两个钩子，
     默认只执行前置检查，子类可以覆盖after_call实现结果校验。
+
+    拦截写法：统一 `return self.reject(原因)`（返回 GuardrailResult）；在钩子里直接
+    `raise XxxGuardrailReject` 也支持——invoke() 会把两种写法归一为同一条
+    allowed=False 链路（统计 / duration_ms / Trace 均不丢失）。
     """
+
+    # Bug1 修复：ToolCallGuardrail 依赖原始 pydantic 对象（ToolCallInfo/ToolResultInfo）做 isinstance 分发，
+    # 不能被 to_scan_text 文本化，否则对象变成字符串导致分发失效。
+    _normalize_input = False
 
     # 是否执行后置检查（检查工具返回结果）
     check_result: bool = False
@@ -64,7 +72,16 @@ def run_tool_call_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> List[GuardrailResult]:
-    """执行工具调用前置检查；guardrails=None 时默认不执行，use_global=True 才扫全局。"""
+    """执行工具调用前置检查（**fail-fast**）；guardrails=None 时默认不执行，use_global=True 才扫全局。
+
+    Returns:
+        仅在全部前置护栏都放行时才返回结果列表（按 priority 升序逐个执行）。
+
+    Raises:
+        ToolCallGuardrailReject: 遇到**第一条** allowed=False 立即抛出，剩余护栏不再执行；
+            `details` 除该结果的 metadata 外额外含 tool_name / tool_args，
+            `results` 为已执行完的结果（含拒绝项自身，见 S5）。
+    """
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, ToolCallGuardrail)] if use_global else []
 
@@ -94,7 +111,16 @@ def run_tool_result_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> Tuple[ToolResultInfo, List[GuardrailResult]]:
-    """执行工具调用结果后置检查；guardrails=None 时默认不执行，use_global=True 才扫全局。"""
+    """执行工具调用结果后置检查（**fail-fast**）；guardrails=None 时默认不执行，use_global=True 才扫全局。
+
+    Returns:
+        (current_result, results)：仅在全部后置护栏都放行时才返回；current_result 为依次叠加
+        护栏改写（metadata["modified_result"]）后的结果，无任何修改时就是入参本身。
+
+    Raises:
+        ToolCallGuardrailReject: 遇到**第一条** allowed=False 立即抛出，剩余护栏不再执行；
+            中间件据此屏蔽原始结果并下发安全文案。
+    """
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, ToolCallGuardrail) and g.check_result] if use_global else []
 
@@ -129,7 +155,7 @@ async def arun_tool_call_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> List[GuardrailResult]:
-    """异步版本的工具调用前置检查。"""
+    """异步版本的工具调用前置检查，语义与 run_tool_call_guardrails 严格一致（同样 fail-fast）。"""
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, ToolCallGuardrail)] if use_global else []
 
@@ -159,7 +185,7 @@ async def arun_tool_result_guardrails(
     use_global: bool = False,
     fail_open: Optional[bool] = None,
 ) -> Tuple[ToolResultInfo, List[GuardrailResult]]:
-    """异步版本的工具调用结果后置检查。"""
+    """异步版本的工具调用结果后置检查，语义与 run_tool_result_guardrails 严格一致（同样 fail-fast）。"""
     if guardrails is None:
         guardrails = [g for g in list_guardrails() if isinstance(g, ToolCallGuardrail) and g.check_result] if use_global else []
 

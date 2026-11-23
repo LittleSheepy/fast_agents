@@ -7,7 +7,8 @@
 2. 结构化返回值：check() 返回 GuardrailResult，明确是否触发拦截、原因说明
 3. 同步/异步双入口：check / acheck（子类实现），invoke / ainvoke（带错误处理的公共入口）
 4. 三种子类划分：InputGuardrail / OutputGuardrail / ToolCallGuardrail，分别对应三个检查阶段
-5. 元数据支持：name / description / priority，用于注册和排序
+5. 元数据支持：name / description / priority / enabled / fail_open / tags / metadata，用于注册和排序
+   （Bug6：全部在 GuardrailBase 类体显式声明默认值，子类只覆盖自己需要的即可）
 6. 统一日志：通过 logger 输出拦截事件，对接 Trace 体系
 7. hooks 机制：before_check / after_check / on_error
 """
@@ -24,7 +25,6 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .errors import GuardrailConfigError, GuardrailError
 from .models import GuardrailResult
 from .guardrail_registry import GuardrailRegistry, global_guardrail_registry
-from ..messages.parts import content_to_text
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +43,10 @@ def to_scan_text(input_data: Any) -> str:
     - None → 空串；
     - dict：递归收集字符串 key 与全部 value；list/tuple/set/frozenset：逐项递归；
     - 其他对象：降级 str(obj)，保证不存在「零扫描盲区」。
-    只做扁平化文本拼接、不解释结构语义；需要结构化解析的自定义护栏仍应
-    自行接收原始 input_data 处理（invoke 传入的原对象不变）。
+    只做扁平化文本拼接、不解释结构语义。
+    ⚠️ Bug5 纠正：_normalize_input=True（Input/Output 系默认）时，invoke() 传入 check() 的
+    是本函数扁平化后的字符串，并非原始 input_data；需要结构化解析的自定义护栏应设
+    _normalize_input=False（如 ToolCallGuardrail），此时 check() 收到未经扁平化的原对象。
     """
     if isinstance(input_data, str):
         return input_data
@@ -67,6 +69,8 @@ class GuardrailBase(ABC):
 
     子类至少要设置 ``name`` / ``description`` 两个类属性，并实现 ``check()`` 方法。
     ``priority`` 控制执行顺序，数字越小优先级越高，默认 100。
+    ``tags`` / ``metadata`` 同样支持类级声明（如 ``tags = ["audit"]``）或构造器传参，
+    两者都会被拷贝成实例属性，修改一个实例不会影响其它实例或类默认值。
     """
 
     name: str = ""
@@ -81,6 +85,21 @@ class GuardrailBase(ABC):
     # 单独使用时可在构造器显式设置 fail_open=True/False；挂载到 GuardrailMiddleware 后，
     # 未显式设置的实例会继承 middleware 的统一姿态，显式设置的保留用户值。
     fail_open: bool = False
+    # Bug6 修复：tags / metadata 与 name/description/priority/enabled/fail_open 一样在类体显式声明。
+    # 此前基类没这两个类属性，__init__ 只能靠 `hasattr(type(self), 'tags')` 隔空探测子类有没有写，
+    # 带来两个实际问题：
+    #   1) 子类覆盖 __init__ 又漏调 super().__init__() 时，priority/enabled/fail_open 能从类默认值
+    #      兜住，而 tags/metadata 直接 AttributeError（to_dict() / clone() 立即报错）；
+    #   2) 本包发布 `py.typed`，字段契约不在类上声明，静态检查与 IDE 补全都看不到「护栏可以有 tags」。
+    # 注意：类级值只是共享的「兜底常量」，__init__ 一律 list()/dict() 拷贝成实例属性，
+    # 因此实例各自 append/update 不会互相污染，也不会改到这里的类默认值。
+    tags: List[str] = []
+    metadata: Dict[str, Any] = {}
+    # Bug1 修复：是否在 invoke/ainvoke 中自动将 input_data 文本化（to_scan_text）。
+    # InputGuardrail / OutputGuardrail 等基于正则匹配的护栏需要 True（默认），
+    # 确保 dict/list 等结构化输入被全量扁平化，不因 content_to_text 的 "content" 提取而丢失字段。
+    # ToolCallGuardrail 需要 False —— 它依赖原始 pydantic 对象（ToolCallInfo/ToolResultInfo）的 isinstance 分发。
+    _normalize_input: bool = True
 
     def __init__(
         self,
@@ -101,8 +120,10 @@ class GuardrailBase(ABC):
         # 未显式设置→继承 middleware 默认；显式设置→保留用户值，middleware 不覆盖。
         self.fail_open = fail_open if fail_open is not None else type(self).fail_open
         self._fail_open_explicit: bool = fail_open is not None
-        self.tags: List[str] = list(tags) if tags is not None else list(type(self).tags if hasattr(type(self), 'tags') else [])
-        self.metadata: Dict[str, Any] = dict(metadata) if metadata is not None else dict(type(self).metadata if hasattr(type(self), 'metadata') else {})
+        # Bug6 修复：类上已声明 tags/metadata 默认值，无需再 `hasattr(type(self), ...)` 兜底；
+        # 依旧做 list()/dict() 浅拷贝，保证多个实例之间、实例与类默认值之间互不串扰。
+        self.tags: List[str] = list(tags) if tags is not None else list(type(self).tags)
+        self.metadata: Dict[str, Any] = dict(metadata) if metadata is not None else dict(type(self).metadata)
 
         if not self.name:
             raise GuardrailConfigError("护栏必须有 name")
@@ -146,12 +167,46 @@ class GuardrailBase(ABC):
             return GuardrailResult.allow()
 
         start_time = _time.perf_counter()
-        self._before_check(input_data, context)
+        self._safe_before_check(input_data, context)
         effective_fail_open = self.fail_open if fail_open is None else fail_open
-        # L6：多模态输入归一化，避免 List[ContentPart] 直接绕过所有 isinstance(str) 检查
-        check_input = content_to_text(input_data)
+        # Bug1 修复：用 to_scan_text 全量扁平化替代 content_to_text，
+        # 避免 {"content": "安全", "query": "恶意"} 中非 content 字段绕过扫描。
+        # to_scan_text 对 str 是恒等变换，不改变既有文本路径行为。
+        # ToolCallGuardrail 设置 _normalize_input=False 跳过（它需要原始 pydantic 对象做 isinstance 分发）。
+        check_input = to_scan_text(input_data) if self._normalize_input else input_data
         try:
             result = self.check(check_input, context)
+        except GuardrailConfigError as e:
+            # P5 修复：配置错误（如 allow_modify=False 却调用 modify()）不是「内容命中」，
+            # 不能和「护栏作者主动抛的拦截异常」共用一条 reject 通道——否则开发者把护栏配错，
+            # 表现却像用户内容被安全拦截，既误导终端用户、又让配置 bug 无法在 error 通道暴露。
+            # 这里按「组件故障」观测：is_error=True，并尊重 fail_open 姿态（放行/拦截由姿态决定）。
+            duration_ms = int((_time.perf_counter() - start_time) * 1000)
+            self._safe_on_error(e, input_data, context)
+            cfg_meta = {
+                "duration_ms": duration_ms,
+                "guardrail_name": self.name,
+                "guardrail_error": str(e),
+                "guardrail_error_type": type(e).__name__,
+                "is_error": True,
+                "config_error": True,
+            }
+            if effective_fail_open:
+                logger.warning(
+                    "[guardrail:%s] 配置错误（fail_open=True，放行）: %s", self.name, e,
+                )
+                result = GuardrailResult(allowed=True, metadata=cfg_meta)
+            else:
+                logger.error(
+                    "[guardrail:%s] 配置错误（fail_open=False，拦截）: %s", self.name, e,
+                )
+                result = GuardrailResult(
+                    allowed=False,
+                    reason=f"护栏 '{self.name}' 配置错误，fail_open=False 拦截请求：{e}",
+                    metadata=cfg_meta,
+                )
+            self._safe_after_check(input_data, context, result)
+            return result
         except GuardrailError as e:
             # 护栏作者显式抛出的拦截/配置异常——统一走 reject 路径打点，
             # 不再直接 raise 导致跳过 _after_check / duration_ms / 统计 / trace。
@@ -168,13 +223,16 @@ class GuardrailBase(ABC):
                 },
             )
             logger.warning("[guardrail:%s] 拦截触发（抛异常）: %s", self.name, result.reason)
-            self._after_check(input_data, context, result)
-            # 标记为异常路径抛出，由聚合层（run_input_guardrails 等）转换成 XxxGuardrailReject
-            result.metadata["_raise_reject"] = True
+            self._safe_after_check(input_data, context, result)
+            # Bug4 修复：删除无人消费的控制流标记 `_raise_reject`。聚合层（run_input_guardrails 等）
+            # 只看 `not result.allowed` 就转成 XxxGuardrailReject，从来不读这个标记；
+            # 留着会让人误以为「异常式拦截」与「返回式拦截」是两条链路、要靠该标记才能往下传导。
+            # 拦截来源已由上方 metadata 的 rejected_via_exception / exception_type 表达（仅诊断用），
+            # 并经 e.details 透传给上层回调，不参与任何控制流判定。
             return result
         except Exception as e:
             duration_ms = int((_time.perf_counter() - start_time) * 1000)
-            self._on_error(e, input_data, context)
+            self._safe_on_error(e, input_data, context)
             err_meta = {
                 "duration_ms": duration_ms,
                 "guardrail_name": self.name,
@@ -201,7 +259,38 @@ class GuardrailBase(ABC):
                     reason=f"护栏 '{self.name}' 执行异常，fail_open=False 拦截请求：{type(e).__name__}: {e}",
                     metadata=err_meta,
                 )
-            self._after_check(input_data, context, result)
+            self._safe_after_check(input_data, context, result)
+            return result
+
+        # Bug1 修复：对 check() 返回值做防御性类型守卫。
+        # 子类若忘记 return（隐式返回 None）或误返回其他类型，此前会直接
+        # AttributeError 崩溃 invoke() 本身——该崩溃发生在 try/except 块**外**，
+        # 不受任何 except 兜底，违反 R6「观测/检查代码不得打挂主流程」。
+        # 这里把它降级为「组件故障」路径，尊重 effective_fail_open 姿态决定放行或拦截。
+        if not isinstance(result, GuardrailResult):
+            _invalid_msg = (
+                f"护栏 '{self.name}' 的 check() 返回了非法类型 {type(result).__name__}"
+                f"（期望 GuardrailResult），视为组件异常"
+            )
+            duration_ms = int((_time.perf_counter() - start_time) * 1000)
+            inv_meta: Dict[str, Any] = {
+                "duration_ms": duration_ms,
+                "guardrail_name": self.name,
+                "guardrail_error": _invalid_msg,
+                "guardrail_error_type": "InvalidCheckReturn",
+                "is_error": True,
+            }
+            if effective_fail_open:
+                logger.warning("[guardrail:%s] %s（fail_open=True，放行）", self.name, _invalid_msg)
+                result = GuardrailResult(allowed=True, metadata=inv_meta)
+            else:
+                logger.error("[guardrail:%s] %s（fail_open=False，拦截）", self.name, _invalid_msg)
+                result = GuardrailResult(
+                    allowed=False,
+                    reason=f"护栏 '{self.name}' check() 返回类型非法，fail_open=False 拦截请求",
+                    metadata=inv_meta,
+                )
+            self._safe_after_check(input_data, context, result)
             return result
 
         duration_ms = int((_time.perf_counter() - start_time) * 1000)
@@ -219,7 +308,7 @@ class GuardrailBase(ABC):
                 self.name, duration_ms,
             )
 
-        self._after_check(input_data, context, result)
+        self._safe_after_check(input_data, context, result)
         return result
 
     async def ainvoke(self, input_data: Any, context: Optional[Dict[str, Any]] = None, *, fail_open: Optional[bool] = None) -> GuardrailResult:
@@ -231,11 +320,41 @@ class GuardrailBase(ABC):
             return GuardrailResult.allow()
 
         start_time = _time.perf_counter()
-        self._before_check(input_data, context)
+        self._safe_before_check(input_data, context)
         effective_fail_open = self.fail_open if fail_open is None else fail_open
-        check_input = content_to_text(input_data)
+        # Bug1 修复：异步入口同样使用 to_scan_text 替代 content_to_text
+        check_input = to_scan_text(input_data) if self._normalize_input else input_data
         try:
             result = await self.acheck(check_input, context)
+        except GuardrailConfigError as e:
+            # P5 修复：异步入口与同步 invoke 语义一致——配置错误按组件故障观测，
+            # is_error=True 且尊重 fail_open 姿态，不再伪装成内容命中。
+            duration_ms = int((_time.perf_counter() - start_time) * 1000)
+            self._safe_on_error(e, input_data, context)
+            cfg_meta = {
+                "duration_ms": duration_ms,
+                "guardrail_name": self.name,
+                "guardrail_error": str(e),
+                "guardrail_error_type": type(e).__name__,
+                "is_error": True,
+                "config_error": True,
+            }
+            if effective_fail_open:
+                logger.warning(
+                    "[guardrail:%s] 异步配置错误（fail_open=True，放行）: %s", self.name, e,
+                )
+                result = GuardrailResult(allowed=True, metadata=cfg_meta)
+            else:
+                logger.error(
+                    "[guardrail:%s] 异步配置错误（fail_open=False，拦截）: %s", self.name, e,
+                )
+                result = GuardrailResult(
+                    allowed=False,
+                    reason=f"护栏 '{self.name}' 配置错误，fail_open=False 拦截请求：{e}",
+                    metadata=cfg_meta,
+                )
+            self._safe_after_check(input_data, context, result)
+            return result
         except GuardrailError as e:
             duration_ms = int((_time.perf_counter() - start_time) * 1000)
             result = GuardrailResult(
@@ -250,12 +369,12 @@ class GuardrailBase(ABC):
                 },
             )
             logger.warning("[guardrail:%s] 拦截触发（抛异常，异步）: %s", self.name, result.reason)
-            self._after_check(input_data, context, result)
-            result.metadata["_raise_reject"] = True
+            self._safe_after_check(input_data, context, result)
+            # Bug4 修复：异步入口同样不再写入无人消费的 `_raise_reject` 标记，语义与同步 invoke 一致。
             return result
         except Exception as e:
             duration_ms = int((_time.perf_counter() - start_time) * 1000)
-            self._on_error(e, input_data, context)
+            self._safe_on_error(e, input_data, context)
             err_meta = {
                 "duration_ms": duration_ms,
                 "guardrail_name": self.name,
@@ -279,7 +398,35 @@ class GuardrailBase(ABC):
                     reason=f"护栏 '{self.name}' 执行异常，fail_open=False 拦截请求：{type(e).__name__}: {e}",
                     metadata=err_meta,
                 )
-            self._after_check(input_data, context, result)
+            self._safe_after_check(input_data, context, result)
+            return result
+
+        # Bug1 修复（异步入口）：与同步 invoke 语义完全一致——
+        # acheck() 返回非法类型时视为组件故障，不再裸 AttributeError 崩溃 ainvoke。
+        if not isinstance(result, GuardrailResult):
+            _invalid_msg = (
+                f"护栏 '{self.name}' 的 acheck() 返回了非法类型 {type(result).__name__}"
+                f"（期望 GuardrailResult），视为组件异常"
+            )
+            duration_ms = int((_time.perf_counter() - start_time) * 1000)
+            inv_meta: Dict[str, Any] = {
+                "duration_ms": duration_ms,
+                "guardrail_name": self.name,
+                "guardrail_error": _invalid_msg,
+                "guardrail_error_type": "InvalidCheckReturn",
+                "is_error": True,
+            }
+            if effective_fail_open:
+                logger.warning("[guardrail:%s] %s（fail_open=True，放行）", self.name, _invalid_msg)
+                result = GuardrailResult(allowed=True, metadata=inv_meta)
+            else:
+                logger.error("[guardrail:%s] %s（fail_open=False，拦截）", self.name, _invalid_msg)
+                result = GuardrailResult(
+                    allowed=False,
+                    reason=f"护栏 '{self.name}' acheck() 返回类型非法，fail_open=False 拦截请求",
+                    metadata=inv_meta,
+                )
+            self._safe_after_check(input_data, context, result)
             return result
 
         duration_ms = int((_time.perf_counter() - start_time) * 1000)
@@ -297,7 +444,7 @@ class GuardrailBase(ABC):
                 self.name, duration_ms,
             )
 
-        self._after_check(input_data, context, result)
+        self._safe_after_check(input_data, context, result)
         return result
 
     # ── 内部钩子 ─────────────────────────────────────────────
@@ -320,6 +467,52 @@ class GuardrailBase(ABC):
         context: Optional[Dict[str, Any]] = None,
     ) -> None:
         pass
+
+    # ── Bug2/3 修复：钩子安全包装层 ────────────────────────────────────
+    # 三个钩子 _before_check / _after_check / _on_error 是子类可重写的观测点，
+    # 其调用原本不在 try/except 保护范围内，若子类重写实现抛异常，
+    # 会打挂 invoke()/ainvoke() 本身（违反 R6）。
+    # 修复后所有钩子调用走 _safe_xxx 包装，失败仅打 warning，绝不阻断主流程。
+    # _safe_before_check 失败时跳过钩子继续执行 check()；
+    # _safe_after_check 失败时跳过钩子仍然 return result（拦截/放行结果不受影响）；
+    # _safe_on_error 失败时跳过钩子继续走 fail_open/fail_closed 逻辑。
+
+    def _safe_before_check(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> None:
+        try:
+            self._before_check(input_data, context)
+        except Exception as e:
+            logger.warning(
+                "[guardrail:%s] _before_check 钩子异常（已忽略，不影响主流程）: %s: %s",
+                self.name, type(e).__name__, e,
+            )
+
+    def _safe_after_check(
+        self,
+        input_data: Any,
+        context: Optional[Dict[str, Any]],
+        result: GuardrailResult,
+    ) -> None:
+        try:
+            self._after_check(input_data, context, result)
+        except Exception as e:
+            logger.warning(
+                "[guardrail:%s] _after_check 钩子异常（已忽略，不影响拦截结果）: %s: %s",
+                self.name, type(e).__name__, e,
+            )
+
+    def _safe_on_error(
+        self,
+        error: Exception,
+        input_data: Any,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            self._on_error(error, input_data, context)
+        except Exception as e:
+            logger.warning(
+                "[guardrail:%s] _on_error 钩子异常（已忽略，不影响 fail_open 判定）: %s: %s",
+                self.name, type(e).__name__, e,
+            )
 
     # ── 注册与序列化 ───────────────────────────────────────────────
 
@@ -363,10 +556,27 @@ def guardrail_creator(
     description: Optional[str] = None,
     priority: int = 100,
     tags: Optional[List[str]] = None,
+    guardrail_type: str = "input",
 ) -> Callable[[Callable[..., GuardrailResult]], GuardrailBase]:
     """护栏创建装饰器，对齐 @tool_creator 的使用风格。
 
-    可以直接装饰一个普通函数，自动转换为 GuardrailBase 子类实例。
+    可以直接装饰一个普通函数，自动转换为**对应类型**的护栏子类实例并注册到全局表。
+
+    P1 修复背景：此前生成的 _FunctionGuardrail 只继承 GuardrailBase，不属于
+    InputGuardrail / OutputGuardrail / ToolCallGuardrail 任一子类，会被
+    GuardrailMiddleware 的类型分派与 use_global=True 的 isinstance 扫描静默剔除
+    ——「注册成功但永远不执行」，与本函数 docstring 承诺的“自动注册为输入护栏”矛盾。
+    现在通过 guardrail_type 参数决定继承哪个基类，让函数式护栏真正参与检查。
+
+    Args:
+        name / description / priority / tags: 语义不变；缺省时从函数名与 docstring 推断。
+        guardrail_type: "input"（默认）/ "output" / "tool_call"，决定生成的护栏继承的基类、
+            进而决定参与哪个阶段的检查；非法值在装饰器**创建时**即抛 GuardrailConfigError。
+            被装饰函数签名统一为 func(input_data, context) -> GuardrailResult：
+            - input / output：input_data 为待检查的用户输入 / Agent 最终输出；
+            - tool_call：input_data 为 ToolCallInfo（before_call）或 ToolResultInfo（after_call），
+              沿用 ToolCallGuardrail.check 的类型分发，后置检查仍受 check_result 开关约束
+              （默认 False 只跑前置；需要检查工具结果时显式置 instance.check_result = True）。
 
     Example:
         @guardrail_creator(name="no_injection", description="检测prompt注入")
@@ -374,29 +584,80 @@ def guardrail_creator(
             if "忽略之前的指令" in input_data:
                 return GuardrailResult.reject("检测到提示注入尝试")
             return GuardrailResult.allow()
+
+        @guardrail_creator(name="tool_pre_check", guardrail_type="tool_call")
+        def check_tool(tool_call, context=None) -> GuardrailResult:
+            if tool_call.tool_name == "shell_exec":
+                return GuardrailResult.reject("禁止执行 shell")
+            return GuardrailResult.allow()
+
+    ⚠️ 装饰 GuardrailBase 子类（class）时原样返回、不做包装（P1 同步修复：此前会被
+    误包装成 _FunctionGuardrail，把类当函数调用导致每次检查都报配置错误），
+    护栏类型由类自身的继承决定，此时 guardrail_type 参数不生效（显式传入会告警）。
     """
+    # D3：非法类型值早失败——装饰器创建时即抛错，而不是等到运行时被兜底伪装成拦截
+    if guardrail_type not in ("input", "output", "tool_call"):
+        raise GuardrailConfigError(
+            f"guardrail_type 必须是 'input' / 'output' / 'tool_call' 之一，收到：{guardrail_type!r}"
+        )
+
     def decorator(func: Callable[..., GuardrailResult]) -> GuardrailBase:
+        # 延迟 import：三个子类模块均依赖本模块，顶层 import 会形成循环导入
+        from .input_guardrail import InputGuardrail
+        from .output_guardrail import OutputGuardrail
+        from .tool_call_guardrail import ToolCallGuardrail
+
+        # P1：传入的已经是 Guardrail 类则原样返回，类型由类的继承决定，不做函数式包装
+        if isinstance(func, type) and issubclass(func, GuardrailBase):
+            if guardrail_type != "input":
+                logger.warning(
+                    "@guardrail_creator 装饰类 '%s' 时 guardrail_type=%r 不生效，护栏类型由类自身的继承决定",
+                    func.__name__, guardrail_type,
+                )
+            return func
+
         # 从函数签名和docstring自动推断信息
         _name = name or func.__name__
         _description = description or inspect.getdoc(func) or f"Guardrail: {_name}"
 
-        class _FunctionGuardrail(GuardrailBase):
-            def __init__(self):
-                super().__init__(
-                    name=_name,
-                    description=_description,
-                    priority=priority,
-                    tags=tags or [],
-                )
-                self.func = func
+        if guardrail_type == "tool_call":
+            # 不覆盖 check()，沿用 ToolCallGuardrail.check 按输入类型的 before/after 分发，
+            # 两个钩子都委托给同一个函数，由用户在函数内自行判断被检查对象
+            class _FunctionGuardrail(ToolCallGuardrail):
+                def __init__(self):
+                    super().__init__(
+                        name=_name,
+                        description=_description,
+                        priority=priority,
+                        tags=tags or [],
+                    )
+                    self.func = func
 
-            def check(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
-                return self.func(input_data, context)
+                def before_call(self, tool_call, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
+                    return self.func(tool_call, context)
 
-            async def acheck(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
-                if asyncio.iscoroutinefunction(self.func):
-                    return await self.func(input_data, context)
-                return await super().acheck(input_data, context)
+                def after_call(self, tool_result, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
+                    return self.func(tool_result, context)
+        else:
+            _base_cls = OutputGuardrail if guardrail_type == "output" else InputGuardrail
+
+            class _FunctionGuardrail(_base_cls):
+                def __init__(self):
+                    super().__init__(
+                        name=_name,
+                        description=_description,
+                        priority=priority,
+                        tags=tags or [],
+                    )
+                    self.func = func
+
+                def check(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
+                    return self.func(input_data, context)
+
+                async def acheck(self, input_data: Any, context: Optional[Dict[str, Any]] = None) -> GuardrailResult:
+                    if asyncio.iscoroutinefunction(self.func):
+                        return await self.func(input_data, context)
+                    return await super().acheck(input_data, context)
 
         instance = _FunctionGuardrail()
         instance.register()

@@ -28,7 +28,7 @@
 import atexit
 import json
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from .prompt import DEFAULT_REACT_PROMPT
 from ...agents.agent_base import AgentBase
@@ -651,10 +651,36 @@ class ReActAgent(AgentBase):
             print(f"⚠️ 工具结果卸载失败，保留原文：{e}")
             return observation
 
+    def _resolve_tool_info(self, tool_name: str) -> Dict[str, str]:
+        """F1：从 ToolRegistry 查询工具类型与来源，填充 ToolCallInfo 契约字段。
+
+        返回 ``{"tool_type": ..., "source": ...}``，供 ``before_tool_call`` 的 **kwargs 展开。
+
+        判定优先级：
+        - MCP 工具（``tags`` 含 ``"mcp"``）：``tool_type="mcp"``，``source=server_name``；
+        - 技能内置工具（名称在 ``SKILL_BUILTIN_TOOLS`` 里）：``tool_type="skill"``，``source=""``；
+        - 其余：``tool_type="local"``，``source=""``。
+        """
+        tool = self.tool_registry.get_tool(tool_name) if self.tool_registry else None
+        if tool is None:
+            return {"tool_type": "local", "source": ""}
+        # MCP：tags 含 "mcp"，取实例级 server_name 作为来源
+        if "mcp" in (getattr(tool, "tags", None) or []):
+            return {"tool_type": "mcp", "source": str(getattr(tool, "server_name", "") or "")}
+        # 技能内置工具：按名称集合判定，延迟 import 避免循环依赖
+        try:
+            from ...skills.middleware import SKILL_BUILTIN_TOOLS
+            if tool_name in SKILL_BUILTIN_TOOLS:
+                return {"tool_type": "skill", "source": ""}
+        except ImportError:
+            pass
+        return {"tool_type": "local", "source": ""}
+
     def _apply_output_guardrails(
         self,
         final_answer: Optional[str],
         final_finish_reason: str,
+        hook_context: Optional[Dict[str, Any]] = None,  # F1: 新增可选参数，默认 None 保持原行为
     ) -> tuple[Optional[str], str]:
         """把「最终答案」过一遍所有中间件的 after_agent_run 钩子（输出护栏）。
 
@@ -674,7 +700,7 @@ class ReActAgent(AgentBase):
         """
         for _mw in self._middleware_list:
             try:
-                _hook_result = _mw.after_agent_run(final_answer)
+                _hook_result = _mw.after_agent_run(final_answer, context=hook_context)
                 if isinstance(_hook_result,
                               GuardrailBlocked) and _hook_result.phase == "output":
                     final_answer = _hook_result.message
@@ -744,9 +770,10 @@ class ReActAgent(AgentBase):
         # G1: tracer 存在时开启一条 agent trace，用 agent span 包裹整次 run
         _tracer: Optional["TraceLogger"] = getattr(self, "tracer", None)
         _agent_span = None
+        _agent_trace_id = ""  # F1: start_trace() 返回值，供 hook_context 使用
         if _tracer is not None:
             from ...trace import SpanKind
-            _tracer.start_trace(name=f"agent.{self.name}.run")
+            _agent_trace_id = _tracer.start_trace(name=f"agent.{self.name}.run")
             _agent_span = _tracer.start_span(
                 name=f"agent.run",
                 kind=SpanKind.AGENT,
@@ -754,6 +781,14 @@ class ReActAgent(AgentBase):
                        "max_steps": self.max_steps},
                 metadata={"agent": self.name},
             )
+
+        # F1: 组装中间件钩子公共上下文，供护栏做会话级判定；
+        # trace_id 由 start_trace() 返回，session_id 由 tracer 实例持有，均在调用栈内已知。
+        hook_context: Dict[str, Any] = {"agent_name": self.name}
+        if _agent_trace_id:
+            hook_context["trace_id"] = _agent_trace_id
+        if _tracer is not None:
+            hook_context["session_id"] = _tracer.session_id
 
         final_answer: Optional[str] = None
         try:
@@ -775,7 +810,7 @@ class ReActAgent(AgentBase):
             input_blocked = False
             for _mw in self._middleware_list:
                 try:
-                    _hook_result = _mw.before_agent_run(user_input)
+                    _hook_result = _mw.before_agent_run(user_input, context=hook_context)
                     if isinstance(_hook_result, GuardrailBlocked) and _hook_result.phase == "input":
                         final_answer = _hook_result.message
                         final_finish_reason = "guardrail_block"
@@ -867,8 +902,10 @@ class ReActAgent(AgentBase):
                                 return_direct_answer: Optional[str] = None
 
                                 # 工具调用前调用所有中间件的before_tool_call钩子，拦截非法调用。
-                                # L5：AgentMiddleware 协议保证签名 (tool_name, tool_args, ...) -> bool，
+                                # L5：AgentMiddleware 协议保证签名 (tool_name, tool_args, ...) -> bool | (allowed, reason)，
                                 # 不再 hasattr 鸭子分发；与 SkillMiddleware 同名但签名不同的钩子彻底隔离。
+                                # Bug3：新版中间件拦截时返回 (False, 原因) 二元组，原因随返回值携带（线程安全），
+                                # 旧式 bool 返回仍兼容（原因回退共享属性/默认文案）。
                                 tool_blocked = False
                                 # N2：记录本批次里「已经生成 tool 消息」的 tool_call_id 与被拦截的工具名。
                                 # assistant 消息（L815）已带上整批 tool_calls，OpenAI 要求每个 tool_call_id
@@ -884,10 +921,25 @@ class ReActAgent(AgentBase):
                                     _coerced_args_cache[tc.id] = _coerced_args
                                     for m in self._middleware_list:
                                         try:
-                                            allowed = m.before_tool_call(tc.name, _coerced_args)
+                                            _ret = m.before_tool_call(
+                                                tc.name, _coerced_args,
+                                                context=hook_context,
+                                                call_id=tc.id,
+                                                **self._resolve_tool_info(tc.name),
+                                            )
+                                            # Bug3 归一化：bool（旧协议）或 (allowed, reason) 二元组（新协议）都归一成布尔判定 + 拦截原因。
+                                            # 注意必须取 _ret[0] 判定而不能直接 bool(_ret)：裸 (False, "原因") 元组是 truthy，
+                                            # GuardrailMiddleware 的 ToolDecision 虽重写了 __bool__，但第三方中间件可能返回裸 tuple。
+                                            if isinstance(_ret, tuple):
+                                                allowed = bool(_ret[0]) if _ret else False
+                                                _mw_reason = str(_ret[1]) if len(_ret) > 1 else ""
+                                            else:
+                                                allowed, _mw_reason = bool(_ret), ""
                                             if not allowed:
-                                                observation = getattr(m, '_last_tool_reject_reason',
-                                                                      f"工具 {tc.name} 调用被安全护栏拦截")
+                                                # 拦截原因优先级：返回值携带（线程安全）> 共享属性（旧式兼容）> 默认文案
+                                                observation = (_mw_reason
+                                                               or getattr(m, '_last_tool_reject_reason', None)
+                                                               or f"工具 {tc.name} 调用被安全护栏拦截")
                                                 tool_msg = Message("tool", observation)
                                                 tool_msg.metadata = {"tool_call_id": tc.id, "name": tc.name}
                                                 self.messages.append(tool_msg)
@@ -992,6 +1044,8 @@ class ReActAgent(AgentBase):
                                                 tool_call.name, result.succeeded,
                                                 output=observation if result.succeeded else result.output or "",
                                                 error=result.error if not result.succeeded else "",
+                                                context=hook_context,
+                                                metadata={"call_id": tool_call.id, "tool_name": tool_call.name},
                                             )
                                             if isinstance(new_obs, str):
                                                 observation = new_obs
@@ -1029,7 +1083,7 @@ class ReActAgent(AgentBase):
                                     # C3：工具直接返回的答案同样要过输出护栏，否则工具原始输出
                                     # 会绕过全部 OutputGuardrail 原样透传给用户
                                     final_answer, final_finish_reason = self._apply_output_guardrails(
-                                        final_answer, final_finish_reason,
+                                        final_answer, final_finish_reason, hook_context=hook_context,
                                     )
                                     if _dec_span is not None:
                                         _tracer.end_span(
@@ -1057,7 +1111,7 @@ class ReActAgent(AgentBase):
                                 # 具体判定与 fail-closed 兜底已抽到 _apply_output_guardrails，
                                 # 与 return_direct 分支共用（C3），改一处不会漏另一处。
                                 final_answer, final_finish_reason = self._apply_output_guardrails(
-                                    final_answer, final_finish_reason,
+                                    final_answer, final_finish_reason, hook_context=hook_context,
                                 )
                                 if _dec_span is not None:
                                     _tracer.end_span(

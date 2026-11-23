@@ -149,33 +149,42 @@ class BasicPermissionGuardrail(ToolCallGuardrail):
             return GuardrailResult.allow(metadata={"match": "whitelist"})
 
         # 2) 优先：读 ToolRegistry 的 requires_approval（单一事实源，对齐 A9/C6）
+        #    requires_approval=True 一旦命中直接拦截，不再走后续步骤。
         tool_meta = self._lookup_tool_meta(tool_name)
-        if tool_meta is not None:
-            if tool_meta.get("requires_approval", False):
+        if tool_meta is not None and tool_meta.get("requires_approval", False):
+            return GuardrailResult.reject(
+                f"工具 '{tool_name}' 被标记 requires_approval=True，默认被权限护栏拦截（如需执行请走人工审批或将其加入 allowed_dangerous_tools）",
+                metadata={
+                    "risk_type": "requires_approval",
+                    "source": "tool_registry_metadata",
+                },
+            )
+
+        # 3) Bug4 修复：blocked_names 精确黑名单提升为**无条件兜底**。
+        #    此前它仅在 else 分支（tool_meta is None，即 registry 里查不到该工具）时生效，
+        #    形成安全死角：工具已注册到 registry 但未打 requires_approval=True 时，
+        #    tool_meta is not None 进入 if 分支 → requires_approval=False → 不拦截，
+        #    直接跳过 else 里的 blocked_names，delete_file / shell_exec 等高危工具被静默放行。
+        #    修复后无论有无 registry，工具名命中精确黑名单就拦截。
+        #    白名单（步骤 1）和 requires_approval（步骤 2）已各自短路，
+        #    本步骤不改变单一事实源的优先级语义。
+        if tool_name_lower in self.blocked_names:
+            return GuardrailResult.reject(
+                f"工具 '{tool_call.tool_name}' 属于高危操作（精确名匹配），默认被权限护栏拦截",
+                metadata={"risk_type": "dangerous_tool", "match": "exact_name"},
+            )
+
+        # 4) 可选兜底：拆词后关键词匹配（仅 registry 里查不到该工具时启用，默认关闭）。
+        #    保留原设计意图：有 tool_registry 信息时不靠拆词猜测，避免把正式注册的业务
+        #    工具误伤；只有完全没有任何 registry 线索的场景，才降级使用关键词启发式。
+        if tool_meta is None and self.fallback_keyword_match:
+            words = _split_tool_name(tool_name)
+            hit = _DEFAULT_FALLBACK_KEYWORDS & words
+            if hit:
                 return GuardrailResult.reject(
-                    f"工具 '{tool_name}' 被标记 requires_approval=True，默认被权限护栏拦截（如需执行请走人工审批或将其加入 allowed_dangerous_tools）",
-                    metadata={
-                        "risk_type": "requires_approval",
-                        "source": "tool_registry_metadata",
-                    },
+                    f"工具 '{tool_call.tool_name}' 包含高危关键词 {sorted(hit)}，默认被权限护栏拦截",
+                    metadata={"risk_type": "dangerous_tool", "match": "fallback_keyword", "matched": sorted(hit)},
                 )
-            # 有 tool_registry 就不再用关键词/精确名猜测，交给审批回调/C6 沙箱自己处理
-        else:
-            # 3) 无 registry 时：精确名匹配
-            if tool_name_lower in self.blocked_names:
-                return GuardrailResult.reject(
-                    f"工具 '{tool_call.tool_name}' 属于高危操作（精确名匹配），默认被权限护栏拦截",
-                    metadata={"risk_type": "dangerous_tool", "match": "exact_name"},
-                )
-            # 4) 可选兜底：拆词后关键词匹配（默认关闭，避免误伤）
-            if self.fallback_keyword_match:
-                words = _split_tool_name(tool_name)
-                hit = _DEFAULT_FALLBACK_KEYWORDS & words
-                if hit:
-                    return GuardrailResult.reject(
-                        f"工具 '{tool_call.tool_name}' 包含高危关键词 {sorted(hit)}，默认被权限护栏拦截",
-                        metadata={"risk_type": "dangerous_tool", "match": "fallback_keyword", "matched": sorted(hit)},
-                    )
 
         # 5) 检查参数中的敏感路径
         if self.check_sensitive_paths:
