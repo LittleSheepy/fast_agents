@@ -63,9 +63,13 @@ class AgentMiddleware(ABC):
         * ``GuardrailBlocked(phase="output", message=...)`` 拦截，message 替换最终答案；
         * ``GuardrailModified(phase="output", content=...)`` 修改/脱敏，content 替换最终答案。
 
-    - ``after_agent_turn()``
+    - ``after_agent_turn()`` / ``aafter_agent_turn()``
       本轮对话结束后（finally 块中）调用，用于清理状态、卸载上下文、打点收尾等。
       无返回值，异常会被 ReActAgent 兜底吞掉打 warning，绝不阻塞主流程。
+
+    同步/异步成对性（E10）：以上五个钩子**全部**同时提供 ``a*`` 异步版本。
+    ReActAgent 的异步主循环 ``arun_stream`` 只 await ``a*`` 版本，同步主循环
+    ``run_stream`` 只调同步版本；两条链路各调用一次，不会重复触发。
     """
 
     # ── 输入检查 ─────────────────────────────────────────────
@@ -162,4 +166,17 @@ class AgentMiddleware(ABC):
 
     def after_agent_turn(self) -> None:
         """每轮结束后钩子，默认空操作。异常会被 Agent 兜底吞掉。"""
+        return None
+
+    async def aafter_agent_turn(self) -> None:
+        """``after_agent_turn`` 的异步版本，默认在线程池中调用同步实现。
+
+        E10 补齐：本钩子原先只有同步版，导致异步主循环要么静默漏调轮次收尾
+        （技能 unload_after_turn 卸载、状态清理），要么在事件循环里直跑同步钩子。
+        现与其他四个钩子保持成对，ReActAgent.arun_stream 在 finally 里 await 本方法。
+
+        与同步版一致：实现**不得抛出异常**给主循环；即便抛出，Agent 侧也只记
+        warning 后继续收尾（R6：观测/收尾代码不得打挂业务流程）。
+        """
+        await asyncio.to_thread(self.after_agent_turn)
         return None

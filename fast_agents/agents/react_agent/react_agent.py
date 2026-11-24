@@ -25,10 +25,12 @@
   不应当作无状态的工具列表传入；用 self.mcp_registry 统一管理，close() 负责资源回收。
 """
 
+import asyncio
 import atexit
 import json
+import logging
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Tuple
 
 from .prompt import DEFAULT_REACT_PROMPT
 from ...agents.agent_base import AgentBase
@@ -722,6 +724,96 @@ class ReActAgent(AgentBase):
                 final_finish_reason = "guardrail_block"
         return final_answer, final_finish_reason
 
+    async def _a_apply_output_guardrails(
+        self,
+        final_answer: Optional[str],
+        final_finish_reason: str,
+        hook_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[str], str]:
+        """``_apply_output_guardrails`` 的异步兄弟（E10）。
+
+        判定规则 / fail-closed 兜底 / 拦截文案与同步版逐字一致，唯一差别是 await
+        ``aafter_agent_run``。未挂载任何中间件时逐字节返回入参。
+
+        ⚠ 与同步版同样受 A2 的**流式部分**限制：text 增量已经 yield 给调用方，
+        本方法只能改「最终答案」，不能收回已发出的内容（拦截场景可凭
+        end 事件的 ``finish_reason == "guardrail_block"`` 撤销展示；脱敏场景无标记，
+        需要强护栏语义请用 ``run`` / ``arun``，它已改为返回护栏后正文）。
+        """
+        for _mw in self._middleware_list:
+            try:
+                _hook_result = await _mw.aafter_agent_run(final_answer, context=hook_context)
+                if isinstance(_hook_result,
+                              GuardrailBlocked) and _hook_result.phase == "output":
+                    final_answer = _hook_result.message
+                    final_finish_reason = "guardrail_block"
+                elif isinstance(_hook_result,
+                                GuardrailModified) and _hook_result.phase == "output":
+                    final_answer = _hook_result.content
+            except Exception as _mw_err:
+                # S1 兜底：输出侧中间件抛异常 → fail-closed，拦截输出，
+                # 绝不将模型原始输出透传给用户（与同步版同一套文案）。
+                logging.getLogger(__name__).error(
+                    "中间件 aafter_agent_run 异常（fail-closed，拦截输出）: %s", _mw_err
+                )
+                final_answer = (
+                    "输出被安全护栏拦截：输出安全检查发生内部错误，"
+                    "为保证安全已拒绝展示原始输出。"
+                )
+                final_finish_reason = "guardrail_block"
+        return final_answer, final_finish_reason
+
+    async def _aiter_llm_stream(
+        self,
+        messages: list,
+        tools: Optional[list] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[StreamChunk]:
+        """异步走查 LLM 流式事件（E10）。
+
+        优先用 ``llm.astream_invoke``（真异步、不占用事件循环）；若注入的是 duck-typed
+        LLM 对象（只实现了同步 ``stream_invoke``，典型为测试 mock），则回退直跑同步
+        迭代器——回退路径会占住事件循环，行为等同 ``run()``，不因此丢块/错序。
+        """
+        astream = getattr(self.llm, "astream_invoke", None)
+        if astream is None:
+            logging.getLogger(__name__).debug(
+                "注入的 llm 没有 astream_invoke，arun_stream 本轮退回同步 stream_invoke（会阻塞事件循环）"
+            )
+            for chunk in self.llm.stream_invoke(messages, tools=tools, **kwargs):
+                yield chunk
+            return
+        async for chunk in astream(messages, tools=tools, **kwargs):
+            yield chunk
+
+    async def _aiter_tool_execution(
+        self,
+        tool_calls: List[Any],
+        args_cache: Dict[str, dict],
+    ) -> AsyncIterator[Tuple[Any, Any]]:
+        """按「执行方式」逐条产出 ``(tool_call, ToolResult)`` 配对（E10）。
+
+        对齐同步主循环的分支1/分支2，并**刻意保持惰性**：
+        - 分支1（``parallel_tool_calls=True`` 且本批工具数≥2）：走
+          ``ainvoke_tools_concurrent`` 一次性并发，结果顺序与 tool_calls 严格对齐；
+        - 分支2（默认/单工具）：保持「执行一个、后处理一个」语义，与同步版的
+          生成器表达式一致 —— 若中途抛出异常（如后处理未兼容的新写法），剩余
+          工具不会先被跑完（写成列表推导会提前执行完整批，行为不同）。
+
+        ⚠ 不要把本批惰性误读成「return_direct 会短路同批后续工具」：两条链路的
+        后处理循环都不在命中 return_direct 时 break，而是跑完整批再退出推理循环，
+        本方法只是把「何时执行」交给消费方决定。
+        """
+        if self.parallel_tool_calls and len(tool_calls) >= 2:
+            results = await self.tool_registry.ainvoke_tools_concurrent(
+                calls=[(tc.name, args_cache[tc.id]) for tc in tool_calls],
+            )
+            for pair in zip(tool_calls, results):
+                yield pair
+        else:
+            for tc in tool_calls:
+                yield tc, await self.tool_registry.ainvoke_tool(tc.name, args_cache[tc.id])
+
     # ---------- 主循环 ----------
 
     def run(self, input_text: str, **kwargs) -> str:
@@ -733,20 +825,26 @@ class ReActAgent(AgentBase):
             **kwargs: 其他参数（会透传给 llm.invoke）
 
         Returns:
-            最终答案
+            最终答案（已过输出护栏）
         """
-        # 复用流式实现的完整逻辑，收集 text 增量拼接成最终字符串；
-        # 若本轮没有任何 text 增量（例如 return_direct 短路），改用 end 事件携带的完整正文
+        # A2 修复：本方法以 end 事件携带的正文为准，不再优先拼接 text 增量。
+        # 原因：输出护栏（after_agent_run / aafter_agent_run）在正文增量已经产出
+        # **之后**才执行（见 run_stream：先 yield text，再走 _apply_output_guardrails），
+        # 改写/拦截结果只体现在 end 事件上。旧写法「有 text 增量就拼 text 返回」会
+        # 把护栏拦下来/脱敏前的原文直接交给调用方，等于非流式路径绕过输出护栏。
+        # 仅在根本没有 end 事件（调用方提前 break 等异常用法）时退回聚合文本兜底。
         final_text_parts = []
-        end_content: Optional[str] = None
+        end_content = ""
+        saw_end = False
         for chunk in self.run_stream(input_text, **kwargs):
             if chunk.type == "text":
                 final_text_parts.append(chunk.text)
             elif chunk.type == "end":
-                end_content = chunk.content
-        if final_text_parts:
-            return "".join(final_text_parts)
-        return end_content or ""
+                saw_end = True
+                end_content = chunk.content or ""
+        if saw_end and end_content:
+            return end_content
+        return "".join(final_text_parts) or end_content
 
     def run_stream(self, input_text: str, **kwargs) -> Iterator[StreamChunk]:
         """
@@ -761,6 +859,15 @@ class ReActAgent(AgentBase):
             - type="text": LLM输出的文本增量（用于打字机效果）
             - type="tool_call": 工具调用增量片段（透传底层LLM分片，便于前端实时展示）
             - type="end": 本轮运行结束，携带完整最终答案和统计信息
+
+        ⚠ 输出护栏与流式的时序（A2 已知限制，请调用方知悉）：
+        正文增量为了打字机效果会在护栏**之前**发出，而输出护栏（after_agent_run）
+        只能改写 end 事件携带的最终答案，无法收回已发出的内容。因此：
+        - 直接渲染 text 分片的界面，若要保证脱敏/拦截生效，要么累加 text 到 end
+          事件后再一次性展示（牺牲打字机手感），要么只在未挂输出护栏时直渲；
+        - 拦截场景可用 ``end.finish_reason == "guardrail_block"`` 判定并清空已展示内容；
+          脱敏（modify）场景目前无事件级标记，需要该能力请取 ``run`` / ``arun`` 的返回值
+          （已改为护栏后正文）。
         """
         current_step = 0
         final_finish_reason: str = "stop"  # 初始默认值，避免输入拦截分支未赋值
@@ -1133,6 +1240,421 @@ class ReActAgent(AgentBase):
                         except Exception as _mw_err:
                             import logging
                             logging.getLogger(__name__).warning("中间件 after_agent_turn 异常: %s", _mw_err)
+                    # 不管成功还是超步，都把这一轮沉淀回记忆
+                    if final_answer is not None:
+                        self._remember(input_text, final_answer)
+                    else:
+                        final_answer = "抱歉，我无法在限定步数内完成这个任务。"
+                        self._remember(input_text, final_answer)
+
+                print(f"🎉 最终答案: {final_answer}")
+            if _agent_span is not None and _tracer is not None:
+                _tracer.end_span(
+                    _agent_span,
+                    output={
+                        "final_answer_preview": (_tracer.truncate_preview(final_answer, 300) if final_answer else None),
+                        "steps": current_step},
+                )
+
+            # 最终产出end事件，携带完整最终答案
+            yield StreamChunk(
+                type="end",
+                content=final_answer,
+                finish_reason=final_finish_reason,
+            )
+            return
+        except Exception as run_err:
+            if _agent_span is not None and _tracer is not None:
+                _tracer.end_span(_agent_span, output=None, error=f"{type(run_err).__name__}: {run_err}")
+            raise
+        finally:
+            if _tracer is not None:
+                _tracer.end_trace()
+
+    # ---------- 异步主循环（E10） ----------
+
+    async def arun(self, input_text: str, **kwargs) -> str:
+        """
+        异步运行ReAct Agent（E10）
+
+        与 :meth:`run` 完全同构：同样以 end 事件携带的**护栏后正文**为准（A2），
+        只在没有 end 事件时退回聚合 text 增量；差别在于全程跑在事件循环里——
+        LLM 走 ``astream_invoke``、中间件钩子走 ``a*`` 异步版本、工具走
+        ``ToolRegistry.ainvoke_tool``，因此在 FastAPI / Jupyter 等已有事件循环的环境
+        里可以直接 ``await``，不需要（也不应该）再套一层 ``asyncio.run``。
+
+        Args:
+            input_text: 用户问题
+            **kwargs: 其他参数（会透传给 llm.astream_invoke）
+
+        Returns:
+            最终答案（已过输出护栏）
+        """
+        final_text_parts = []
+        end_content = ""
+        saw_end = False
+        async for chunk in self.arun_stream(input_text, **kwargs):
+            if chunk.type == "text":
+                final_text_parts.append(chunk.text)
+            elif chunk.type == "end":
+                saw_end = True
+                end_content = chunk.content or ""
+        if saw_end and end_content:
+            return end_content
+        return "".join(final_text_parts) or end_content
+
+    async def arun_stream(self, input_text: str, **kwargs) -> AsyncIterator[StreamChunk]:
+        """
+        异步流式运行ReAct Agent（E10）
+
+        事件流契约与 :meth:`run_stream` 逐字一致（text / tool_call / end 三态）；
+        推理循环、护栏 fail-closed 判定、tool_calls 配对（N2）、参数同一性（N3）、
+        return_direct 短路（C3）、记忆沉淀、tracer span 结构全部同构。
+        同样受 A2 的流式侧限制：text 增量在输出护栏之前发出，详见
+        :meth:`run_stream` 里的说明。
+
+        与同步链路的三处实现差异（刻意保留，不是遗漏）：
+        1. 中间件钩子只 await ``a*`` 版本 —— 这是 ``AgentMiddleware`` 四个异步钩子与
+           Guardrails 整条 ``arun_*`` 链路的**唯一生产调用点**（E10 之前它们只被测试调用）；
+        2. 工具执行走 ``ToolRegistry.ainvoke_tool`` / ``ainvoke_tools_concurrent``：
+           原生 async 工具直接 await，只实现了同步 ``run()`` 的工具自动降级
+           ``asyncio.to_thread``（见 ``ToolBase.arun``），不会堵事件循环；
+        3. ``SkillMiddleware`` 仍调同步方法：它不是 ``AgentMiddleware`` 子类，只做纯内存
+           字符串处理（没有异步版本，也不涉及阻塞 I/O）。
+
+        ⚠ 以下已知限制本条**不涉及**，行为与同步链路一致：
+        A2（输出护栏与流式的时序：text 已发出后无法收回，需强护栏语义请用
+        ``arun`` / ``run``）、
+        A4（run 级无 session_id / user_id 维度）、A5（流式无 usage）、
+        K2（tracer 仍是同步 API，span 落盘为本地 I/O）。
+
+        Args:
+            input_text: 用户问题
+            **kwargs: 其他参数（会透传给 llm.astream_invoke）
+
+        Yields:
+            StreamChunk 事件流：
+            - type="text": LLM输出的文本增量（用于打字机效果）
+            - type="tool_call": 工具调用增量片段（透传底层LLM分片）
+            - type="end": 本轮运行结束，携带完整最终答案和统计信息
+        """
+        current_step = 0
+        final_finish_reason: str = "stop"  # 初始默认值，避免输入拦截分支未赋值
+
+        print(f"\n🤖 {self.name} 开始处理问题: {input_text}")
+
+        # G1: tracer 存在时开启一条 agent trace，用 agent span 包裹整次运行
+        # （tracer 本身是同步 API，K2 未做；打点不阻塞主流程）
+        _tracer: Optional["TraceLogger"] = getattr(self, "tracer", None)
+        _agent_span = None
+        _agent_trace_id = ""  # F1: start_trace() 返回值，供 hook_context 使用
+        if _tracer is not None:
+            from ...trace import SpanKind
+            _agent_trace_id = _tracer.start_trace(name=f"agent.{self.name}.run")
+            _agent_span = _tracer.start_span(
+                name=f"agent.run",
+                kind=SpanKind.AGENT,
+                input={"user_input": _tracer.truncate_preview(input_text, 500, is_input=True), "agent": self.name,
+                       "max_steps": self.max_steps},
+                metadata={"agent": self.name},
+            )
+
+        # F1: 组装中间件钩子公共上下文，供护栏做会话级判定；与同步链路同一套字段。
+        hook_context: Dict[str, Any] = {"agent_name": self.name}
+        if _agent_trace_id:
+            hook_context["trace_id"] = _agent_trace_id
+        if _tracer is not None:
+            hook_context["session_id"] = _tracer.session_id
+
+        final_answer: Optional[str] = None
+        try:
+            if self.enable_memory and self.memory:
+                # 每次运行重建工作区（system + buffer 历史），保证历史只注入一次
+                self._seed_workspace()
+            # else: 关闭记忆时保持原有行为：不清空 messages，允许跨 run 累积
+
+            # 本轮只检索一次长期记忆，拼进本轮用户输入
+            memory_text = self._retrieve_long_term_memory(input_text)
+            if memory_text:
+                print(f"🧠 已注入长期记忆:\n{memory_text}")
+            user_input = self._merge_memory(input_text, memory_text)
+
+            # 输入护栏：await abefore_agent_run（与同步版同一套结构化判定 + fail-closed）
+            input_blocked = False
+            for _mw in self._middleware_list:
+                try:
+                    _hook_result = await _mw.abefore_agent_run(user_input, context=hook_context)
+                    if isinstance(_hook_result, GuardrailBlocked) and _hook_result.phase == "input":
+                        final_answer = _hook_result.message
+                        final_finish_reason = "guardrail_block"
+                        # 先 yield text 分片让流式前端看到拦截提示，再走统一 end 事件
+                        yield StreamChunk(type="text", text=final_answer)
+                        input_blocked = True
+                        break
+                except Exception as _mw_err:
+                    # S1 兜底：任何中间件（含未来未按协议返回的实现）抛异常都视为
+                    # fail-closed 拦截，绝不 warning 放行，避免护栏失效被静默吞掉。
+                    logging.getLogger(__name__).error(
+                        "中间件 abefore_agent_run 异常（fail-closed，拦截输入）: %s", _mw_err
+                    )
+                    final_answer = "请求被安全护栏拦截：安全检查发生内部错误，为保证安全已拒绝本次请求。"
+                    final_finish_reason = "guardrail_block"
+                    yield StreamChunk(type="text", text=final_answer)
+                    input_blocked = True
+                    break
+
+            if not input_blocked:
+                # 开启 context 时走「按 token 预算分层拼装」重建工作区（与同步版一致）；
+                # 否则只把画像追加到 system 末尾。
+                if self.enable_context and self.ctx is not None:
+                    self._fit_context(input_text)
+                    user_input = input_text
+                else:
+                    self._inject_profile_to_workspace()
+
+                try:
+                    while current_step < self.max_steps:
+                        current_step += 1
+                        print(f"\n--- 第 {current_step} 步 ---")
+
+                        # G1: 每步包一个 decision Span
+                        _dec_span = None
+                        if _tracer is not None:
+                            from ...trace import SpanKind
+                            _dec_span = _tracer.start_span(
+                                name=f"decision.step{current_step}",
+                                kind=SpanKind.DECISION,
+                                input={"step": current_step,
+                                       "user_input_for_step": user_input if current_step == 1 else None},
+                                metadata={"step": current_step, "agent": self.name},
+                            )
+
+                        try:
+                            # 【C10】优先使用技能中间件过滤后的工具schema（无技能加载时返回None，回退到全量）
+                            tools = None
+                            if self.skill_middleware is not None:
+                                tools = self.skill_middleware.get_filtered_openai_tools()
+                            if tools is None:
+                                tools = self.tool_registry.to_openai_tools()
+
+                            # 系统提示词已在构造/seed 时就位，这里只追加本轮用户输入（仅第 1 步追加）
+                            if current_step == 1 and not (self.enable_context and self.ctx is not None):
+                                self.messages.append_user(user_input)
+                            messages = self.messages.to_openai_messages()
+
+                            # 异步流式调用LLM，透传所有text/tool_call分片，收集最终结果
+                            text_buf = []
+                            final_tool_calls = []
+                            final_finish_reason = ""
+                            async for chunk in self._aiter_llm_stream(messages, tools, **kwargs):
+                                if chunk.type == "text":
+                                    text_buf.append(chunk.text)
+                                    yield chunk  # 透传文本增量，前端直接用于打字机效果
+                                elif chunk.type == "tool_call":
+                                    yield chunk  # 透传工具调用分片（可选：前端展示参数拼装）
+                                elif chunk.type == "end":
+                                    final_tool_calls = chunk.tool_calls
+                                    final_finish_reason = chunk.finish_reason
+
+                            # 构造和invoke路径完全一致的response消息
+                            response = Message(
+                                role="assistant",
+                                content="".join(text_buf) if text_buf else "",
+                                tool_calls=final_tool_calls,
+                            )
+                            self.messages.append(response)
+
+                            # 判断是否执行工具：只看tool_calls是否非空，不依赖finish_reason
+                            if response.tool_calls:
+                                tool_names = [tc.name for tc in response.tool_calls]
+                                return_direct_answer: Optional[str] = None
+
+                                # 工具前置护栏：await abefore_tool_call（与同步版同一套归一化判定）
+                                tool_blocked = False
+                                # N2：记录本批次里「已经生成 tool 消息」的 tool_call_id 与被拦截的工具名。
+                                _responded_ids = set()
+                                _blocked_tool_name: Optional[str] = None
+                                # N3：缓存每个 tool_call 的解析结果，保证护栏检查与实际执行用同一份参数。
+                                _coerced_args_cache = {}  # tc.id -> coerced_args
+                                for tc in response.tool_calls:
+                                    _coerced_args = _coerce_tool_args(tc.arguments)
+                                    _coerced_args_cache[tc.id] = _coerced_args
+                                    for m in self._middleware_list:
+                                        try:
+                                            _ret = await m.abefore_tool_call(
+                                                tc.name, _coerced_args,
+                                                context=hook_context,
+                                                call_id=tc.id,
+                                                **self._resolve_tool_info(tc.name),
+                                            )
+                                            # Bug3 归一化：bool（旧协议）或 (allowed, reason) 二元组（新协议）
+                                            # 都归一成布尔判定 + 拦截原因。必须取 _ret[0] 判定，不能 bool(_ret)。
+                                            if isinstance(_ret, tuple):
+                                                allowed = bool(_ret[0]) if _ret else False
+                                                _mw_reason = str(_ret[1]) if len(_ret) > 1 else ""
+                                            else:
+                                                allowed, _mw_reason = bool(_ret), ""
+                                            if not allowed:
+                                                # 拦截原因优先级：返回值携带（线程安全）> 共享属性（旧式兼容）> 默认文案
+                                                observation = (_mw_reason
+                                                               or getattr(m, '_last_tool_reject_reason', None)
+                                                               or f"工具 {tc.name} 调用被安全护栏拦截")
+                                                tool_msg = Message("tool", observation)
+                                                tool_msg.metadata = {"tool_call_id": tc.id, "name": tc.name}
+                                                self.messages.append(tool_msg)
+                                                _responded_ids.add(tc.id)
+                                                _blocked_tool_name = tc.name
+                                                tool_blocked = True
+                                                break
+                                        except Exception as _mw_err:
+                                            # S1 兜底：中间件抛异常视为 fail-closed，拦截本次工具调用，
+                                            # 不再 warning 放行，避免危险工具被静默执行。
+                                            logging.getLogger(__name__).error(
+                                                "中间件 abefore_tool_call 异常（fail-closed，拦截工具 %s）: %s",
+                                                tc.name, _mw_err,
+                                            )
+                                            observation = (
+                                                f"工具 {tc.name} 调用被安全护栏拦截：工具安全检查发生内部错误，"
+                                                f"为保证安全已拒绝本次调用。"
+                                            )
+                                            tool_msg = Message("tool", observation)
+                                            tool_msg.metadata = {"tool_call_id": tc.id, "name": tc.name}
+                                            self.messages.append(tool_msg)
+                                            # N2：异常兜底分支与正常拦截分支保持同一套配对登记
+                                            _responded_ids.add(tc.id)
+                                            _blocked_tool_name = tc.name
+                                            tool_blocked = True
+                                            break
+                                    if tool_blocked:
+                                        break
+                                if tool_blocked:
+                                    # N2：给本批次中「既没执行、也没消息」的 tool_call 补齐占位响应，
+                                    # 保证 assistant.tool_calls 与 tool 消息严格一一对应。
+                                    for pending_tc in response.tool_calls:
+                                        if pending_tc.id in _responded_ids:
+                                            continue
+                                        _placeholder = (
+                                            f"未执行：本批次中工具 {_blocked_tool_name} 的调用被安全护栏拦截，"
+                                            f"按「一批中任一调用被拦则整批不执行」的规则，"
+                                            f"{pending_tc.name} 也没有被执行、没有结果。"
+                                            f"下一步：如需继续，请单独重新发起 {pending_tc.name}"
+                                            f"（不要与 {_blocked_tool_name} 放在同一批），"
+                                            f"并从后续计划中移除被拦截的 {_blocked_tool_name}。"
+                                        )
+                                        _ph_msg = Message("tool", _placeholder)
+                                        _ph_msg.metadata = {"tool_call_id": pending_tc.id, "name": pending_tc.name}
+                                        self.messages.append(_ph_msg)
+                                        _responded_ids.add(pending_tc.id)
+                                    # 本轮工具被拦截，直接进入下一轮推理，让LLM看到拦截提示
+                                    continue
+
+                                # 先只按「执行方式」拿到 (tool_call, ToolResult) 配对：
+                                # 并发与顺序的差异只保留在 _aiter_tool_execution 这一处，后面的
+                                # observation 渲染 / 卸载 / 技能事件 / tool 消息挂载全部共用同一段处理。
+                                # 惰性产出，与同步版的生成器表达式保持同一套「执行一个、后处理一个」时序；
+                                # 命中 return_direct 也不 break，整批跑完后才退出推理循环。
+                                async for tool_call, result in self._aiter_tool_execution(
+                                        response.tool_calls, _coerced_args_cache):
+                                    # return_direct：工具标记「结果直接作为最终答案返回」，不再进下一轮推理
+                                    tool_obj = self.tool_registry.get_tool(tool_call.name)
+                                    if tool_obj is not None and getattr(tool_obj, "return_direct",
+                                                                        False) and result.succeeded:
+                                        return_direct_answer = result.output
+                                    observation = _render_observation(result)
+                                    # 超长结果先卸载到磁盘：上下文里只留引用
+                                    observation = self._offload_observation(tool_call.name, observation)
+                                    # 通知技能中间件（纯内存操作，走同步接口）
+                                    if self.skill_middleware is not None:
+                                        observation = self.skill_middleware.after_tool_call(
+                                            tool_call.name, _coerce_tool_args(tool_call.arguments), observation,
+                                        )
+                                    # 工具后置护栏：await aafter_tool_call（结果脱敏/屏蔽）
+                                    for m in self._middleware_list:
+                                        try:
+                                            new_obs = await m.aafter_tool_call(
+                                                tool_call.name, result.succeeded,
+                                                output=observation if result.succeeded else result.output or "",
+                                                error=result.error if not result.succeeded else "",
+                                                context=hook_context,
+                                                metadata={"call_id": tool_call.id, "tool_name": tool_call.name},
+                                            )
+                                            if isinstance(new_obs, str):
+                                                observation = new_obs
+                                        except Exception as _mw_err:
+                                            # S1 兜底：后置护栏异常 → 屏蔽真实工具结果，替换为拦截占位 observation
+                                            logging.getLogger(__name__).error(
+                                                "中间件 aafter_tool_call 异常（fail-closed，屏蔽工具 %s 结果）: %s",
+                                                tool_call.name, _mw_err,
+                                            )
+                                            observation = (
+                                                f"工具 {tool_call.name} 执行结果被安全护栏拦截：结果安全检查发生内部错误，"
+                                                f"为保证安全已屏蔽原始结果。"
+                                            )
+                                    tool_msg = Message("tool", observation)
+                                    tool_msg.metadata = {"tool_call_id": tool_call.id, "name": tool_call.name}
+                                    # 多模态透传：工具返回 artifact.images 时以 ImagePart 追加到 tool 消息
+                                    if result.succeeded and isinstance(result.artifact, dict):
+                                        imgs = result.artifact.get("images") or []
+                                        for img in imgs:
+                                            data = img.get("data", "") if isinstance(img, dict) else ""
+                                            mime = img.get("mime", "image/png") if isinstance(img,
+                                                                                              dict) else "image/png"
+                                            if data:
+                                                tool_msg.add_image_base64(data, mime)
+                                    self.messages.append(tool_msg)
+                                # return_direct 命中：本轮不再把 tool 结果喂给模型，直接作为最终答案返回
+                                if return_direct_answer is not None:
+                                    final_answer = return_direct_answer
+                                    # C3：工具直接返回的答案同样要过输出护栏，否则工具原始输出
+                                    # 会绕过全部 OutputGuardrail 原样透传给用户
+                                    final_answer, final_finish_reason = await self._a_apply_output_guardrails(
+                                        final_answer, final_finish_reason, hook_context=hook_context,
+                                    )
+                                    if _dec_span is not None:
+                                        _tracer.end_span(
+                                            _dec_span,
+                                            output={"action": "return_direct", "tool_names": tool_names},
+                                        )
+                                    # 跳出 while 推理循环（走 finally 做记忆沉淀）
+                                    current_step = self.max_steps + 1
+                                    break
+                                # 本轮可能有新加载的技能，同步到 system 提示词（Level 2 详情）
+                                if self.skill_middleware is not None:
+                                    self.refresh_system_prompt()
+                                if _dec_span is not None:
+                                    _tracer.end_span(
+                                        _dec_span,
+                                        output={"action": "tool_calls", "tool_names": tool_names},
+                                    )
+                                continue
+                            else:
+                                final_answer = response.text
+                                # 最终输出后 await aafter_agent_run钩子（输出护栏，结构化返回）：
+                                # 判定与 fail-closed 兜底已抽到 _a_apply_output_guardrails，
+                                # 与 return_direct 分支共用（C3），改一处不会漏另一处。
+                                final_answer, final_finish_reason = await self._a_apply_output_guardrails(
+                                    final_answer, final_finish_reason, hook_context=hook_context,
+                                )
+                                if _dec_span is not None:
+                                    _tracer.end_span(
+                                        _dec_span,
+                                        output={"action": "final", "length": len(final_answer) if final_answer else 0},
+                                    )
+                                break
+                        except Exception as step_err:
+                            if _dec_span is not None:
+                                _tracer.end_span(_dec_span, output=None, error=f"{type(step_err).__name__}: {step_err}")
+                            raise
+                finally:
+                    # 每轮结束通知技能中间件（unload_after_turn 开启时会自动卸载已加载技能）
+                    # SkillMiddleware 不是 AgentMiddleware 子类，只做纯内存字符串处理，走同步接口
+                    if self.skill_middleware is not None:
+                        self.skill_middleware.after_agent_turn()
+                    for m in self._middleware_list:
+                        try:
+                            await m.aafter_agent_turn()
+                        except Exception as _mw_err:
+                            logging.getLogger(__name__).warning("中间件 aafter_agent_turn 异常: %s", _mw_err)
                     # 不管成功还是超步，都把这一轮沉淀回记忆
                     if final_answer is not None:
                         self._remember(input_text, final_answer)
