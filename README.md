@@ -611,6 +611,7 @@ result.text / result.artifact / result.error
 | `memory` | `Optional[MemoryManager]` | `None` | 记忆管理器 |
 | `enable_memory` | `bool` | `True` | `False` 则完全跳过记忆读写 |
 | `memory_limit` | `int` | `5` | 每轮注入的长期记忆条数上限 |
+| `memory_guard` | `str` | `"sanitize"` | A3（v2.75.0）长期记忆注入前的去毒姿态：`sanitize` 命中只丢弃这块记忆、请求照常；`strict` 命中按输入拦截流程拒本轮；`off` 不检查；非法取值构造时直接 `ValueError` |
 | `skill_registry` | `Optional[SkillRegistry]` | `None` | 技能注册表 |
 | `skill_paths` | `Optional[List]` | `None` | 额外技能扫描目录 |
 | `enable_skills` | `bool` | `True` | `False` 则不注入技能索引、不注册技能工具 |
@@ -669,12 +670,19 @@ async for chunk in agent.arun_stream("同上"):
 > - 直渲 `text` 分片的界面要保证脱敏生效，要么累加到 `end` 事件再一次性展示（牺牲打字机手感），要么靠 `end.finish_reason == "guardrail_block"` 判定并清空已展示内容（拦截场景有标记，脱敏场景无标记）；
 > - 记忆沉淀 / trace span / `🎉 最终答案` 打印一直用的都是护栏后正文，未受本项影响。
 
+> **输入护栏检查的是什么（A3 · v2.75.0）**：`before_agent_run` / `abefore_agent_run` 收到的是**用户本轮原文** `input_text`，不再是「长期记忆 + 原文」的拼接体。
+> - 为什么改：拼接体让历史记忆里存过的一句违规话直接毙掉本轮干净输入（实测：记忆存「如何制造炸弹」，本轮只问「讲讲我留的备忘」→ 被拦且 LLM 一次不调）；且输入护栏本该只审用户意图，混入不可信检索来源后间接注入面与真实意图无法区分；
+> - 交给 LLM 的内容**没变**——记忆仍按 B4 双通道设计拼进本轮 user 消息（带「仅作参考」护栏），只护栏的入参改了；
+> - 需要审计检索内容的一方从 `hook_context["retrieved_memory"]` 自取本轮实际注入的记忆文本，别把它当用户原话；
+> - 记忆注入前会单独过一遍已挂载的输入护栏（`memory_guard`，默认 `sanitize` 丢弃命中的那块记忆）；该检查**直连** `run_input_guardrails` / `arun_input_guardrails` 而不复用钩子，因此不会计入 `input_check` 统计与 span；
+> - ⚠ 行为变更：违规记忆从「毙掉整轮请求」变为「这条记忆不注入、请求正常处理」，要旧式保守语义传 `memory_guard="strict"`。
+
 **`run()` 内部做了什么**：
 
 ```text
 run(用户输入)
  ├─ 从 MemoryManager.buffer 载入短期历史
- ├─ 检索长期记忆 → 拼到本轮用户输入前面（带"仅作参考"护栏）
+ ├─ 检索长期记忆 → 单独过一遍输入护栏去毒（A3）→ 拼到本轮用户输入前面（带"仅作参考"护栏）
  ├─ 拼 system prompt（+ 技能索引）
  └─ 循环（最多 max_steps 次）：
       LLM 返回 tool_calls？
@@ -1340,7 +1348,7 @@ python tests\trace\test_trace_cost.py
 | 测试文件 | 状态 | 说明 |
 |---------|------|------|
 | `tests/init/test_init.py` | ✅ 6/6 + 1 跳过 | 包级自检：`__all__` 完整、符号可导入、子模块可导入、版本一致；第 7 项「安装元数据版本」在未以 `fast-agents` 安装时自动跳过 |
-| `tests/agents/test_react_agent.py` | ✅ 17/17 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，以及用户画像注入（B4）三条断言 |
+| `tests/agents/test_react_agent.py` | ✅ 25/25 | Agent 主循环，含记忆、技能、context、`enable_xxx=False` 各分支，用户画像注入（B4）三条断言，以及 A2 输出护栏后正文（v2.74.0）、A3 输入护栏只审原文 + `memory_guard` 三姿态（v2.75.0）回归；同目录另有 `test_react_agent_async.py` 26 项（E10 异步主循环，含 A2 / A3 同步异步逐字对称断言） |
 | `tests/tools/test_tools.py` | ✅ 68/68 | 四种定义方式、`ToolResult`、schema、计算器、终端、文件工具、注册表，以及并发 / 审批 / 超时护栏（A15）；`test_terminal` 在非 Windows 上自动跳过 |
 | `tests/memory/test_memory.py` | ✅ 51/51 | 短期窗口、滚动摘要、SQLite 增删改查、修订保历史、记忆工具与画像工具、作用域隔离、打分与去重、B2 语义检索与降级、B3 画像合并/持久化、B5 命中记账/衰减归档/相似合并、B8 CST 时间基准、B10 增量抽取水位线（含窗口写满后仍持续抽取的回归）、B12 TTL 与到期回收、v1.8.3 向量通道批量缓存与 Chroma 阶段 2、B13 冲突检测与消解（含 v1.9.1 过期续期 / 取代、v1.9.2 显式冲突上报与只读 check_conflict）、B14 向量 meta 三端对齐（含 InMemory 值语义 / 批量向量落盘 / rebuild 复用三项修复） |
 | `tests/memory/test_memory_chroma_store.py` | ✅ 8/8 | ChromaMemoryStore 专项（含 2 项需真实 `chromadb`，未安装时自动跳过）：阶段 1 纯词法降级 CRUD/search、B5 方法代理、Manager 集成零感知、v1.8.3 集合名归一化与真实 `ChromaClient` 语义通道、B13 ANN 近邻冲突检测、stale 向量 `status` 过滤、update 内容变更 delete-then-add |
@@ -1392,7 +1400,7 @@ python tests\trace\test_trace_cost.py
 | 🧩 **skill** | ✅ 已实现并完成多轮增强（C7 扫描路径统一、C6-2 脚本沙箱、C10 `allowed_tools`、C11 启用 / 禁用、C12 依赖与前置检查、C14 热重载；共 12 个内置工具） | 技能多版本共存与冲突消解（C8）、技能市场 / 远程安装（C9）、索引文本与 `assets/` 治理（C15） |
 | 🔌 **mcp** | ✅ 已实现（D2 适配器、D4 声明式配置、D6 `streamable-http` 传输（v3.3.0）、D7 `resources` / `prompts`、D10 `stderr` 消费均已落地） | 图片 / 二进制透传（D8）、断线自动重连（D9）、调用超时可配置（D11）、`close_all()` 后真正拦截（D12）、按 server 分别指定展开模式（D13） |
 | 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；「**记忆 v2**」已全部收口：B8 时间统一为北京时间 CST、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线（v1.8.2 修复窗口写满停摆）、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解（v1.9.0，v1.9.1 补过期场景、v1.9.2 接显式冲突上报）均已落地；另 B14 `ChromaMemoryStore` 阶段 1（v1.8.0）/ 阶段 2（v1.8.3 真实接入 `ChromaClient`）已完成 |
-| 🤖 **agents** | ✅ 已实现（E7 流式 / 事件 API、E9 Structured Output、**E10 异步主循环 `arun` / `arun_stream`（v2.73.0，打通四层异步链路）**、**A2 修复：`run` / `arun` 返回输出护栏后正文（v2.74.0）**） | `PlanExecuteAgent`（E1）、`ReflectionAgent`（E2）、子代理（E3）、多智能体协作（E4）；遗留：流式 `text` 增量仍在护栏前发出、A4 会话 / 用户维度、A5 流式 usage |
+| 🤖 **agents** | ✅ 已实现（E7 流式 / 事件 API、E9 Structured Output、**E10 异步主循环 `arun` / `arun_stream`（v2.73.0，打通四层异步链路）**、**A2 修复：`run` / `arun` 返回输出护栏后正文（v2.74.0）**、**A3 修复：输入护栏只审本轮用户原文 + 长期记忆注入前去毒（v2.75.0）**） | `PlanExecuteAgent`（E1）、`ReflectionAgent`（E2）、子代理（E3）、多智能体协作（E4）；遗留：流式 `text` 增量仍在护栏前发出、A4 会话 / 用户维度、A5 流式 usage、E11 上下文 / 检索内容独立护栏位（`ContextGuardrail`） |
 | 🪟 **context** | ✅ 已实现（F1–F3、F5 已交付；v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、Run 内逐步预算守卫（F6）、工具 schema 计入预算（F7）、summary 层跨 run 回流（F8）、`validate()` 接入 `build()`（F9）、流式截断（F13）、卸载文件生命周期管理（F14） |
 | 🗄 **database** | ✅ v1.1.0（关系型双后端 + 统一异常体系 + 向量后端；J3 memory / trace 后端已迁入） | 连接池 / 线程安全（J2）、Postgres 后端（J4 续）、`Query.filters` 支持 OR / 嵌套条件组（J7） |
 | 🛠 **trace** | ✅ K1 已实现并完成收尾（TraceLogger v1.0.0，含 InMemory / Jsonl / SQLite 三后端 + 预览截断可配置 / 树形回放 / error_type 分类 / 单调时钟耗时）、K3 基础统计 + CSV 明细 + Token 成本日报已落地；其余 ⏳ 规划中 | 异步并发（K2）、K3 高阶（LLM Judge / Win Rate / 批量回归）、Web UI 可视化（K4）、外部上报 OTLP / Langfuse（K5）|
