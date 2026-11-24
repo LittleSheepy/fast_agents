@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 from ..agents.middleware import AgentMiddleware
 from .guardrail_base import GuardrailBase
@@ -121,7 +121,11 @@ class GuardrailMiddleware(AgentMiddleware):
         Args:
             guardrails: 用户显式注册的护栏实例列表；传入后会自动 clone() 一份副本，
                 避免多 Agent 共享同一实例导致 enable/disable 串扰。
+                **优先级**：与自动加载的预设护栏同名时，这里传入的实例胜出，
+                对应预设会被跳过（见 ``presets`` / A1）。
             presets: 要加载的预设护栏名称列表，None 表示加载全部默认预设。
+                名称与构造器 ``guardrails`` 中某个护栏相同时，预设让位（显式优先），
+                并打一条 info 日志留痕，不会静默替换掉用户实例。
             auto_register_presets: 是否加载默认预设护栏（默认 True）。
                 ``enable_presets`` 是向后兼容的别名。
             enable_presets: 向后兼容参数；非 None 时覆盖 auto_register_presets。
@@ -135,6 +139,7 @@ class GuardrailMiddleware(AgentMiddleware):
                 ``tool.metadata["requires_approval"]`` 这一单一事实源（对齐路线图
                 A9 审批 / C6 沙箱），而不是自造一份危险关键词清单；
                 None 时回退到预设关键词表（向后兼容）。
+                赋值后晚执行的 ``add_guardrail()`` 也会拿到它（A2），不限于赋值瞬间已挂载的实例。
         """
         super().__init__()
         self.tracer = tracer
@@ -152,6 +157,10 @@ class GuardrailMiddleware(AgentMiddleware):
             auto_register_presets = enable_presets
         # 实例级护栏副本列表（隔离语义：多 Agent 之间互不影响）
         self._instance_guardrails: List[GuardrailBase] = []
+        # 构造器「显式传入」的护栏名集合，仅供 _load_presets 判定同名预设是否要让位（A1）。
+        # 只在 __init__ 期间登记：构造完成后走公开 add_guardrail() 的注册属于显式替换，
+        # 语义是「后注册的覆盖先注册的」，仍然会替换预设副本并打 warning，故不写进这里。
+        self._explicit_guardrail_names: Set[str] = set()
         # 拦截/通过统计，支持观测/监控接入（按护栏名计数）；
         # ``stats["registered"]/stats["reject"]/stats["pass"]`` 作为总览字段。
         self._reject_stats: Dict[str, int] = {}
@@ -164,6 +173,9 @@ class GuardrailMiddleware(AgentMiddleware):
         if guardrails:
             for g in guardrails:
                 self.add_guardrail(g)
+                # A1：先靠 add_guardrail 做类型校验，通过后记下护栏名再供预设让位判定；
+                # 放在调用之后，避免非护栏对象在这里提前抛 AttributeError 顶替原有 TypeError 文案。
+                self._explicit_guardrail_names.add(g.name)
 
         # 加载预设护栏（此时 _tool_registry 仍是 None；预设构造不依赖 registry，
         # 后续 setter 会把 registry 广播到所有已挂载的 BasicPermissionGuardrail 实例）
@@ -222,6 +234,16 @@ class GuardrailMiddleware(AgentMiddleware):
         preset_names = names if names is not None else list(_prototypes.keys())
         for preset_name in preset_names:
             if preset_name in _prototypes:
+                # A1 修复：构造器已显式传入同名护栏时，预设让位（显式优先）。
+                # 修复前的顺序是「先挂显式、后加载预设」，而 add_guardrail 的同名替换逻辑
+                # 会把用户实例 pop 掉，又因为这里传了 skip_exist_check=True 连 warning 都不打，
+                # 导致用户的自定义同名护栏被静默丢弃（配置改了却毫无效果，且无从排查）。
+                if preset_name in self._explicit_guardrail_names:
+                    _logger.info(
+                        "[guardrail] 预设 '%s' 让位于构造器显式传入的同名护栏（显式优先，跳过加载）",
+                        preset_name,
+                    )
+                    continue
                 # 预设也走 add_guardrail（clone + fail_open 同步），保证实例隔离
                 self.add_guardrail(_prototypes[preset_name], skip_exist_check=True)
             else:
@@ -234,6 +256,11 @@ class GuardrailMiddleware(AgentMiddleware):
             guardrail: 原型或现有实例；内部会 clone() 一份副本再挂载，
                 所以对返回对象 enable/disable 不会影响其他 Agent。
             skip_exist_check: 内部 _load_presets 调用时跳过同名检查，避免重复告警。
+
+        注入规则：middleware 已经持有 ``tool_registry`` 时，本方法新挂载且自己没带
+        registry 的 ``BasicPermissionGuardrail`` 副本会补拿到它（A2），以保证
+        ``metadata["requires_approval"]`` 单一事实源在任何挂载时序下都生效；
+        实例自己显式带了 registry 时不覆盖它。
         """
         if not isinstance(guardrail, GuardrailBase):
             raise TypeError(f"add_guardrail 只接受 GuardrailBase 实例，收到 {type(guardrail)}")
@@ -258,6 +285,22 @@ class GuardrailMiddleware(AgentMiddleware):
         instance = guardrail.clone()
         if not getattr(instance, "_fail_open_explicit", False):
             instance.fail_open = self.fail_open
+        # A2 修复：middleware 已持有 tool_registry 时，晚挂载的权限护栏副本要同步注入。
+        # 修复前广播只写在 tool_registry 的 setter 里，只能覆盖「赋值那一瞬间已挂载」的实例；
+        # 之后再 add_guardrail(BasicPermissionGuardrail()) 挂进来的副本里 tool_registry 仍是 None，
+        # 单一事实源分支（读 metadata["requires_approval"]）永远不会被走到，高危工具被静默放行，
+        # 属 S4（晚注入不传播）的同一条死角延伸到了「先注入、后挂载」方向。
+        # 两点克制：
+        #   1) 仅当实例自己没带 registry（为 None）才注入，不把用户显式配置的 registry 覆盖掉；
+        #   2) self._tool_registry 为 None 时不做事，也不去 import preset 包（零开销路径保持零开销）。
+        if self._tool_registry is not None:
+            from .preset import BasicPermissionGuardrail as _BPG
+            if isinstance(instance, _BPG) and instance.tool_registry is None:
+                instance.tool_registry = self._tool_registry
+                _logger.debug(
+                    "GuardrailMiddleware.add_guardrail: 把已设置的 tool_registry 补注入晚挂载的权限护栏 '%s'",
+                    instance.name,
+                )
         self._instance_guardrails.append(instance)
 
     def remove_guardrail(self, name: str) -> bool:

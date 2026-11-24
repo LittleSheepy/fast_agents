@@ -46,16 +46,23 @@ def log_guardrail_event(
         phase: 检查阶段，取值 ``input_check`` / ``tool_pre_check`` / ``tool_post_check`` / ``output_check``；
                会同时写入 metadata.phase 与 metadata.event_type，消除历史字段漂移。
         context: 业务上下文，键值会合并进 metadata，供评估器/OTLP 导出使用。
+            ⚠️ 修复#3：若 context 含与打点核心字段（guardrail_name/phase/event_type/
+            allowed/is_error/reason/duration_ms）同名的键，以结构化字段为准，
+            context 中的同名键不会生效（防止外部上下文篡改统计维度）。
     """
     if tracer is None:
         return
 
     try:
+        # 修复#3：业务 context 先铺底，结构化字段后置覆盖——保证 guardrail_name/phase/allowed 等
+        # 打点核心字段不被外部传入的同名 context 静默篡改（如 context={"phase": "llm_call"}
+        # 会污染护栏阶段统计）；业务自定义键（session_id/tool_name 等）仍正常写入 span metadata。
         span = tracer.start_span(
             name=f"guardrail:{guardrail_name}",
             kind=_guardrail_span_kind(),
             input={"phase": phase},
             metadata={
+                **(context or {}),
                 "guardrail_name": guardrail_name,
                 "phase": phase,
                 "event_type": phase,  # 与 event_type 字段同值，避免两处漂移
@@ -63,7 +70,6 @@ def log_guardrail_event(
                 "is_error": result.metadata.get("is_error", False),
                 "reason": result.reason,
                 "duration_ms": result.metadata.get("duration_ms", 0),
-                **(context or {}),
             },
         )
         # Bug2 修复：仅在护栏实际拦截（not allowed）时才标记 span 为 ERROR。

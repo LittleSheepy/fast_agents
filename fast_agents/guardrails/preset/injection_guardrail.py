@@ -17,6 +17,21 @@
 
 ⚠️ 与所有基于规则的安全组件一样，本护栏无法覆盖语义改写型注入（例如换用完全
 不同的措辞诱导模型），只作为「高召回、低成本」的确定性第一道防线。
+
+4. **逐句匹配（B4 RC1 修订，回应「注入规则误拦正常文本」的审计意见）**：带间隙的英文
+   模式（如 `ignore.{0,20}?previous.{0,20}?instructions`）原先在整段文本上匹配，会把
+   「Don\'t forget the previous chapters. Instructions for installation are below.」这种
+   分属两句的无关子句粘连成误报。现按句子边界切分再逐句匹配：
+   英文 `.` `!` `?` **后跟空白才切**（`jail.break` 不切，`chapters. Instructions` 切），
+   中文 `。` `！` `？` 直接切；跨句误报被拆开；因逐句是整段的子集，句内注入与加空格 / 加符号 / 全角绕过均不受影响。
+
+5. **词融合防护（B4 RC2 修订）**：`jailbreak(?:mode|prompt|now)?` 等纯单词紧凑模式
+   原本在完整压缩视图（去空格 + 去分隔符）里匹配，导致普通英文短语
+   `jail  break the habit` 被误融合成 `jailbreak` 而误拦。现对这些模式改用「非空格
+   压缩」视图（仅去 `.` `-` `_` `*` 等非空白分隔符、保留空格），因此：
+   `jail-break` / `jail.break` 仍能匹配；`jail  break` 不再误触。
+   ⚠️ 已知取舍：`do anything now`（纯空格分隔）仍由完整压缩视图捕获，因为现有测试
+   L7 断言该短语单独出现就是 DAN 攻击签名，不可放宽。
 """
 from __future__ import annotations
 
@@ -67,8 +82,20 @@ DEFAULT_INJECTION_PATTERNS = [
 
 # 归一化时要去除的零宽 / 不可见控制字符（常被用来拆断关键词）
 _ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060\ufeff]")
-# 压缩视图时要去除的空白与常见插入分隔符
+# 压缩视图时要去除的空白与常见插入分隔符（完整压缩，用于跨词间隙模式）
 _SEPARATOR_RE = re.compile(r"[\s._\-*~`·•|/\\^]+")
+# B4 RC2 修复：非空格压缩视图——仅去非空白分隔符（`.` `-` `_` `*` 等），保留词间空格。
+# 用途：专供 jailbreak 类紧凑单词模式使用，避免 `jail break the habit`（普通英文短语）
+# 被全压缩视图误融合为 `jailbreak` 而误拦；`jail-break`、`jail.break` 等真实绕过仍能被捕获。
+_NO_SPACE_SEPARATOR_RE = re.compile(r"[._\-*~`·•|/\\^]+")
+# B4 RC1 修复：句子切分边界。带间隙的英文模式（如 `ignore.{0,20}?previous.{0,20}?instructions`）
+# 在整段文本上会把「……chapters. Instructions for installation……」这种相邻但无关的两个
+# 子句粘连成注入特征，造成对正常叙述 / 教程文本的误拦。先按**句末标点**切分、再逐句匹配。
+# 切分规则：
+# - 英文 `.` `!` `?` 后必须跟空白才切（`chapters. Instructions` 切，`jail.break` 不切）
+# - 中文 `。` `！` `？` 直接切（中文词内不会出现这些字符）
+# ❗ **不切裸换行**：「ignore all\nprevious instructions」靠完整压缩视图处理，不能靠切分漏放。
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|(?<=[\u3002\uff01\uff1f])")
 
 
 def _normalize_text(text: str) -> str:
@@ -81,6 +108,27 @@ def _normalize_text(text: str) -> str:
 def _squeeze_text(normalized: str) -> str:
     """在归一化文本基础上再去掉空白与插入分隔符：对抗「加空格 / 加符号」绕过。"""
     return _SEPARATOR_RE.sub("", normalized)
+
+
+def _squeeze_text_nonspace(normalized: str) -> str:
+    """非空格压缩：仅去非空白分隔符（`.` `-` `_` `*` 等），保留词间空格。
+    B4 RC2 修复：防止 `jail break`（含空格英文词组）被误融合为 `jailbreak`。
+    真实绕过 `jail-break` / `jail.break` 经此视图仍会变成 `jailbreak` 而被捕获。"""
+    return _NO_SPACE_SEPARATOR_RE.sub("", normalized)
+
+
+def _split_sentences(text: str) -> List[str]:
+    """按句末终止符切分为子句，用于限制带间隙模式跨句粘连（B4）。
+
+    切分规则：
+    - 英文 `.` `!` `?` 后跟空白才切（`chapters. Instructions` 切，`jail.break` 不切）
+    - 中文 `。` `！` `？` 直接切
+    - **不切裸换行**：换行绕过靠完整压缩视图处理
+
+    若切分后无有效子段则退回原文，绝不因切分而漏扫。
+    """
+    parts = [p for p in _SENTENCE_SPLIT_RE.split(text) if p and p.strip()]
+    return parts or [text]
 
 
 class PromptInjectionGuardrail(InputGuardrail):
@@ -116,13 +164,35 @@ class PromptInjectionGuardrail(InputGuardrail):
 
         # 两个视图：归一化串（保留词间空格）/ 压缩串（去掉全部空白与分隔符）
         normalized = _normalize_text(scan_text)
-        squeezed = _squeeze_text(normalized)
+
+        # B4 RC1 修复：按句末标点切分后逐句匹配，避免带间隙模式跨句把无关子句粘成误报。
+        # 逐句匹配是整段匹配的子集（只会减少命中），因此既能拆掉跨句误报，
+        # 又不会把句内注入（含 i g n o r e 这类加空格绕过）漏放。
+        segments = _split_sentences(normalized)
+
+        # B4 RC2 修复：jailbreak 类纯单词紧凑模式改用「非空格压缩」视图，
+        # 防止 jail break（普通英文短语）被压缩成 jailbreak 而误拦；
+        # jail-break / jail.break 等真实绕过仍能命中。
+        # doanythingnow 保持完整压缩（现有测试 L7 断言 `do anything now` 应被拦截，R1 不变更）。
+        _WORD_FUSION_PATTERNS = {
+            r"jailbreak(?:mode|prompt|now)?",
+        }
 
         matched: List[str] = []
         for pattern in self._compiled:
-            if pattern.search(normalized) or pattern.search(squeezed):
-                if pattern.pattern not in matched:
-                    matched.append(pattern.pattern)
+            if pattern.pattern in _WORD_FUSION_PATTERNS:
+                # RC2：只匹配归一化视图 + 非空格压缩视图，不用完整压缩
+                hit = any(
+                    pattern.search(seg) or pattern.search(_squeeze_text_nonspace(seg))
+                    for seg in segments
+                )
+            else:
+                hit = any(
+                    pattern.search(seg) or pattern.search(_squeeze_text(seg))
+                    for seg in segments
+                )
+            if hit and pattern.pattern not in matched:
+                matched.append(pattern.pattern)
 
         if matched:
             if self.block_on_match:

@@ -40,11 +40,19 @@ class OutputGuardrail(GuardrailBase):
         return GuardrailResult.reject(reason, metadata=metadata or {})
 
     def modify(self, modified_output: Any, reason: str = "", **metadata) -> GuardrailResult:
-        """返回修改后的输出结果，不拦截但替换内容。"""
+        """返回修改后的输出结果，不拦截但替换内容。
+
+        Args:
+            modified_output: 改写后的输出内容。
+            reason: 修改原因说明（写入 metadata["modify_reason"] 供审计/Trace 追溯）。
+            **metadata: 额外元数据键值对。
+        """
         if not self.allow_modify:
             raise GuardrailConfigError(f"护栏 '{self.name}' 不允许修改输出，请设置 allow_modify=True")
         metadata["modified_output"] = modified_output
         metadata["modified"] = True
+        if reason:
+            metadata["modify_reason"] = reason
         return GuardrailResult.allow(metadata=metadata)
 
 

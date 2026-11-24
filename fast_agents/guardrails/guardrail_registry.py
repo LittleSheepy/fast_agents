@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Union
 
+from .errors import GuardrailConfigError
+
 if TYPE_CHECKING:  # 仅为类型注解，避免与 guardrail_base 形成循环导入
     from .guardrail_base import GuardrailBase
 
@@ -43,7 +45,7 @@ class GuardrailRegistry:
         """登记一个护栏原型；同名时打印 warning 后覆盖（对齐 ToolRegistry.register_tool）。"""
         name = getattr(guardrail, "name", None)
         if not name:
-            raise ValueError(f"无法注册 {guardrail!r}：护栏必须有 name")
+            raise GuardrailConfigError(f"无法注册 {guardrail!r}：护栏必须有 name")
         if name in self._guardrails:
             logger.warning("[guardrail] 覆盖已注册的同名护栏原型: %s", name)
         self._guardrails[name] = guardrail

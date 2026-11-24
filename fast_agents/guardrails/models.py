@@ -27,7 +27,9 @@ class GuardrailResult(BaseModel):
         metadata: 附加元数据，用于日志、Trace 上报、上层异常 details 透传。
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+    # B3 修复：`extra="allow"` 会静默接受拼错的字段名（如 `alowd=True`），导致安全关键模型被绕过
+    # 改为 `extra="forbid"`，任何未声明字段立即抛 ValidationError
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     allowed: bool
     reason: str = ""
@@ -55,7 +57,8 @@ class ToolCallInfo(BaseModel):
         call_id: 工具调用 ID，用于链路追踪（对应 MsgToolCall.id）。
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+    # B3 修复：同上，防止 `tool_ars={...}` 这类拼错被静默接受
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     tool_name: str
     tool_args: Dict[str, Any] = Field(default_factory=dict)
@@ -75,7 +78,8 @@ class ToolResultInfo(BaseModel):
         metadata: 附加元数据（耗时、truncated 等）。
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+    # B3 修复：同上
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     tool_name: str
     success: bool

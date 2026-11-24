@@ -8,12 +8,14 @@
   被 ``execute`` 误伤、``remove_duplicate`` 被 ``remove`` 误伤的误判问题；
 - 仍保留关键词表作为**兜底**（仅在没有 tool_registry 传入时启用子串匹配，
   且全部对 tool_name 做词边界/分隔符分割后精确比较，不再无脑 ``keyword in name``）；
-- 敏感路径参数扫描保留，但可被显式关闭。
+- 敏感路径参数扫描保留，但可被显式关闭；扫描会**逐层展开**嵌套参数（B2 修复），
+  不再只看顶层 str 值。
 """
 from __future__ import annotations
 
+import os
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 from ..tool_call_guardrail import ToolCallGuardrail
 from ..models import GuardrailResult, ToolCallInfo
@@ -61,6 +63,77 @@ def _split_tool_name(name: str) -> Set[str]:
     return {p.lower() for p in parts if p}
 
 
+# 参数展开的容器类型（set / frozenset 无下标顺序，仅用于定位路径不稳定，不影响拦截判定）
+_CONTAINER_TYPES = (dict, list, tuple, set, frozenset)
+
+
+def _iter_arg_strings(value: Any, prefix: str = "") -> Iterator[Tuple[str, str]]:
+    """展开工具参数为 ``(定位路径, 字符串内容)`` 二元组序列（B2 修复）。
+
+    修复前 ``before_call`` 只对 ``tool_args.items()`` 的顶层 str 值做敏感路径匹配，
+    于是把路径藏进一层嵌套就完全绕过，探针实测全部静默放行：
+    ``{"payload": {"path": "/etc/passwd"}}``、``{"paths": ["/etc/shadow"]}``、
+    ``{"a": {"b": [{"c": "/proc/self/environ"}]}}``。
+
+    展开规则：
+    - dict：**键与值都扫**（``{"files": {"/etc/passwd": "r"}}`` 这类路径写在键上的同样要拦），
+      定位路径用 ``父.子``；
+    - list / tuple / set / frozenset：逐元素扫，定位路径带下标 ``paths[0]``；
+    - str 与 ``os.PathLike``：作为字符串产出（文件类工具传 Path 对象很常见，
+      ``skills/loader.py`` 的同类检查也显式接受 ``(str, Path)``）；
+    - 其余标量（int / float / bool / None）跳过，与修复前一致；
+    - 自引用参数按「当前分支已访问容器 id」剪枝，不会死循环。
+
+    两个刻意的设计取舍：
+    1. **用显式栈而非递归**：护栏自己报 RecursionError 会按 fail_open/fail_closed
+       把业务打成放行或全部拦截，观测/检查代码绝不能把主流程打挂；
+    2. **不设深度上限**：深度上限等于新递一个「藏到第 N+1 层就过关」的绕过口，
+       而栈遍历本身没有栈深风险，所以不限深度。
+
+    Args:
+        value: 参数根对象（正常是 dict，但非 dict 也能安全展开，不再因 ``.items()`` 报错）。
+        prefix: 定位路径前缀，顶层传空串使**顶层参数的 arg_name 与修复前完全一致**
+            （直接是参数名），既有 ``metadata["arg_name"]`` 契约不变。
+
+    Yields:
+        ``(arg_name, text)``：按先序遍历产出，与修复前的顶层扫描顺序一致，
+        多个命中时报告的仍是第一个。
+    """
+    # 栈元素：(待展值, 定位路径, 当前分支已访问的容器 id 元组)
+    stack: List[Tuple[Any, str, Tuple[int, ...]]] = [(value, prefix, ())]
+    while stack:
+        current, loc, branch_ids = stack.pop()
+        if isinstance(current, str):
+            yield loc, current
+            continue
+        if isinstance(current, os.PathLike):
+            try:
+                yield loc, os.fspath(current)
+            except Exception:
+                # 异常的 PathLike 实现不参与判定，也不能把主流程打挂
+                pass
+            continue
+        next_ids = branch_ids
+        if isinstance(current, _CONTAINER_TYPES):
+            container_id = id(current)
+            if container_id in branch_ids:
+                continue  # 自引用剪枝
+            # 只禁止「同一条分支上重复出现」，不影响兄弟分支合法引用同一对象
+            next_ids = branch_ids + (container_id,)
+        children: List[Tuple[Any, str, Tuple[int, ...]]] = []
+        if isinstance(current, dict):
+            for key, val in current.items():
+                child_loc = f"{loc}.{key}" if loc else str(key)
+                if isinstance(key, str):
+                    children.append((key, child_loc, next_ids))
+                children.append((val, child_loc, next_ids))
+        elif isinstance(current, _CONTAINER_TYPES):
+            for index, item in enumerate(current):
+                children.append((item, f"{loc}[{index}]", next_ids))
+        # 倒序入栈使弹出顺序等于原始顺序（保持先序，与修复前的顶层扫描行为一致）
+        stack.extend(reversed(children))
+
+
 class BasicPermissionGuardrail(ToolCallGuardrail):
     """基础工具权限护栏，拦截未授权的高危工具调用。
 
@@ -70,7 +143,7 @@ class BasicPermissionGuardrail(ToolCallGuardrail):
        为 True 则拦截（对齐 A9 / C6 单一事实源）；
     3. 否则用内置**精确**危险工具名清单匹配；
     4. 兜底关键词（拆词后精确比较，仅在 ``fallback_keyword_match=True`` 时启用，默认关闭）；
-    5. 参数里扫描敏感路径。
+    5. 参数里扫描敏感路径（逐层展开嵌套 dict / list / tuple / set、字典键与 Path 对象，B2）。
 
     高优先级（priority=15），在所有工具调用前最先执行。
     """
@@ -101,9 +174,10 @@ class BasicPermissionGuardrail(ToolCallGuardrail):
             check_sensitive_paths: 是否扫描工具参数里的敏感路径（默认 True）。
         """
         super().__init__(**_guardrail_kwargs)
-        self.blocked_names: Set[str] = set(n.lower() for n in (blocked_tool_names or DEFAULT_DANGEROUS_TOOL_NAMES))
-        self.sensitive_paths: Set[str] = set(sensitive_paths or DEFAULT_SENSITIVE_PATHS)
-        self.allowed_tools: Set[str] = set(n.lower() for n in (allowed_dangerous_tools or set()))
+        # B1 修复：改用 `is not None` 判断，避免空集合被 `or` 运算符替换为默认值
+        self.blocked_names: Set[str] = set(n.lower() for n in (blocked_tool_names if blocked_tool_names is not None else DEFAULT_DANGEROUS_TOOL_NAMES))
+        self.sensitive_paths: Set[str] = set(sensitive_paths if sensitive_paths is not None else DEFAULT_SENSITIVE_PATHS)
+        self.allowed_tools: Set[str] = set(n.lower() for n in (allowed_dangerous_tools if allowed_dangerous_tools is not None else set()))
         self.tool_registry = tool_registry
         self.fallback_keyword_match = fallback_keyword_match
         self.check_sensitive_paths = check_sensitive_paths
@@ -186,17 +260,17 @@ class BasicPermissionGuardrail(ToolCallGuardrail):
                     metadata={"risk_type": "dangerous_tool", "match": "fallback_keyword", "matched": sorted(hit)},
                 )
 
-        # 5) 检查参数中的敏感路径
+        # 5) 检查参数中的敏感路径（B2 修复：不再只看顶层 str 值，嵌套参数同样扫到；
+        #    顶层命中的 reason 文案与 metadata 字段与修复前逐字节一致）
         if self.check_sensitive_paths:
-            for arg_name, arg_value in tool_call.tool_args.items():
-                if isinstance(arg_value, str):
-                    arg_lower = arg_value.lower()
-                    for path in self.sensitive_paths:
-                        if path.lower() in arg_lower:
-                            return GuardrailResult.reject(
-                                f"工具参数中包含敏感路径访问：{path}",
-                                metadata={"risk_type": "sensitive_path", "path": path, "arg_name": arg_name},
-                            )
+            for arg_name, arg_text in _iter_arg_strings(tool_call.tool_args):
+                arg_lower = arg_text.lower()
+                for path in self.sensitive_paths:
+                    if path.lower() in arg_lower:
+                        return GuardrailResult.reject(
+                            f"工具参数中包含敏感路径访问：{path}",
+                            metadata={"risk_type": "sensitive_path", "path": path, "arg_name": arg_name},
+                        )
 
         return GuardrailResult.allow()
 
