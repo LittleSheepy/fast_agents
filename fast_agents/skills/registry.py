@@ -421,7 +421,7 @@ class SkillRegistry:
 
         # 1. 框架版本检查
         try:
-            from ... import __version__ as framework_version
+            from ..version import __version__ as framework_version
         except Exception:
             framework_version = "0.0.0"
         fw_ver = self._parse_version(framework_version)
