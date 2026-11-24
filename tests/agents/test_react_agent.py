@@ -539,6 +539,126 @@ def test_parallel_return_direct_short_circuits():
     print("✅ test_parallel_return_direct_short_circuits passed")
 
 
+# ==================== A2：输出护栏与 run() 取值的时序 ====================
+
+def _a2_mask_middleware():
+    """一条把手机号脱敏的输出护栏中间件（modify 语义）。"""
+    from fast_agents.agents.middleware import AgentMiddleware
+    from fast_agents.guardrails import GuardrailModified
+
+    class _MaskOutput(AgentMiddleware):
+        def after_agent_run(self, answer, context=None):
+            if "13800138000" in str(answer):
+                return GuardrailModified(
+                    phase="output",
+                    content=str(answer).replace("13800138000", "138****0000"),
+                )
+            return None
+
+    return _MaskOutput()
+
+
+def _a2_block_middleware():
+    """一条整段拦截的输出护栏中间件（reject 语义）。"""
+    from fast_agents.agents.middleware import AgentMiddleware
+    from fast_agents.guardrails import GuardrailBlocked
+
+    class _BlockOutput(AgentMiddleware):
+        def after_agent_run(self, answer, context=None):
+            return GuardrailBlocked(phase="output", message="输出被安全护栏拦截。")
+
+    return _BlockOutput()
+
+
+def test_a2_run_returns_masked_answer_not_raw_text():
+    """A2 修复：输出护栏脱敏后，run() 必须返回护栏后正文。
+
+    旧实现优先拼接流式 text 增量，而护栏在 text 产出之后才跑，导致 run() 把
+    未脱敏的原文直接交给调用方（非流式路径也绕过输出护栏）。
+    """
+    raw = "联系人手机号是 13800138000"
+    masked = "联系人手机号是 138****0000"
+
+    def _build():
+        llm = MockLLM([Message("assistant", raw)])
+        mem = MemoryManager(llm=llm)
+        agent = ReActAgent("脱敏助手", llm, memory=mem,
+                           enable_skills=False, middleware=[_a2_mask_middleware()])
+        return agent, mem
+
+    assert _build()[0].run("查一下联系人") == masked, "run() 仍返回未脱敏原文（A2 未修）"
+
+    # 流式侧的剩余限制（本轮不修，已写进 docstring / 文档）：text 增量在护栏前发出
+    agent_s, _mem_s = _build()
+    chunks = list(agent_s.run_stream("查一下联系人"))
+    leaked = "".join(c.text for c in chunks if c.type == "text")
+    end = [c for c in chunks if c.type == "end"][0]
+    assert leaked == raw, f"流式 text 增量仍为原文（A2 流式侧限制，调用方需自己累加到 end）: {leaked!r}"
+    assert end.content == masked, f"end 事件应携带脱敏后正文: {end.content!r}"
+
+    # 护栏同样生效于沉淀回短期记忆的文本（_remember 在护栏之后拿到的已是改写结果）
+    agent_m, mem = _build()
+    agent_m.run("查一下联系人")
+    stored = " ".join(str(getattr(m, "content", "")) for m in mem.buffer.get_messages())
+    assert masked in stored and raw not in stored, \
+        f"记忆应沉淀护栏后文本，实际: {stored!r}"
+    print("✅ test_a2_run_returns_masked_answer_not_raw_text passed")
+
+
+def test_a2_run_returns_block_message_when_output_rejected():
+    """A2 修复（拦截场景）：输出被整段拦截时，run() 返回拦截文案而不是原文。"""
+    raw = "这整段都不应该被输出"
+
+    def _build():
+        llm = MockLLM([Message("assistant", raw)])
+        return ReActAgent("拦截助手", llm, memory=MemoryManager(llm=llm),
+                          enable_skills=False, middleware=[_a2_block_middleware()])
+
+    assert _build().run("讲点违规的") == "输出被安全护栏拦截。", "run() 未返回拦截文案"
+
+    chunks = list(_build().run_stream("讲点违规的"))
+    end = [c for c in chunks if c.type == "end"][0]
+    assert end.finish_reason == "guardrail_block", \
+        f"拦截时 end.finish_reason 应为 guardrail_block，实际 {end.finish_reason!r}"
+    assert end.content == "输出被安全护栏拦截。"
+    print("✅ test_a2_run_returns_block_message_when_output_rejected passed")
+
+
+def test_a2_run_returns_final_round_answer_drops_preamble_text():
+    """A2 行为变化（显式钉住）：多轮工具时 run() 返回「最终答案」，不再拼入过渡语。
+
+    这是修 A2 带来的必然取舍：护栏只能作用于最终答案，所以 run() 的语义
+    从「本轮所有 text 增量拼接」收敛为「end 事件携带的最终答案」，与
+    OpenAI Agents SDK 的 final_output 取向一致。旧行为会把「我先查一下」这类
+    工具轮次的过渡语一并当成答案返回，本身就不是「最终答案」。
+    """
+    reg = ToolRegistry()
+    reg.register_tool(CalculatorTool())
+
+    llm = MockLLM([
+        Message("assistant", "我先算一下。",
+                tool_calls=[MsgToolCall(name="python_calculator", arguments='{"expression": "6*7"}', id="c1")]),
+        Message("assistant", "最终答案是 42。"),
+    ])
+    agent = ReActAgent("过渡语助手", llm, tool_registry=reg, memory=MemoryManager(llm=llm),
+                       enable_skills=False)
+    answer = agent.run("6*7 等于多少")
+
+    assert answer == "最终答案是 42。", f"run() 应只返回最终答案，实际 {answer!r}"
+    assert "我先算一下" not in answer, "过渡语不应再混进 run() 的返回值"
+    # 流式调用方仍然能看到过渡语（没有丢块）
+    llm2 = MockLLM([
+        Message("assistant", "我先算一下。",
+                tool_calls=[MsgToolCall(name="python_calculator", arguments='{"expression": "6*7"}', id="c1")]),
+        Message("assistant", "最终答案是 42。"),
+    ])
+    agent2 = ReActAgent("过渡语助手", llm2, tool_registry=reg, memory=MemoryManager(llm=llm2),
+                        enable_skills=False)
+    texts = "".join(c.text for c in agent2.run_stream("6*7 等于多少") if c.type == "text")
+    assert texts == "我先算一下。最终答案是 42。", f"流式 text 增量不得丢块：{texts!r}"
+    print("✅ test_a2_run_returns_final_round_answer_drops_preamble_text passed")
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -555,6 +675,9 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
+    test_a2_run_returns_masked_answer_not_raw_text()  # A2 修复：run() 返回护栏后正文
+    test_a2_run_returns_block_message_when_output_rejected()  # A2 修复：拦截场景 + finish_reason 标记
+    test_a2_run_returns_final_round_answer_drops_preamble_text()  # A2 行为变化：不再拼过渡语
     test_parallel_and_sequential_tool_paths_are_consistent()  # AI新加的测试
     test_parallel_return_direct_short_circuits()  # AI新加的测试
 

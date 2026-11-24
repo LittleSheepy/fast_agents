@@ -692,6 +692,277 @@ def test_transport_t7_stdio_close_idempotent_and_no_zombie():
     t.close()
 
 
+# ─── t8 make_stdio_transport 剥离 Windows 残留引号（v3.3.2 缺陷修复回归）───
+def test_transport_t8_make_stdio_transport_strips_wrapping_quotes():
+    """回归缺陷：Windows 上 shlex.split(posix=False) 会保留引号字符，
+    修复前 '"exe" "script"' 形式的命令串切分后 token 带字面引号，
+    Popen 报 FileNotFoundError（test_8 当时因此红灯）。
+    修复后：token 与原始路径逐字节相等，且能真实拉起子进程完成握手。"""
+    from fast_agents.mcp.transports import make_stdio_transport
+    py = sys.executable
+    echo = _server_path()
+    t = make_stdio_transport(_cmd_str())  # '"{py}" "{echo}"'
+    # 不应残留任何字面引号，且内容与原路径逐字节一致
+    assert t.command == py, f"command 残留引号：{t.command!r}"
+    assert t.args == [echo], f"args 残留引号：{t.args!r}"
+    # 真实启动 + 一次完整握手（离线 stdio 服务器）
+    c = MCPClient(t)
+    try:
+        c.connect(timeout=10)
+        tools = c.list_tools()
+        assert any(tool.name == "echo" for tool in tools)
+    finally:
+        c.close()
+    # 纯引号 / 空串命令提前报友好错误，不再泄漏到 Popen
+    with raises(MCPConnectionError):
+        make_stdio_transport('""')
+    with raises(MCPConnectionError):
+        make_stdio_transport("")
+
+
+def test_transport_t9_reconnect_drains_stale_queue():
+    """回归隐患1（v3.3.7）：StdioTransport 实例被复用重连时，connect() 此前只重置
+    _closed/_proc，却不清空 _queue 与 stderr ring——上一会话残留的 "_event: disconnected"
+    哨兵会让新客户端首次 recv 直接误判「连接已断开」，旧响应还可能与新请求 id 撞号错配。
+    修复后 connect() 先 _drain_queue + 清 stderr_buf。离线、不依赖真实握手响应。"""
+    py = sys.executable
+    t = StdioTransport(command=py, args=[_server_path()])
+    # 预置脏状态：模拟上一会话遗留在队列里的断开哨兵 + 一条旧响应 + stderr 残留
+    t._queue.put({"_event": "disconnected", "error": "STALE-OLD-SESSION"})
+    t._queue.put({"jsonrpc": "2.0", "id": 1, "result": {"stale": True}})
+    with t._stderr_lock:
+        t._stderr_buf.append("STALE-STDERR-LINE")
+    t.connect()  # drain 在启动读线程之前同步完成
+    try:
+        # echo_server 未收到 stdin 不会写 stdout，故此刻队列必须为空（脏哨兵已清）——
+        # 关键断言：不能残留上一会话的 disconnected 哨兵，否则新会话 recv 立刻误报断开
+        assert t._queue.empty(), f"重连后队列未清空：{list(t._queue.queue)}"
+        # stderr ring 也已清空，不把上一进程报错混进本次排查
+        assert "STALE-STDERR-LINE" not in t.get_last_stderr(), "stderr ring 未清空"
+    finally:
+        t.close()
+
+
+# ==================== P4 批量打磨修复回归测试（v3.3.6）====================
+
+# ─── p1 #5：as_messages 的 role_prefix 死参数生效 ───
+def test_polish_p1_as_messages_role_prefix_takes_effect():
+    """回归：GetPromptResult.as_messages 的 role_prefix 参数此前从未被使用（死参数）。
+    修复后：无参（默认 False）与旧行为逐字节一致；True 时 content 前缀 "[role] "。"""
+    from fast_agents.mcp.models import GetPromptResult, PromptMessage
+    gpr = GetPromptResult(description="d", messages=[
+        PromptMessage(role="user", content={"type": "text", "text": "hello"}),
+        PromptMessage(role="assistant", content={"type": "text", "text": "hi there"}),
+    ])
+    std = gpr.as_messages()
+    assert std == [{"role": "user", "content": "hello"},
+                   {"role": "assistant", "content": "hi there"}], "默认输出必须与旧版一致"
+    prefixed = gpr.as_messages(role_prefix=True)
+    assert prefixed[0]["content"] == "[user] hello"
+    assert prefixed[1]["content"] == "[assistant] hi there"
+    assert [m["role"] for m in prefixed] == ["user", "assistant"], "role 字段仍独立保留"
+
+
+# ─── p2 #7：_closed 从只写不读变为拦截 connect ───
+def test_polish_p2_closed_registry_blocks_connect():
+    """回归：MCPRegistry._closed 此前只写不读（死标记），close_all() 后仍能 sneak 新连接。
+    现在 close_all() 后 connect 拒绝并抛 MCPError；未 close_all 时 close 单个后仍可重连（不受影响）。"""
+    reg = MCPRegistry()
+    reg.add_stdio_cmd("p2_srv", _cmd_str())
+    reg.connect_all(timeout=10)
+    assert "p2_srv" in reg.clients
+    reg.close_all()
+    with raises(MCPError):
+        reg.connect("p2_srv")
+    # connect_all 走 connect 被拦，只降级为 warning，不产生新连接
+    reg.connect_all(timeout=10)
+    assert "p2_srv" not in reg.clients
+    # 反向对照：没有 close_all 时，单个 close 后重连照常合法
+    reg2 = MCPRegistry()
+    reg2.add_stdio_cmd("tmp", _cmd_str())
+    reg2.connect("tmp", timeout=10)
+    reg2.close("tmp")
+    reg2.connect("tmp", timeout=10)
+    assert "tmp" in reg2.clients
+    reg2.close_all()
+
+
+# ─── p3 #8：卸载兜底扫描尊重自定义 prefix_sep ───
+def test_polish_p3_unregister_fallback_honors_custom_prefix_sep():
+    """回归：_unregister_one 的兜底前缀扫描此前硬编码 "__"，用户用自定义分隔符
+    注册的历史残留清不掉。抹去记账、只留兜底路径，验证自定义分隔符下残留被清。"""
+    client = _spawn_client()
+    try:
+        client.connect(timeout=10)
+        reg = MCPRegistry()
+        reg._clients["demo"] = client
+        reg._tools["demo"] = client.list_tools(timeout=10)
+        tr = ToolRegistry()
+        reg.register_into(tr, prefix_sep="_", expand="fine")  # 工具名形如 demo_echo
+        names = list(tr.list_names())
+        assert "demo_echo" in names and all("__" not in n for n in names)
+        # 抹掉记账，强制只走兜底前缀扫描
+        reg._registered_names["demo"] = []
+        removed = reg.unregister_from(tr)
+        assert "demo_echo" in removed, "自定义分隔符的残留未被兜底扫描清除"
+        assert not tr.has_tool("demo_echo")
+    finally:
+        client.close()
+
+
+# ─── p4 #9：_json_resolved 响应消费后即清，不再只增不清 ───
+def test_polish_p4_json_resolved_pruned_on_recv():
+    """回归：StreamableHTTPTransport._json_resolved 此前只增不清（长驻进程慢速泄漏）。
+    现在响应被 recv 消费后对应 id 标记立即移除。不起真服务，直接操作队列验证。"""
+    t = StreamableHTTPTransport(url="http://127.0.0.1:1")  # 不 connect，仅验证消费逻辑
+    t._json_resolved.add(101)
+    t._queue.put({"jsonrpc": "2.0", "id": 101, "result": {"ok": True}})
+    msg = t.recv(timeout=2.0)
+    assert msg is not None and msg["id"] == 101
+    assert 101 not in t._json_resolved, "响应消费后应清除 id 标记"
+
+
+# ─── p5 #10 + 根因：list_changed 刷新真正生效且同步粗粒度门脸索引 ───
+def test_polish_p5_list_changed_refresh_works_and_updates_coarse_gate():
+    """回归（v3.3.6 两层）：
+    ①根因——list_changed handler 此前在客户端读线程内同步执行刷新，而刷新要再发
+      请求、响应只有读线程自己消费 → 自死锁直到超时，自动刷新从未生效（探针实证）；
+      现刷新甩到独立线程。
+    ②#10——刷新后已注册粗粒度门脸的旧快照索引同步，新增子工具可调。"""
+    state = {"n": 0}
+
+    def responder(msg):
+        m = msg["method"]
+        if m == "tools/list":
+            state["n"] += 1
+            tools = [{"name": "echo", "description": "e", "inputSchema": {}}]
+            if state["n"] > 1:  # 刷新后服务器多了一个子工具
+                tools.append({"name": "extra", "description": "x", "inputSchema": {}})
+            return {"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": tools}}
+        if m == "tools/call":
+            return {"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "content": [{"type": "text", "text": "ok-extra"}], "isError": False}}
+        return {"jsonrpc": "2.0", "id": msg["id"], "result": {}}
+
+    t = FakeTransport()  # auto_init：capabilities.tools.listChanged=True
+    t.responder = responder
+    client = MCPClient(t)
+    reg = MCPRegistry()
+    reg._factories["fx"] = lambda: client
+    try:
+        reg.connect("fx", timeout=5)
+        tr = ToolRegistry()
+        reg.register_into(tr, expand="coarse")
+        # 服务端新增工具并推送 list_changed（读线程收到后应甩独立线程刷新）
+        t.push({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        deadline = time.time() + 6.0
+        while time.time() < deadline and not any(x.name == "extra" for x in reg._tools["fx"]):
+            time.sleep(0.05)
+        # ①刷新链路本身生效（修复前此处自死锁超时，缓存永远停在旧列表）
+        assert any(x.name == "extra" for x in reg._tools["fx"]), "list_changed 后缓存未刷新"
+        # ②粗粒度门脸索引同步（修复前门脸只存旧快照，报「不存在」）
+        res = tr.invoke_tool("mcp__fx", action="call_tool", tool_name="extra")
+        assert res.succeeded and "ok-extra" in res.output, f"门脸索引未同步：{res.output}"
+    finally:
+        reg.close_all()
+
+
+# ==================== Registry 声明式配置 env 透传测试（v3.3.5）====================
+
+# ─── r1 command_str 形态的 env 透传（缺陷修复回归）───
+def test_registry_r1_command_str_env_transparent_to_subprocess():
+    """回归缺陷：add_config 走 command_str 分支时此前不透传 config.env，
+    声明式配置的环境变量被静默丢弃（探针 P-D 实证）；add_stdio_cmd /
+    make_stdio_transport 此前也没有 env 入参。现三层透传，不传 env 行为不变。
+    """
+    probe_key = "FAST_AGENTS_MCP_ENV_PROBE"
+    cmd = _cmd_str()  # '"{py}" "{echo_server}"'
+
+    # 1) add_stdio_cmd 直接传 env → 工厂造出的 transport 含该变量
+    reg = MCPRegistry()
+    reg.add_stdio_cmd("env_direct", cmd, env={probe_key: "42"})
+    t1 = reg.factories["env_direct"]().transport
+    assert t1.env.get(probe_key) == "42", f"env 未透传：{list(t1.env)!r}"
+
+    # 2) 声明式 MCPConfig.stdio_cmd(env=...) → add_config 透传
+    reg2 = MCPRegistry()
+    reg2.add_config(MCPConfig.stdio_cmd("env_cfg", cmd, env={probe_key: "7"}))
+    t2 = reg2.factories["env_cfg"]().transport
+    assert t2.env.get(probe_key) == "7", f"声明式 env 被丢弃：{list(t2.env)!r}"
+
+    # 3) 不传 env → 不加额外键（默认行为逐字节不变）
+    reg3 = MCPRegistry()
+    reg3.add_stdio_cmd("env_none", cmd)
+    assert probe_key not in reg3.factories["env_none"]().transport.env
+
+    # 4) 带 env 真实拉起服务器并完成握手 + 工具调用（env 不破坏启动链路）
+    reg4 = MCPRegistry()
+    reg4.add_stdio_cmd("env_live", cmd, env={probe_key: "1"})
+    client = reg4.connect("env_live", timeout=10)
+    try:
+        assert any(tool.name == "echo" for tool in client.list_tools())
+    finally:
+        reg4.close("env_live")
+
+
+def test_registry_r2_tools_capability_guard_and_connect_rollback():
+    """回归发现1（v3.3.7）：
+    1) 未声明 tools 能力的合规 server（规范要求对 tools/list 回 -32601）此前会让
+       registry.connect 报错且 client 残留半初始化脏状态；现对齐 list_resources /
+       list_prompts 的能力保护，返回空工具列表且资源缓存照常加载。
+    2) 缓存加载任一步失败（构造声明了 tools 能力但挂起不响应的 server 触发超时），
+       connect 整体回滚：client 关闭、摘出 _clients，异常照常上抛。
+    用严格合规的内联假 server（不复用仓库示例，避免 fixture 迎合客户端缺陷）。"""
+    import tempfile
+    server_code = r'''
+import sys, json
+mode = sys.argv[1] if len(sys.argv) > 1 else "res_only"
+def send(o): sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
+caps = {"resources": {}} if mode == "res_only" else {"tools": {}}
+while True:
+    line = sys.stdin.readline()
+    if not line: break
+    try: req = json.loads(line)
+    except Exception: continue
+    m, rid = req.get("method"), req.get("id")
+    if m == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2024-11-05",
+             "serverInfo": {"name": mode}, "capabilities": caps}})
+    elif m == "resources/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"resources": [{"uri": "file:///a.txt", "name": "a"}]}})
+    elif m == "tools/list":
+        # res_only：未声明能力按规范回 -32601；hang：声明了能力但挂起不响应，模拟异常 server
+        if mode != "hang":
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+    elif rid is not None:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "Method not found"}})
+'''
+    with tempfile.TemporaryDirectory() as td:
+        srv = os.path.join(td, "fake_server.py")
+        with open(srv, "w", encoding="utf-8") as f:
+            f.write(server_code)
+        py = sys.executable
+
+        # 1) 无 tools 能力的合规 server：connect 成功，工具空，资源缓存照常
+        reg = MCPRegistry()
+        reg.add_stdio("res_only", py, [srv, "res_only"])
+        client = reg.connect("res_only", timeout=10)
+        try:
+            assert reg.list_tools("res_only")["res_only"] == [], "未声明能力时工具应为空列表"
+            res = reg.list_resources("res_only")["res_only"]
+            assert len(res) == 1 and res[0].uri == "file:///a.txt", f"资源缓存异常：{res}"
+        finally:
+            reg.close_all()
+
+        # 2) 声明 tools 能力但挂起不响应 → list_tools 超时 → connect 回滚不留脏状态
+        reg2 = MCPRegistry()
+        reg2.add_stdio("hang", py, [srv, "hang"])
+        with raises(MCPError):
+            reg2.connect("hang", timeout=1.5)
+        assert "hang" not in reg2.clients, "失败后 client 必须被摘出 _clients（不得残留脏状态）"
+        reg2.close_all()
+
+
 # ==================== v3.1.0 schema_to_pydantic 增强专项测试 ====================
 
 class MockMCPClientForSchema:
@@ -997,6 +1268,62 @@ def test_schema_c11_empty_schema_compatibility():
     assert adapter3.args_schema is not None
 
 
+# ─── c12 嵌套对象缓存键全量语义（v3.3.4 缺陷修复回归）───
+def test_schema_c12_nested_objects_same_shape_different_required():
+    """回归缺陷：嵌套对象缓存键此前只含 str(properties)，不含同级 required。
+
+    同一 schema 里两个 properties 完全一致、必填集合不同的嵌套对象，后者会复用
+    前者的模型：必填字段被静默降级为可选（校验绕过），或可选字段被误强制必填
+    （合法调用被拒），双向都错（探针 P-C 实证）。
+    """
+    shared_props = {"name": {"type": "string"}, "age": {"type": "integer"}}
+
+    # 方向一：先处理的必填多（owner）→ 后处理的 guest 可选字段被误强制必填
+    tool_req_first = _make_tool_info("t_req_first", {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "object", "properties": dict(shared_props), "required": ["name", "age"]},
+            "guest": {"type": "object", "properties": dict(shared_props), "required": ["name"]},
+        },
+        "required": ["owner", "guest"],
+    })
+    s1 = MCPToolAdapter(client=MockMCPClientForSchema(), server_name="s", tool_info=tool_req_first).args_schema
+    # owner 缺 age 必须报错（必填）
+    with raises(Exception):
+        s1(owner={"name": "a"}, guest={"name": "b", "age": 2})
+    # guest 缺 age 合法（修复前命中 owner 模型被误拦）
+    s1(owner={"name": "a", "age": 1}, guest={"name": "b"})
+
+    # 方向二：先处理的必填少（guest）→ 后处理的 owner 必填字段被静默降级
+    tool_opt_first = _make_tool_info("t_opt_first", {
+        "type": "object",
+        "properties": {
+            "guest": {"type": "object", "properties": dict(shared_props), "required": ["name"]},
+            "owner": {"type": "object", "properties": dict(shared_props), "required": ["name", "age"]},
+        },
+        "required": ["guest", "owner"],
+    })
+    s2 = MCPToolAdapter(client=MockMCPClientForSchema(), server_name="s", tool_info=tool_opt_first).args_schema
+    # owner 缺 age 必须报错（修复前复用 guest 模型直接放行）
+    with raises(Exception):
+        s2(guest={"name": "b"}, owner={"name": "a"})
+    # 齐全时合法
+    s2(guest={"name": "b"}, owner={"name": "a", "age": 2})
+
+    # 缓存仍生效：结构完全一致的两个嵌套对象复用同一模型类（不能因修键把缓存弄没）
+    tool_same = _make_tool_info("t_same", {
+        "type": "object",
+        "properties": {
+            "x": {"type": "object", "properties": dict(shared_props), "required": ["name"]},
+            "y": {"type": "object", "properties": dict(shared_props), "required": ["name"]},
+        },
+        "required": ["x", "y"],
+    })
+    s3 = MCPToolAdapter(client=MockMCPClientForSchema(), server_name="s", tool_info=tool_same).args_schema
+    inst = s3(x={"name": "a"}, y={"name": "b"})
+    assert type(inst.x) is type(inst.y), "结构完全一致的嵌套对象应复用同一模型类（缓存未被改没）"
+
+
 def _rp_server_path() -> str:
     """Resources/Prompts 示例服务器路径"""
     return str(Path(__file__).resolve().parents[2] / "examples/mcp/resources_prompts_server.py")
@@ -1208,6 +1535,74 @@ def test_d10_unsupported_server_returns_empty_lists():
         assert client.list_prompts() == []
     finally:
         client.close()
+
+
+# ─── d11 资源模板规范方法名 + MethodNotFound 降级（v3.3.3 缺陷修复回归）───
+def test_d11_list_resource_templates_uses_spec_method():
+    """回归缺陷：list_resource_templates 此前误调 resources/list。
+
+    规范要求模板由独立方法 resources/templates/list 返回；合规服务器不会在
+    resources/list 响应里塞 resourceTemplates，导致本方法永远为空（此前仓内
+    示例 server 恰好同样不规范地混返，联合掩盖了问题）。
+    同时验证：声明 resources 能力但未实现本方法（-32601）时降级空列表不打断
+    上层流程；其他错误码照抛且 MCPCallError.error_code 携带 JSON-RPC 错误码。
+    """
+    from fast_agents.mcp.errors import MCPCallError
+
+    def _ok_responder(msg):
+        m = msg["method"]
+        if m == "initialize":
+            return {"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "spec-fake", "version": "0"},
+                "capabilities": {"resources": {}},
+            }}
+        if m == "resources/templates/list":
+            return {"jsonrpc": "2.0", "id": msg["id"], "result": {
+                "resourceTemplates": [{"uriTemplate": "file://{path}", "name": "本地文件"}],
+            }}
+        return {"jsonrpc": "2.0", "id": msg["id"], "result": {}}
+
+    # 1) 规范合规服务器：必须走 resources/templates/list，不再调 resources/list
+    t = FakeTransport(auto_init=False)
+    t.responder = _ok_responder
+    c = MCPClient(t)
+    c.connect()
+    templates = c.list_resource_templates()
+    assert len(templates) == 1 and templates[0].uriTemplate == "file://{path}"
+    assert "resources/templates/list" in t.sent_methods()
+    assert "resources/list" not in t.sent_methods(), "不应再调 resources/list 拿模板"
+    c.close()
+
+    # 2) 声明了 resources 能力但未实现模板方法（-32601）→ 降级空列表，不抛错
+    def _501_responder(msg):
+        if msg["method"] == "resources/templates/list":
+            return {"jsonrpc": "2.0", "id": msg["id"],
+                    "error": {"code": -32601, "message": "Method not found"}}
+        return _ok_responder(msg)
+
+    t2 = FakeTransport(auto_init=False)
+    t2.responder = _501_responder
+    c2 = MCPClient(t2)
+    c2.connect()
+    assert c2.list_resource_templates() == []
+    c2.close()
+
+    # 3) 其他错误码照抛，且异常携带 error_code 供调用方区分
+    def _503_responder(msg):
+        if msg["method"] == "resources/templates/list":
+            return {"jsonrpc": "2.0", "id": msg["id"],
+                    "error": {"code": -32603, "message": "boom"}}
+        return _ok_responder(msg)
+
+    t3 = FakeTransport(auto_init=False)
+    t3.responder = _503_responder
+    c3 = MCPClient(t3)
+    c3.connect()
+    with raises(MCPCallError) as ei:
+        c3.list_resource_templates()
+    assert ei.value.error_code == -32603
+    c3.close()
 
 
 # ==================== Streamable HTTP 测试（v3.3.0）====================
@@ -1473,12 +1868,14 @@ def main_of_new_add():
     failed += run_prefix(globals(), "test_client_b")
     failed += run_prefix(globals(), "test_transport_t")
     failed += run_prefix(globals(), "test_schema_c")
+    failed += run_prefix(globals(), "test_polish_p")
+    failed += run_prefix(globals(), "test_registry_r")
     failed += run_prefix(globals(), "test_d")
     failed += run_prefix(globals(), "test_streamable_http_e")
     failed += run_prefix(globals(), "test_multimodal_f")
     if failed:
         raise SystemExit(failed)
-    print("✅ main_of_new_add：新增 MCP v3.1/v3.2/v3.3/v3.3.1 客户端/传输层/Schema/Resources-Prompts/StreamableHTTP/多模态 测试全部通过")
+    print("✅ main_of_new_add：新增 MCP v3.1~v3.3.6 客户端/传输层/Schema/Resources-Prompts/StreamableHTTP/多模态/Registry env/P4 打磨 测试全部通过")
 
 
 if __name__ == "__main__":
