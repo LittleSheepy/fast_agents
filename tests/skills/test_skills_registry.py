@@ -1072,6 +1072,85 @@ def test_c8_5_list_conflicts_api():
 # ==================== 入口 ====================
 
 
+def test_bug10_disabled_skill_blocked_on_level3_entries():
+    """【Bug10修复】技能被禁用后，Level 3 入口（run_script / read_reference / read_asset）
+    不得再执行脚本或读出内容；registry API 与 LLM 工具两条路径都要拦，重新启用后恢复。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        skill_dir = _make_script_skill(tmpdir, "bug10-skill", [], "danger.py", "print('BOOM-RAN')")
+        (skill_dir / "references").mkdir()
+        (skill_dir / "references" / "note.md").write_text("SECRET-NOTE\n", encoding="utf-8")
+        (skill_dir / "assets").mkdir()
+        (skill_dir / "assets" / "data.txt").write_text("SECRET-ASSET\n", encoding="utf-8")
+
+        reg = SkillRegistry(extra_skill_paths=[tmpdir], include_default_paths=False)
+        reg.scan()
+        # 禁用前：三个入口正常工作（行为不回退）
+        assert "BOOM-RAN" in reg.run_script("bug10-skill", "danger.py", {"a": "x"})
+        assert "SECRET-NOTE" in reg.read_reference("bug10-skill", "note.md")
+        assert "SECRET-ASSET" in reg.read_asset("bug10-skill", "data.txt")
+
+        assert "已禁用" in reg.disable_skill("bug10-skill")
+        # 禁用后：不得执行、不得泄内容，并给出与 load_skill 同句式的提示
+        for out in (
+            reg.run_script("bug10-skill", "danger.py", {"a": "x"}),
+            reg.read_reference("bug10-skill", "note.md"),
+            reg.read_asset("bug10-skill", "data.txt"),
+        ):
+            assert "BOOM-RAN" not in out and "SECRET-" not in out, f"禁用后仍执行/读出: {out}"
+            assert "已被禁用" in out and "enable_skill" in out, f"禁用提示文案不对: {out}"
+
+        # LLM 工具层同样拦截（工具直转 registry 方法）
+        tools = {f.__name__: f for f in reg.get_tools()}
+        assert "BOOM-RAN" not in tools["run_skill_script"]("bug10-skill", "danger.py", {"a": "x"})
+        assert "SECRET-" not in tools["read_skill_reference"]("bug10-skill", "note.md")
+        assert "SECRET-" not in tools["read_skill_asset"]("bug10-skill", "data.txt")
+
+        # 重新启用后恢复可用
+        reg.enable_skill("bug10-skill")
+        assert "BOOM-RAN" in reg.run_script("bug10-skill", "danger.py", {"a": "x"})
+    print("✅ test_bug10_disabled_skill_blocked_on_level3_entries 通过")
+
+
+def test_bug10_disabled_code_skill_blocked_on_execute_and_tag_disable():
+    """【Bug10修复】代码型技能的 execute_skill / aexecute_skill 受禁用约束（同步与异步一致），
+    按 tag 批量禁用同样拦截；不存在的技能与未禁用技能行为不变。"""
+    import asyncio
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        _make_skill_dir(tmpdir, "tagged-s", {
+            "name": "tagged-s", "description": "带标签技能", "version": "1.0.0", "tags": ["dev"],
+        })
+        reg = SkillRegistry(extra_skill_paths=[tmpdir], include_default_paths=False)
+        reg.scan()
+
+        @skill(name="bug10-code", description="代码型技能")
+        def bug10_code():
+            return "CODE-EXECUTED"
+
+        reg.register(bug10_code)
+        # 未禁用：正常执行
+        assert reg.execute_skill("bug10-code") == "CODE-EXECUTED"
+        assert asyncio.run(reg.aexecute_skill("bug10-code")) == "CODE-EXECUTED"
+        # 单个禁用：同步与异步入口都拦
+        reg.disable_skill("bug10-code")
+        assert "CODE-EXECUTED" not in str(reg.execute_skill("bug10-code"))
+        assert "CODE-EXECUTED" not in str(asyncio.run(reg.aexecute_skill("bug10-code")))
+        assert "已被禁用" in str(reg.execute_skill("bug10-code"))
+        reg.enable_skill("bug10-code")
+        assert reg.execute_skill("bug10-code") == "CODE-EXECUTED"
+        # 按 tag 禁用：Level 3 文件型入口同样拦截
+        assert "tagged-s" in reg.disable_skills_by_tag("dev")
+        assert "已被禁用" in reg.read_reference("tagged-s", "a.md")
+        assert "已被禁用" in str(reg.execute_skill("tagged-s"))
+        reg.enable_skills_by_tag("dev")
+        assert "已被禁用" not in reg.read_reference("tagged-s", "a.md")
+        # 不存在的技能：不得误报为“已被禁用”，保持原有不存在文案
+        ghost = reg.run_script("no-such-skill", "x.py", {})
+        assert "已被禁用" not in ghost and "不存在" in ghost, f"不存在技能文案变了: {ghost}"
+    print("✅ test_bug10_disabled_code_skill_blocked_on_execute_and_tag_disable 通过")
+
+
 def main():
     from tests._runner import run_all
     raise SystemExit(run_all(globals()))
@@ -1086,6 +1165,8 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
+    test_bug10_disabled_skill_blocked_on_level3_entries()
+    test_bug10_disabled_code_skill_blocked_on_execute_and_tag_disable()
 
 
 if __name__ == "__main__":

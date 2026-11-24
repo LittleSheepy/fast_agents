@@ -92,6 +92,10 @@ class SkillLoader:
         "reg delete", "reg add", "net user", "net localgroup",
         "powershell -enc", "Invoke-Expression", "IEX ",
     ]
+    # 【Bug9修复】Windows 扩展长度 / 设备命名前缀（\?\ 与 \.\），归一化敏感路径前先剥掉一层
+    _EXTENDED_PATH_PREFIXES = ("\\\\?\\", "\\\\.\\")
+    # 【Bug11修复】命令注入字符表（与 models.ScriptParam.validate_value 里的 _DANGEROUS_CHARS 保持同一集合）
+    INJECTION_DANGEROUS_CHARS = ['\n', '\r', ';', '&', '|', '`', '$', '(', ')', '<', '>', '\\']
     
     def __init__(
         self,
@@ -954,23 +958,83 @@ class SkillLoader:
                     stack.append((item, f"{path}[{i}]", branch_ids))
             # 其余标量（int / float / bool / None 等）跳过
 
+    @classmethod
+    def _normalize_path_candidate(cls, value: Any, skill_dir_norm: Optional[str] = None) -> Optional[str]:
+        """【Bug9修复】把参数字符串归一化为「可比较的路径形态」，供敏感路径前缀判定使用。
+
+        修复前的判定只做 lower() + 反斜杠转斜杠 + startswith，因此下列常见写法能整体绕过沙箱：
+            1. `C:\\\\Windows\\\\System32\\\\x`（双反斜杠，JSON 双重转义 / 字符串字面量形态）
+            2. `\\\\?\\C:\\Windows\\System32\\x`（Windows 扩展长度前缀，绕过斜杠归一）
+            3. `C:\\Windows\\Temp\\..\\System32\\x`（.. 混排，字面量不以敏感前缀开头）
+            4. `C:\\PROGRA~1\\..\\Windows\\System32\\x`（8.3 短名 + ..）
+            5. `..\\..\\..\\..\\..\\Windows\\System32\\x`（相对路径向上跳出技能目录）
+        归一化步骤：剥 file:// 与 \\\\?\\ 前缀 → 分隔符统一为反斜杠 → ntpath.normpath 折叠 `..`/`.`/重复分隔符
+            → 再回到「小写 + 正斜杠」形态。
+        相对路径按脚本工作目录（技能目录）解析，但**只在对 `..` 向上跳出技能目录时**才纳入判定：
+            留在技能目录内的相对路径（如 templates/a.md、tmp/out.csv）本就是沙箱允许的读写区，不判。
+        返回 None 表示「不必检查」：空串、不含分隔符的普通文本（表达式/文件名/工具名等）、目录内相对路径。
+        """
+        s = str(value).strip()
+        if not s:
+            return None
+        # 1. file:// URI → 取本地路径部分（支持 file:///C:/x、file://C:/x、file://localhost/C:/x）
+        if s.lower().startswith("file://"):
+            rest = s[len("file://"):]
+            m = re.match(r'^/?(?:localhost)?[\\/]?([a-zA-Z]:[\\/].+)$', rest, re.IGNORECASE)
+            s = m.group(1) if m else rest.lstrip("/\\")
+        # 2. 扩展长度 / 设备前缀（只剥一层，避免把 \?\ 藏进深层再绕）
+        for ext in cls._EXTENDED_PATH_PREFIXES:
+            if s.startswith(ext):
+                s = s[len(ext):]
+                break
+        # 3. 分隔符统一成反斜杠，交给 ntpath 做折叠
+        s = s.replace("/", "\\")
+        # 4. 绝对路径 / UNC：直接归一；相对路径：先折叠再判断是否逃出了技能目录
+        if not os.path.splitdrive(s)[0] and not s.startswith("\\"):
+            norm_rel = os.path.normpath(s)
+            if not (norm_rel == ".." or norm_rel.startswith(".." + os.sep)):
+                return None  # 目录内相对路径，沙箱本就允许，不做敏感判定
+            if skill_dir_norm:
+                s = os.path.join(str(skill_dir_norm).replace("/", "\\"), norm_rel)
+            else:
+                s = norm_rel
+        s = os.path.normpath(s)
+        return s.lower().replace("\\", "/")
+
     def _check_sensitive_path_access(self, args: Dict[str, Any], skill_dir: Path) -> Optional[str]:
         """【C6-2】【C18重构】检查参数中是否包含敏感路径，返回错误信息或None，使用全局白名单+技能tmp目录
         【Bug7修复】顶层-only 扫描改为经 _iter_arg_strings 逐层展开嵌套结构，
         堵住 {"payload": {"path": "C:/Windows/System32/..."}} 这类参数绕过；
-        判定逻辑本身不变（归一化后对敏感前缀 startswith + 写入白名单豁免），顶层命中的错误文案逐字节一致
+        【Bug9修复】判定前先做路径归一化（_normalize_path_candidate），堵住双反斜杠 / \\\\?\ 前缀 /
+        `..` 混排 / 8.3 短名 / 逃出技能目录的相对路径 五类绕过；
+        命中后的错误文案保持回显**原始值**，与归一化改动前逐字节一致。
+        注：前缀比较仍沿用原有 startswith 语义（不引入目录边界切分），以免把 `C:\\Users` 这类宽口径
+        防护改松——本次改动只收紧防护面，不放松任何既有拦截。
         """
-        allow_list = [p.lower().replace("\\", "/") for p in self._get_allow_write_paths(skill_dir)]
-        # 敏感路径统一为小写正斜杠形式匹配
-        sensitive_prefixes = [p.lower().replace("\\", "/") for p in self.SENSITIVE_PATH_PREFIXES]
+        # 【Bug9修复】可写白名单也归一化后再比较，避免白名单用反斜杠写、参数用正斜杠写导致豁免失效
+        allow_list = [
+            n for n in (
+                self._normalize_path_candidate(p) for p in self._get_allow_write_paths(skill_dir)
+            ) if n
+        ]
+        # 敏感路径统一为小写正斜杠形式匹配（常量表本身也归一化，消除表内反斜杠写法与参数形态的差异）
+        sensitive_prefixes = [
+            n for n in (
+                self._normalize_path_candidate(p) for p in self.SENSITIVE_PATH_PREFIXES
+            ) if n
+        ]
         # 额外加入常见Windows系统路径的正斜杠/反斜杠变体
         extra_sensitive = [
             "c:/windows/system32", "c:/windows/syswow64", "c:/users",
         ]
         sensitive_prefixes.extend(extra_sensitive)
+        # 技能目录归一化形态：用于把「向上逃逸」的相对路径锚定到脚本真实工作目录
+        skill_dir_norm = self._normalize_path_candidate(skill_dir)
 
         for arg_path, v in self._iter_arg_strings(args):
-            s = str(v).lower().replace("\\", "/")
+            s = self._normalize_path_candidate(v, skill_dir_norm)
+            if s is None:
+                continue
             # 检查是否命中敏感路径
             for prefix in sensitive_prefixes:
                 if s.startswith(prefix):
@@ -979,6 +1043,19 @@ class SkillLoader:
                         return f"参数 '{arg_path}' 指向敏感路径 '{v}'，不在写入白名单内（沙箱拦截）"
         return None
     
+    def _check_injection_chars(self, args: Dict[str, Any], reason: str) -> Optional[str]:
+        """【Bug11修复】对参数字符串做命令注入字符检查，返回错误文案或 None。
+
+        参数集合由调用方给出（无Schema路径走全量 args，有Schema路径只走未声明的键），
+        reason 为文案括号内的口径说明，便于区分「未声明Schema」与「Schema未声明该参数」两种场景。
+        沿用 _iter_arg_strings 逐层展开（嵌套 dict/list 里的字符串同样覆盖）。
+        """
+        for loc, v in self._iter_arg_strings(args):
+            for ch in self.INJECTION_DANGEROUS_CHARS:
+                if ch in v:
+                    return f"参数 '{loc}' 包含非法字符 '{ch}'（{reason}）"
+        return None
+
     def run_script(
         self,
         skill_name: str,
@@ -1083,11 +1160,29 @@ class SkillLoader:
                 # 覆盖timeout为脚本声明的值
                 if schema.timeout is not None:
                     timeout = schema.timeout
+                # 【Bug11修复】Schema 只管得到「已声明参数」（ScriptParam.validate_value 内含注入字符检查），
+                # 而未知参数在 validate_args 里是原样放行进 converted 的，修复前这些值完全跳过注入字符检查，
+                # 造成「声明了Schema反而比不声明更松」：{"unknown": "a;b|c&d"} 能直通脚本 argv。
+                # 这里对未声明的键补上与无Schema路径同强度的检查（已声明参数不重复审，避免改变现有校验次序/文案）。
+                declared_names = {p.name for p in schema.params}
+                undeclared_args = {k: v for k, v in args.items() if k not in declared_names}
+                if undeclared_args:
+                    inj_err = self._check_injection_chars(
+                        undeclared_args, "命令注入防护，Schema未声明的参数同样禁止特殊字符"
+                    )
+                    if inj_err:
+                        if span:
+                            try:
+                                span.set_attribute("script.injection_blocked", True)
+                                span.finish(status=_SpanStatus.ERROR, error=inj_err)
+                            except Exception:
+                                pass
+                        return inj_err
             else:
                 # 无Schema时也做基本的命令注入字符检查
                 for k, v in args.items():
                     if isinstance(v, str):
-                        for ch in ['\n', '\r', ';', '&', '|', '`', '$', '(', ')', '<', '>', '\\']:
+                        for ch in self.INJECTION_DANGEROUS_CHARS:
                             if ch in v:
                                 error_msg = f"参数 '{k}' 包含非法字符 '{ch}'（命令注入防护，未声明Schema的参数默认禁止特殊字符）"
                                 if span:

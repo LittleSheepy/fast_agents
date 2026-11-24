@@ -617,8 +617,26 @@ class SkillRegistry:
 
         return self.loader.load_skill(skill_name)
     
+    def _disabled_hint(self, skill_name: str, action: str) -> Optional[str]:
+        """【Bug10修复】【C11】禁用语义的统一早退判定：返回 None 表示未禁用、可继续。
+
+        修复前只有 `load_skill`（Level 2）做了禁用检查，而 Level 3 入口
+        （`execute_skill` / `aexecute_skill` / `read_reference` / `read_asset` / `run_script`）
+        直接转发给 loader 或技能实例，招致「已禁用技能照样能读文档 / 跑脚本 / 执行业务逻辑」：
+        技能被禁用或已加载后被 `disable_skill` 强制卸载，LLM 只要还记得脚本名/文档名就能继续调用。
+        文案与 `load_skill` 的禁用提示保持同一句式（仅动词按操作替换），便于上层统一识别。
+        注：禁用名单（`_disabled_skills` / `_disabled_tags`）只存在于 registry 层，因此绕开 registry
+        直接调 `self.loader.run_script()` 仍不经过本判定；对外承诺的入口（registry API + 13 个LLM工具）已全部覆盖。
+        """
+        if not self.is_skill_disabled(skill_name):
+            return None
+        return f"技能 '{skill_name}' 当前已被禁用，无法{action}。请先使用 enable_skill 启用它。"
+
     def execute_skill(self, skill_name: str, **kwargs) -> Any:
-        """执行代码型Skill"""
+        """执行代码型Skill；【C11】被禁用的技能不可执行（【Bug10修复】补齐禁用检查）"""
+        blocked = self._disabled_hint(skill_name, "执行")
+        if blocked is not None:
+            return blocked
         if skill_name not in self._code_skills:
             # 文件型Skill不直接execute，按指令执行即可
             return f"文件型Skill '{skill_name}' 请按照加载的指令执行，可调用run_script运行脚本"
@@ -626,26 +644,40 @@ class SkillRegistry:
         return self._code_skills[skill_name].execute(**kwargs)
     
     async def aexecute_skill(self, skill_name: str, **kwargs) -> Any:
-        """异步执行代码型Skill"""
+        """异步执行代码型Skill；【C11】被禁用的技能不可执行（【Bug10修复】禁用检查前置，
+        不复用 execute_skill 的早退结果，避开同步/异步行为分叉）"""
+        blocked = self._disabled_hint(skill_name, "执行")
+        if blocked is not None:
+            return blocked
         if skill_name not in self._code_skills:
             return self.execute_skill(skill_name, **kwargs)
         
         return await self._code_skills[skill_name].aexecute(**kwargs)
     
     def read_reference(self, skill_name: str, ref_name: str) -> str:
-        """读取Skill参考文档"""
+        """读取Skill参考文档；【C11】被禁用的技能不可读取（【Bug10修复】补齐禁用检查）"""
+        blocked = self._disabled_hint(skill_name, "读取参考文档")
+        if blocked is not None:
+            return blocked
         if skill_name in self._code_skills:
             return f"代码型Skill '{skill_name}' 不支持参考文档"
         return self.loader.read_reference(skill_name, ref_name)
     
     def read_asset(self, skill_name: str, asset_name: str) -> str:
-        """【C15】读取Skill静态资产（文本返回内容，二进制仅返回元信息）"""
+        """【C15】读取Skill静态资产（文本返回内容，二进制仅返回元信息）
+        【C11】被禁用的技能不可读取（【Bug10修复】补齐禁用检查）"""
+        blocked = self._disabled_hint(skill_name, "读取静态资产")
+        if blocked is not None:
+            return blocked
         if skill_name in self._code_skills:
             return f"代码型Skill '{skill_name}' 不支持静态资产"
         return self.loader.read_asset(skill_name, asset_name)
     
     def run_script(self, skill_name: str, script_name: str, args: Optional[Dict[str, Any]] = None) -> str:
-        """运行Skill脚本"""
+        """运行Skill脚本；【C11】被禁用的技能不可执行脚本（【Bug10修复】补齐禁用检查）"""
+        blocked = self._disabled_hint(skill_name, "执行脚本")
+        if blocked is not None:
+            return blocked
         if skill_name in self._code_skills:
             return f"代码型Skill '{skill_name}' 不支持脚本执行"
         return self.loader.run_script(skill_name, script_name, args)

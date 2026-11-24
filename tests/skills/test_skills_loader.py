@@ -626,6 +626,119 @@ def test_c15_1_assets_scanned_into_metadata():
 # ==================== 入口 ====================
 
 
+def test_bug9_sensitive_path_normalization_blocks_bypass_forms():
+    """【Bug9修复】敏感路径判定前先做路径归一化，堵住 双反斜杠 / \\\\?\ 前缀 / .. 混排 /
+    8.3 短名 / 跳出技能目录的相对路径 / file:// URI 全部被拦；
+    同时不得误伤非路径参数与技能目录内相对路径，错误文案仍回显原始值（逐字节不变）。
+    """
+    loader = SkillLoader(include_default_paths=False)
+    base = Path("C:/Users/public/proj/.skills/demo")
+    # 1) 修复前全部放行的绕过写法，现在必须拦截
+    bypass_forms = [
+        "C:\\\\Windows\\\\System32\\\\config.dat",        # 双反斜杠（JSON 双重转义形态）
+        "\\\\?\\C:\\Windows\\System32\\config.dat",        # Windows 扩展长度前缀
+        "\\\\.\\C:\\Windows\\System32\\config.dat",        # 设备命名前缀
+        "C:\\Windows\\Temp\\..\\System32\\config.dat",     # .. 混排
+        "C:\\PROGRA~1\\..\\Windows\\System32\\x.sys",      # 8.3 短名 + ..
+        "../../../../../../Windows/System32/config.dat",   # 相对路径向上跳出技能目录
+        "file:///C:/Windows/System32/config.dat",          # file:// URI 形态
+        "C:/Windows/./System32/config.dat",                # ./ 混排
+    ]
+    for raw in bypass_forms:
+        err = loader._check_sensitive_path_access({"target": raw}, base)
+        assert err and "沙箱拦截" in err, f"绕过写法未被拦截: {raw}"
+        assert raw in err, f"错误文案未回显原始值: {err}"
+    # 2) 嵌套结构内的绕过写法同样拦截，并保留定位路径
+    err = loader._check_sensitive_path_access(
+        {"payload": {"items": [{"p": "C:/Windows/Temp/../System32/x"}]}}, base)
+    assert err and "payload.items[0].p" in err, f"嵌套绕过未被拦截或定位丢失: {err}"
+    # 3) 不得误伤：非路径文本 / 技能目录内相对路径
+    benign_args = [
+        {"expr": "1+2", "name": "hello world", "count": 5, "flag": True},
+        {"tpl": "templates/a.md", "out": "tmp/out.csv", "deep": "./tmp/sub/x.json"},
+        {"file": "report.csv", "ver": "1.10", "dot": "a..b"},
+    ]
+    for args in benign_args:
+        assert loader._check_sensitive_path_access(args, base) is None, f"正常参数被误伤: {args}"
+    # 4) 顶层直接命中的错误文案与修复前逐字节一致
+    expect = "参数 'target' 指向敏感路径 'C:/Windows/System32/x.txt'，不在写入白名单内（沙箱拦截）"
+    assert loader._check_sensitive_path_access({"target": "C:/Windows/System32/x.txt"}, base) == expect
+    # 5) 白名单分隔符写法不影响豁免，且未覆盖的敏感路径仍拦截
+    loader.default_allow_write_paths = ["C:\\Users\\public\\out"]
+    try:
+        assert loader._check_sensitive_path_access({"target": "C:/Users/public/out/a.txt"}, base) is None
+        assert loader._check_sensitive_path_access({"target": "C:\\Users\\public\\out\\b.txt"}, base) is None
+        assert loader._check_sensitive_path_access({"target": "C:/Windows/System32/a.sys"}, base) is not None
+    finally:
+        loader.default_allow_write_paths = []
+    print("✅ test_bug9_sensitive_path_normalization_blocks_bypass_forms 通过")
+
+
+def test_bug9_run_script_escapes_blocked_and_relative_paths_still_run():
+    """【Bug9修复】run_script 端到端：跳出技能目录的相对路径被沙箱拦截，
+    目录内相对路径与非路径参数照旧执行（不回退既有行为）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        _make_script_skill(tmpdir, "bug9-skill", [], "echo.py", "print('script ran')")
+        reg = SkillRegistry(extra_skill_paths=[tmpdir])
+        skill_dir = tmpdir / "bug9-skill"
+        # 正常调用：目录内相对路径 + 普通文本参数 → 照旧执行
+        out = reg.run_script("bug9-skill", "echo.py",
+                             {"tpl": "templates/a.md", "out": "tmp/out.csv", "expr": "1+2"})
+        assert "script ran" in out, f"目录内相对路径被误拦: {out}"
+        # 逃逸到用户目录的相对路径（脚本 cwd 就是技能目录）→ 与同路径绝对写法同等拦截
+        rel = os.path.relpath(Path.home() / "secrets" / "id_rsa", skill_dir)
+        if Path.home().drive == skill_dir.drive:
+            out2 = reg.run_script("bug9-skill", "echo.py", {"src": rel.replace("\\", "/")})
+            assert "沙箱拦截" in out2 and "script ran" not in out2, f"逃逸相对路径未被拦截: {out2}"
+        # 绝对敏感路径（正斜杠写法，避开注入字符检查）仍拦截
+        out3 = reg.run_script("bug9-skill", "echo.py", {"src": "C:/Windows/Temp/../System32/config.dat"})
+        assert "沙箱拦截" in out3 and "script ran" not in out3, f".. 混排绝对路径未被拦截: {out3}"
+    print("✅ test_bug9_run_script_escapes_blocked_and_relative_paths_still_run 通过")
+
+
+def test_bug11_undeclared_params_still_injection_checked():
+    """【Bug11修复】声明 Schema 后，Schema 未声明的键也要过命令注入字符检查
+    （修复前只有「无Schema」路径做检查，导致声明了 Schema 反而更松）；
+    未声明参数的「放行不阻断」语义与已声明参数的 Schema 文案均不变。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        _make_script_skill(tmpdir, "inj-skill", [
+            {"name": "run.py", "params": [{"name": "known", "type": "str", "required": True}]}
+        ], "run.py", "import sys; print('ARGS=' + ' | '.join(sys.argv[1:]))")
+        reg = SkillRegistry(extra_skill_paths=[tmpdir], include_default_paths=False)
+        reg.scan()
+        # 未声明键含注入字符 -> 拦截（修复前直通 argv）
+        out = reg.run_script("inj-skill", "run.py", {"known": "ok", "unknown": "a;b|c&d"})
+        assert "包含非法字符" in out and "ARGS=" not in out, f"未声明键跳过了注入检查: {out}"
+        assert "Schema未声明的参数同样禁止特殊字符" in out, f"文案口径不对: {out}"
+        # 嵌套结构与键名同样覆盖
+        out2 = reg.run_script("inj-skill", "run.py", {"known": "ok", "unknown": {"deep": ["ok", "a;b"]}})
+        assert "unknown.deep[1]" in out2, f"嵌套结构未展开: {out2}"
+        out3 = reg.run_script("inj-skill", "run.py", {"known": "ok", "a;b": "x"})
+        assert "包含非法字符" in out3, f"键名未检查: {out3}"
+        # 未声明但干净的参数照旧放行（不改变 C18 的「未知参数不阻断」语义）
+        out4 = reg.run_script("inj-skill", "run.py", {"known": "ok", "unknown": "plain-value"})
+        assert "ARGS=" in out4 and "plain-value" in out4, f"干净参数被误伤: {out4}"
+        # 已声明参数仍由 Schema 负责，校验文案不变（不重复审）
+        out5 = reg.run_script("inj-skill", "run.py", {"known": "a;b"})
+        assert "参数校验失败" in out5 and "参数 'known' 包含非法字符 ';'" in out5, f"已声明参数文案变了: {out5}"
+    print("✅ test_bug11_undeclared_params_still_injection_checked 通过")
+
+
+def test_bug11_no_schema_injection_message_unchanged():
+    """【Bug11修复】无 Schema 路径的注入拦截文案与行为逐字节不变（回归护栏）"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmpdir = Path(tmp)
+        _make_script_skill(tmpdir, "noschema-skill", [], "run.py", "print('ARGS=RUN')")
+        reg = SkillRegistry(extra_skill_paths=[tmpdir], include_default_paths=False)
+        reg.scan()
+        expect = "参数 'msg' 包含非法字符 ';'（命令注入防护，未声明Schema的参数默认禁止特殊字符）"
+        assert reg.run_script("noschema-skill", "run.py", {"msg": "a;b"}) == expect
+        assert "ARGS=RUN" in reg.run_script("noschema-skill", "run.py", {"msg": "clean"})
+    print("✅ test_bug11_no_schema_injection_message_unchanged 通过")
+
+
 def main():
     from tests._runner import run_all
     raise SystemExit(run_all(globals()))
@@ -640,6 +753,10 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
+    test_bug11_undeclared_params_still_injection_checked()
+    test_bug11_no_schema_injection_message_unchanged()
+    test_bug9_sensitive_path_normalization_blocks_bypass_forms()
+    test_bug9_run_script_escapes_blocked_and_relative_paths_still_run()
 
 
 if __name__ == "__main__":

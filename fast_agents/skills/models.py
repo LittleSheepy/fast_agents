@@ -125,7 +125,9 @@ class ScriptSchema:
         # 2. 检查传入的未知参数
         for k in args.keys():
             if k not in param_map:
-                # 未知参数默认放行但给出警告，不阻断执行
+                # 未知参数默认放行（不因「未声明」而阻断），但本方法不做注入字符检查；
+                # 该检查由 loader.run_script 对 Schema 未声明的键补齐（【Bug11修复】），
+                # 与本类已声明 str 参数、以及无 Schema 路径保持同一强度（当前实现不对未知参数打日志告警）
                 converted[k] = args[k]
         
         # 3. 逐个校验已知参数
