@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -296,6 +297,175 @@ class ToolRegistry:
                         hook(tool.name, kwargs, results[i])
                     except Exception as e:
                         logger.exception("工具 hook 失败: %s", e)
+
+        return results  # type: ignore[return-value]
+
+    # ── 异步工具执行（E10）──────────────────────────────────────
+
+    async def ainvoke_tool(
+        self,
+        name: str,
+        tool_input: Union[str, Dict[str, Any], None] = None,
+        *,
+        timeout: Optional[float] = None,
+        skip_approval: bool = False,
+        **kwargs: Any,
+    ) -> ToolResult:
+        """按名异步执行工具，统一返回 ToolResult；语义与 :meth:`invoke_tool` 严格一致。
+
+        审批 / 入参解析 / 超时 / hooks 四段与同步版逐字对齐，差别只在执行体：
+        走 ``tool.ainvoke``（内部 await ``arun``；未实现原生异步的工具会自动
+        降级为 ``asyncio.to_thread(run)``，见 ``ToolBase.arun``）。
+
+        ⚠ 超时语义（与同步版同一课红线）：``asyncio.wait_for`` 只能取消「等待」，
+        **不能终止已进入线程池的工具本体**。超时返回后 ``run()`` 仍可能在后台
+        继续执行并产生副作用，因此超时后不得假定操作未发生；结果会在
+        ``metadata['timeout_abandoned']`` 上标为 ``True``。
+
+        Args:
+            name: 工具名。
+            tool_input: JSON 字符串或 dict；支持同时用 kwargs 追加/覆盖。
+            timeout: 单次调用超时（秒），None 用 default_timeout。
+            skip_approval: 是否跳过审批流程（内部并发预审时使用）。
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return ToolResult.fail(f"未找到名为 '{name}' 的工具。可用工具：{', '.join(self.list_names())}")
+        # 解析入参（与 invoke_tool / ToolBase.invoke 共用同一实现）
+        kwargs, parse_error = _merge_tool_input(tool_input, kwargs, tool_name=name)
+        if parse_error is not None:
+            return ToolResult.fail(parse_error)
+
+        # ── 审批流程（文案与异常兜底对齐同步版）──
+        tool_meta = tool.metadata if isinstance(tool.metadata, dict) else {}
+        requires_approval = tool_meta.get("requires_approval", False)
+        if not skip_approval and self._approval_callback is not None and requires_approval:
+            try:
+                approved, modified_args, reason = self._approval_callback(name, kwargs)
+                if not approved:
+                    return ToolResult.fail(f"工具 '{name}' 执行被拒绝：{reason or '用户未批准'}")
+                if modified_args is not None:
+                    kwargs = modified_args
+            except Exception as e:
+                logger.exception("审批回调执行失败: %s", e)
+                return ToolResult.fail(f"工具 '{name}' 审批流程异常：{e}")
+
+        # ── 超时控制 ──
+        actual_timeout = timeout if timeout is not None else self.default_timeout
+        try:
+            if actual_timeout is not None and actual_timeout > 0:
+                result = await asyncio.wait_for(tool.ainvoke(**kwargs), timeout=actual_timeout)
+            else:
+                result = await tool.ainvoke(**kwargs)
+        except asyncio.TimeoutError:
+            result = ToolResult.fail(
+                f"工具 '{name}' 执行超时（> {actual_timeout}s）",
+                metadata={"timeout_abandoned": True},
+            )
+
+        # hooks：异步路径天然在调用方事件循环线程触发，等价于同步版的
+        # hooks_in_caller_thread=True（trace 父 Span 链不断、SQLite 不跨线程）。
+        for hook in self._hooks:
+            try:
+                hook(name, kwargs, result)
+            except Exception as e:
+                logger.exception("工具 hook 失败: %s", e)
+        return result
+
+    async def ainvoke_tools_concurrent(
+        self,
+        calls: List[Tuple[str, Union[str, Dict[str, Any], None]]],
+        *,
+        timeout: Optional[float] = None,
+    ) -> List[ToolResult]:
+        """并发执行多个无依赖工具，**返回结果与 calls 一一对应（顺序严格匹配）**。
+
+        与 :meth:`invoke_tools_concurrent` 对齐的三点：
+        1. 审批在主线程（即调用方事件循环）**集中预审**，被拒的不进任务表；
+        2. 整体超时后「放弃等待」而非「终止执行」，未完成的子任务标记
+           ``metadata['timeout_abandoned']=True``；
+        3. 超时被放弃的子任务**不触发 hook**（与同步版 ``completed`` 集合同语义）。
+
+        与同步版的差别：子任务靠 ``asyncio`` 并发（而非线程池），因此
+        hooks 永远在调用方上下文按 ``calls`` 顺序触发——所以同步版的
+        ``hooks_in_caller_thread`` 开关在本方法不需要，也不提供。
+
+        Args:
+            calls: [(name, tool_input), ...] 列表；同一工具可重复出现，各位独立。
+            timeout: 整体超时（秒），None 用注册表默认值。
+
+        Returns:
+            ``List[ToolResult]``，**长度与 calls 严格相等**，第 i 个结果对应 calls[i]。
+        """
+        if not calls:
+            return []
+        actual_timeout = timeout if timeout is not None else self.default_timeout
+        results: List[Optional[ToolResult]] = [None] * len(calls)
+
+        # ── 预审：解析入参 + 审批（顺序与文案与同步版一致）──
+        pending: List[Tuple[int, ToolBase, dict]] = []  # (索引, 工具, kwargs)
+        for i, (name, inp) in enumerate(calls):
+            tool = self._tools.get(name)
+            if tool is None:
+                results[i] = ToolResult.fail(
+                    f"未找到名为 '{name}' 的工具。可用工具：{', '.join(self.list_names())}"
+                )
+                continue
+            kwargs, parse_error = _merge_tool_input(inp, {}, tool_name=name)
+            if parse_error is not None:
+                results[i] = ToolResult.fail(parse_error)
+                continue
+            tool_meta = tool.metadata if isinstance(tool.metadata, dict) else {}
+            requires_approval = tool_meta.get("requires_approval", False)
+            if self._approval_callback is not None and requires_approval:
+                try:
+                    approved, modified_args, reason = self._approval_callback(name, kwargs)
+                    if not approved:
+                        results[i] = ToolResult.fail(
+                            f"工具 '{name}' 执行被拒绝：{reason or '用户未批准'}"
+                        )
+                        continue
+                    if modified_args is not None:
+                        kwargs = modified_args
+                except Exception as e:
+                    logger.exception("审批回调执行失败: %s", e)
+                    results[i] = ToolResult.fail(f"工具 '{name}' 审批流程异常：{e}")
+                    continue
+            pending.append((i, tool, kwargs))
+
+        if not pending:
+            return results  # type: ignore[return-value]
+
+        # ── 子任务：直接 await tool.ainvoke，异常就地转失败结果（对齐同步 _run_one）──
+        async def _run_one(idx: int, tool: ToolBase, run_kwargs: dict) -> None:
+            try:
+                results[idx] = await tool.ainvoke(**run_kwargs)
+            except Exception as e:
+                results[idx] = ToolResult.fail(f"工具 '{tool.name}' 并发执行失败：{e}")
+
+        task_to_idx = {
+            asyncio.ensure_future(_run_one(i, t, k)): i
+            for i, t, k in pending
+        }
+        _, not_done = await asyncio.wait(set(task_to_idx), timeout=actual_timeout)
+        for fut in not_done:
+            fut.cancel()
+            idx = task_to_idx[fut]
+            name = calls[idx][0]
+            results[idx] = ToolResult.fail(
+                f"工具 '{name}' 执行超时（整体超时 {actual_timeout}s）",
+                metadata={"timeout_abandoned": True},
+            )
+
+        # ── hooks 在调用方上下文按 calls 顺序、只对拿到结果的子任务各触发一次 ──
+        for i, tool, run_kwargs in pending:
+            if results[i] is None:
+                continue
+            for hook in self._hooks:
+                try:
+                    hook(tool.name, run_kwargs, results[i])
+                except Exception as e:
+                    logger.exception("工具 hook 失败: %s", e)
 
         return results  # type: ignore[return-value]
 

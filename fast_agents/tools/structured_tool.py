@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional, Type, Union
 from pydantic import BaseModel, create_model, Field
 
 from .tool_base import ToolBase
+from .tool_exception import ToolException
 from .tool_result import ToolResult
 
 
@@ -74,11 +75,24 @@ class StructuredTool(ToolBase):
         self.coroutine = coroutine
 
     def run(self, **kwargs: Any) -> Union[str, ToolResult]:
+        # E10-b：@tool 直接装饰 async def 时，旧行为是把「未 await 的协程对象」
+        # 当工具结果返回（observation 变成一串 <coroutine object ...> 乱码）。
+        # 现改为明确报错 + 给出出路；handle_tool_error=True 时会被
+        # ToolBase.invoke 转成友好失败结果，不抛到主流程。
+        if self.coroutine is None and inspect.iscoroutinefunction(self.func):
+            raise ToolException(
+                f"工具 '{self.name}' 的实现是 async 函数，不能在同步路径执行。"
+                f"请改用 agent.arun()/arun_stream()，或在构造时同时提供同步实现："
+                f"StructuredTool.from_function(func=同步函数, coroutine=异步函数)。"
+            )
         return self.func(**kwargs)
 
     async def arun(self, **kwargs: Any) -> Union[str, ToolResult]:
         if self.coroutine is not None:
             return await self.coroutine(**kwargs)
+        if inspect.iscoroutinefunction(self.func):
+            # E10-b：@tool 装饰 async def → 直接 await 本体，不进线程池
+            return await self.func(**kwargs)
         return await super().arun(**kwargs)
 
     @classmethod
