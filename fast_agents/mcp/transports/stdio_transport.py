@@ -6,6 +6,12 @@ v3.1 稳定性升级（对外 API 完全兼容）：
 - StdioTransport：新增 stderr 后台读线程（避免子进程 stderr 缓冲区写满卡死），
   提供 get_last_stderr() 用于错误排查；子进程异常退出时抛 MCPConnectionError；
   send() 检测 stdin 已关闭场景；close() 等待读线程优雅退出、kill 后 wait() 防止僵尸。
+
+v3.3.2 缺陷修复：
+- make_stdio_transport：Windows 上 shlex.split(posix=False) 会把引号字符残留在
+  token 里（posix=False 是必须的，否则反斜杠被当转义符吃掉），带字面引号的
+  程序名交给 CreateProcess 必然 FileNotFoundError——现在切分后剥离 token 首尾
+  成对的双引号，空命令（如 '""'）提前抛 MCPConnectionError。
 """
 
 from __future__ import annotations
@@ -79,6 +85,16 @@ class StdioTransport(TransportBase):
             raise MCPConnectionError(f"找不到命令：{self.command}（请确认已安装）") from e
         except Exception as e:
             raise MCPConnectionError(f"启动子进程失败：{e}") from e
+        # v3.3.7 缺陷修复（隐患1）：StdioTransport 实例被复用重连时（registry.add_stdio_cmd
+        # 在注册期就固定 transport，断开再 connect 沿用同一实例），上一会话残留在队列里的
+        # 消息会污染新会话——最坏情况是旧的 "_event: disconnected" 哨兵还在队里，新客户端
+        # 首次 recv 直接误判「连接已断开」而失败；或旧响应与新请求的 id 撞号被错误匹配。
+        # stderr ring 同理会把上一进程的报错混进本次排查。故每次 connect 先清这些瞬时 I/O
+        # 状态：首连时队列/buf 本就空，等价无操作，不改变既有行为；close() 已 join 掉旧读
+        # 线程，此处无并发写入竞争。
+        self._drain_queue()
+        with self._stderr_lock:
+            self._stderr_buf.clear()
         self._closed = False
         self._reader_exited.clear()
         self._reader = threading.Thread(
@@ -139,6 +155,14 @@ class StdioTransport(TransportBase):
                     self._stderr_buf.append(line)
         except Exception:
             pass
+
+    def _drain_queue(self) -> None:
+        """丢弃队列中所有残留消息（重连时清脏，避免上一会话的消息污染新会话）。"""
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
     def _safe_enqueue(self, msg: Dict[str, Any]) -> None:
         """入队：队列满时丢最旧消息，永远不阻塞读线程。"""
@@ -236,9 +260,27 @@ class StdioTransport(TransportBase):
             self._stderr_reader.join(timeout=0.5)
 
 
-def make_stdio_transport(command_str: str, cwd: Optional[str] = None) -> StdioTransport:
-    """便捷工厂：把 'python server.py --arg x' 拆成命令+参数，Windows 用 posix=False。"""
-    parts = shlex.split(command_str, posix=(sys.platform != "win32"))
-    if not parts:
+def _unquote_token(token: str) -> str:
+    """剥掉 posix=False 切分后残留在 token 首尾的成对双引号。
+
+    Windows 必须用 shlex.split(posix=False)（posix=True 会把 ``D:\\code`` 的反斜杠
+    当转义符吃掉），但 posix=False 不剥离引号字符，token 里带字面引号传给
+    Popen 后会因 list2cmdline 二次转义导致 FileNotFoundError。
+    非 Windows 走 posix=True 时引号已被 shlex 剥掉，本函数为无操作。
+    """
+    if len(token) >= 2 and token[0] == token[-1] == '"':
+        # posix=False 下引号内的 \" 会原样保留，剥外层引号后还原为字面 "
+        return token[1:-1].replace('\\"', '"')
+    return token
+
+
+def make_stdio_transport(command_str: str, cwd: Optional[str] = None,
+                         env: Optional[Dict[str, str]] = None) -> StdioTransport:
+    """便捷工厂：把 'python server.py --arg x' 拆成命令+参数，Windows 用 posix=False 并剥离残留引号。
+
+    env：额外环境变量（v3.3.5 新增可选参数，默认 None 行为不变），透传 StdioTransport 合并。
+    """
+    parts = [_unquote_token(p) for p in shlex.split(command_str, posix=(sys.platform != "win32"))]
+    if not parts or not parts[0]:
         raise MCPConnectionError("命令不能为空")
-    return StdioTransport(command=parts[0], args=parts[1:], cwd=cwd)
+    return StdioTransport(command=parts[0], args=parts[1:], cwd=cwd, env=env)

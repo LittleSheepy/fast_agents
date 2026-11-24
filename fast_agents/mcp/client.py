@@ -16,7 +16,7 @@ import threading
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
-from .errors import MCPConnectionError, MCPCallError, MCPProtocolError
+from .errors import MCPConnectionError, MCPCallError
 from .models import (
     CallResult, InitializeResult, ServerCapabilities, ToolInfo,
     ResourceInfo, ResourceTemplateInfo, ReadResourceResult,
@@ -189,7 +189,12 @@ class MCPClient:
     # ── 工具发现与调用 ───────────────────────────────────────
 
     def list_tools(self, timeout: float = 10.0) -> List[ToolInfo]:
+        """列出服务端提供的全部工具。服务器未声明 tools 能力时返回空列表
+        （v3.3.7 修复发现1：对齐 list_resources / list_prompts 的能力保护——
+        合规的无 tools 能力 server 对本方法必回 -32601，此前会直接报错打断 registry.connect）。"""
         self._ensure_connected()
+        if self.initialize_result is None or self.initialize_result.capabilities.tools is None:
+            return []
         resp = self._request("tools/list", {}, timeout=timeout)
         tools_data = resp.get("tools", [])
         return [ToolInfo(name=t["name"], description=t.get("description", ""), input_schema=t.get("inputSchema", {}))
@@ -215,11 +220,22 @@ class MCPClient:
         return [ResourceInfo(**r) for r in resp.get("resources", [])]
 
     def list_resource_templates(self, timeout: float = 10.0) -> List["ResourceTemplateInfo"]:
-        """列出服务端暴露的参数化资源模板（可按 URI 模板传入参数读取）。"""
+        """列出服务端暴露的参数化资源模板（可按 URI 模板传入参数读取）。
+
+        按 MCP 规范走独立方法 resources/templates/list（v3.3.3 修复：此前误复用
+        resources/list，对合规服务器模板永远为空）。服务器声明了 resources 能力但
+        未实现本方法（JSON-RPC -32601）时降级返回空列表，不打断 registry.connect 等上层流程。
+        """
         self._ensure_connected()
         if self.initialize_result is None or self.initialize_result.capabilities.resources is None:
             return []
-        resp = self._request("resources/list", {}, timeout=timeout)
+        try:
+            resp = self._request("resources/templates/list", {}, timeout=timeout)
+        except MCPCallError as e:
+            if e.error_code == -32601:
+                logger.debug("服务器未实现 resources/templates/list，降级为空模板列表")
+                return []
+            raise
         return [ResourceTemplateInfo(**t) for t in resp.get("resourceTemplates", [])]
 
     def read_resource(self, uri: str, timeout: float = 30.0) -> "ReadResourceResult":
@@ -294,7 +310,10 @@ class MCPClient:
 
         if "error" in data:
             err = data["error"]
-            raise MCPCallError(f"远端错误 {err.get('code')}: {err.get('message')}")
+            raise MCPCallError(
+                f"远端错误 {err.get('code')}: {err.get('message')}",
+                error_code=err.get("code"),
+            )
         return data.get("result", {})
 
     def _fail_all_pending(self, error: Exception) -> None:

@@ -16,4 +16,12 @@ class MCPProtocolError(MCPError):
 
 
 class MCPCallError(MCPError):
-    """业务层：远端返回 JSON-RPC error / 工具不存在 / 参数校验失败"""
+    """业务层：远端返回 JSON-RPC error / 工具不存在 / 参数校验失败
+
+    error_code：远端 JSON-RPC 错误码（v3.3.3 新增可选参数，默认 None，
+    既有单参构造方式不变），便于调用方区分 -32601 MethodNotFound 等做降级处理。
+    """
+
+    def __init__(self, message: str = "", error_code: "int | None" = None):
+        super().__init__(message)
+        self.error_code = error_code

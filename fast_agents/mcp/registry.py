@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Callable, Dict, List, Optional
 
 from .client import MCPClient
@@ -43,6 +44,8 @@ class MCPRegistry:
         self._registered_names: Dict[str, List[str]] = {}
         self._expand_mode: Dict[str, str] = {}
         self._prefix_sep: Dict[str, str] = {}
+        # v3.3.6：记住各 server 已注册的粗粒度门脸工具，tools/list_changed 时同步其内部索引
+        self._coarse_tools: Dict[str, MCPServerTool] = {}
         self._closed = False
 
     # ── 注册 ─────────────────────────────────────────────────
@@ -51,7 +54,8 @@ class MCPRegistry:
         """根据 MCPConfig 添加一个 server（声明式）。"""
         if config.transport == "stdio":
             if config.command_str is not None:
-                self.add_stdio_cmd(config.name, config.command_str, cwd=config.cwd)
+                # v3.3.5 缺陷修复：此前本分支未透传 config.env，声明式配置的环境变量被静默丢弃
+                self.add_stdio_cmd(config.name, config.command_str, cwd=config.cwd, env=config.env)
             elif config.command is not None:
                 self.add_stdio(config.name, config.command, args=config.args,
                                env=config.env, cwd=config.cwd)
@@ -82,9 +86,13 @@ class MCPRegistry:
             return MCPClient(t)
         self._factories[name] = factory
 
-    def add_stdio_cmd(self, name: str, command_str: str, cwd: Optional[str] = None) -> None:
-        """便捷方法：直接传命令字符串，自动 shlex.split（Windows 用 posix=False）。"""
-        t = make_stdio_transport(command_str, cwd=cwd)
+    def add_stdio_cmd(self, name: str, command_str: str, cwd: Optional[str] = None,
+                      env: Optional[Dict[str, str]] = None) -> None:
+        """便捷方法：直接传命令字符串，自动 shlex.split（Windows 用 posix=False）。
+
+        env：额外环境变量（v3.3.5 新增可选参数，默认 None 行为不变），透传到子进程。
+        """
+        t = make_stdio_transport(command_str, cwd=cwd, env=env)
         self._factories[name] = lambda t=t: MCPClient(t)
 
     def add_sse(self, name: str, url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 30.0) -> None:
@@ -104,6 +112,10 @@ class MCPRegistry:
     # ── 生命周期 ─────────────────────────────────────────────
 
     def connect(self, name: str, timeout: float = 10.0) -> MCPClient:
+        # v3.3.6 修复：_closed 此前只写不读（死标记）；现在 close_all() 后拒绝再连接，
+        # 避免拿到一批已被关闭的旧 client / 误以为还能新接入 server。
+        if self._closed:
+            raise MCPError("MCPRegistry 已被 close_all() 关闭，拒绝连接新 server；请新建 MCPRegistry 实例")
         if name in self._clients:
             return self._clients[name]
         if name not in self._factories:
@@ -111,19 +123,27 @@ class MCPRegistry:
         client = self._factories[name]()
         init = client.connect(timeout=timeout)
         self._clients[name] = client
-        self._tools[name] = client.list_tools(timeout=timeout)
-        # 加载资源和提示模板缓存（服务器不支持对应能力时自动返回空列表）
-        self._resources[name] = client.list_resources(timeout=timeout)
-        self._resource_templates[name] = client.list_resource_templates(timeout=timeout)
-        self._prompts[name] = client.list_prompts(timeout=timeout)
+        # v3.3.7 缺陷修复（发现1）：缓存加载任一步失败时整体回滚——此前 client 会作为
+        # 「已连接但没有工具/资源缓存」的半初始化脏状态残留在 _clients 里（上层误判可用、
+        # register_into 注册空门脸），现在失败即关闭并摘表后再上抛。
+        try:
+            self._tools[name] = client.list_tools(timeout=timeout)
+            # 加载资源和提示模板缓存（服务器不支持对应能力时自动返回空列表）
+            self._resources[name] = client.list_resources(timeout=timeout)
+            self._resource_templates[name] = client.list_resource_templates(timeout=timeout)
+            self._prompts[name] = client.list_prompts(timeout=timeout)
+        except Exception:
+            self.close(name)
+            raise
         # 注册 list_changed 通知处理器，服务端工具/资源/提示变更时自动刷新本地缓存
+        # （处理器由客户端读线程同步回调，刷新必须甩到独立线程，见 _schedule_refresh）
         caps = init.capabilities
         if caps.tools and caps.tools.get("listChanged"):
-            client.on_notification("notifications/tools/list_changed", lambda _p, n=name: self._refresh_tools(n))
+            client.on_notification("notifications/tools/list_changed", lambda _p, n=name: self._schedule_refresh(n, "tools"))
         if caps.resources and caps.resources.get("listChanged"):
-            client.on_notification("notifications/resources/list_changed", lambda _p, n=name: self._refresh_resources(n))
+            client.on_notification("notifications/resources/list_changed", lambda _p, n=name: self._schedule_refresh(n, "resources"))
         if caps.prompts and caps.prompts.get("listChanged"):
-            client.on_notification("notifications/prompts/list_changed", lambda _p, n=name: self._refresh_prompts(n))
+            client.on_notification("notifications/prompts/list_changed", lambda _p, n=name: self._schedule_refresh(n, "prompts"))
         logger.info(
             "MCP[%s] 已连接：%s v%s，工具 %d 个，资源 %d 个，提示模板 %d 个",
             name, init.server_info.get("name", "unknown"),
@@ -150,6 +170,7 @@ class MCPRegistry:
         self._registered_names.pop(name, None)
         self._expand_mode.pop(name, None)
         self._prefix_sep.pop(name, None)
+        self._coarse_tools.pop(name, None)
 
     def close_all(self) -> None:
         for name in list(self._clients.keys()):
@@ -158,6 +179,18 @@ class MCPRegistry:
 
     # ── list_changed 缓存自动刷新 ────────────────────────────
 
+    def _schedule_refresh(self, server_name: str, kind: str) -> None:
+        """v3.3.6 根因修复：list_changed 处理器由客户端读线程同步回调，而 _refresh_*
+        内部会再发起新请求——响应只有读线程自己能消费，同步执行就是自死锁直到超时
+        （探针实证：刷新永远报「请求 tools/list 超时」，v3.2 的自动刷新从未生效）。
+        故把刷新甩到独立 daemon 线程，处理器立即返回；失败仍由 _refresh_* 内部
+        try/except 兜底，不阻塞主流程。"""
+        target = {"tools": self._refresh_tools,
+                  "resources": self._refresh_resources,
+                  "prompts": self._refresh_prompts}[kind]
+        threading.Thread(target=target, args=(server_name,),
+                         name=f"mcp-refresh-{server_name}-{kind}", daemon=True).start()
+
     def _refresh_tools(self, server_name: str) -> None:
         """服务端推送 tools/list_changed 时刷新本地工具缓存，不自动重注册工具（避免打断正在执行的调用）。"""
         client = self._clients.get(server_name)
@@ -165,6 +198,11 @@ class MCPRegistry:
             return
         try:
             self._tools[server_name] = client.list_tools(timeout=5.0)
+            # v3.3.6 修复：同步已注册粗粒度门脸的工具索引——此前门脸只存注册时的旧快照，
+            # 刷新后新增子工具永远报「不存在」（半设计半坑：不重注册是有意为之，但索引过期不是）。
+            gate = self._coarse_tools.get(server_name)
+            if gate is not None and self._expand_mode.get(server_name) == "coarse":
+                gate.update_tools(self._tools[server_name])
             logger.info("MCP[%s] 工具列表已刷新，共 %d 个工具", server_name, len(self._tools[server_name]))
         except Exception as e:
             logger.warning("MCP[%s] 刷新工具列表失败：%s", server_name, e)
@@ -265,6 +303,7 @@ class MCPRegistry:
         elif expand == "coarse":
             t = MCPServerTool(client=client, server_name=server_name, tools=tools, prefix_sep=prefix_sep)
             registry.register_tool(t)
+            self._coarse_tools[server_name] = t  # v3.3.6：留引用供 list_changed 同步索引
             registered.append(t)
         else:
             raise MCPError(f"expand 必须是 'fine' 或 'coarse'，收到：{expand}")
@@ -317,8 +356,11 @@ class MCPRegistry:
             if registry.has_tool(name):
                 if registry.unregister(name):
                     removed.append(name)
-        # 兜底：扫描前缀匹配的残留（比如之前用其它模式注册过）
-        prefixes = [f"{server_name}__", f"mcp__{server_name}"]
+        # 兜底：扫描前缀匹配的残留（比如之前用其它模式注册过）。
+        # v3.3.6 修复：分隔符改用该 server 上次展开时记录的 prefix_sep（默认 "__"），
+        # 此前硬编码 "__"，用户用自定义分隔符注册的历史残留清不掉。
+        sep = self._prefix_sep.get(server_name, "__")
+        prefixes = [f"{server_name}{sep}", f"mcp{sep}{server_name}"]
         for tool_name in list(registry.list_names()):
             for pre in prefixes:
                 if tool_name.startswith(pre) and tool_name not in removed:

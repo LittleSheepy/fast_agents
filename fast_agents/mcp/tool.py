@@ -75,8 +75,11 @@ def _schema_to_pydantic(schema: Dict[str, Any]) -> type:
 
         # 对象类型：递归创建嵌套Pydantic模型
         if json_type == "object":
-            # 优先走缓存，避免相同结构重复生成模型
-            cache_key = str(prop.get("properties", {}))
+            # 优先走缓存，避免相同结构重复生成模型。
+            # v3.3.4 缺陷修复：缓存键由 str(properties) 改为整个 prop 的规范化全量序列化——
+            # 此前键不含同级 required 及对象自身约束，同构但必填集合不同的两个嵌套对象
+            # 会复用同一模型，必填字段被静默降级为可选（双向错乱，探针 P-C 实证）。
+            cache_key = json.dumps(prop, sort_keys=True, ensure_ascii=False, default=str)
             if cache_key in _schema_cache:
                 return _schema_cache[cache_key]
             sub_properties: Dict[str, Dict[str, Any]] = prop.get("properties", {}) or {}
@@ -101,9 +104,11 @@ def _schema_to_pydantic(schema: Dict[str, Any]) -> type:
                 if "pattern" in sub_prop:
                     sub_field_kwargs["pattern"] = sub_prop["pattern"]
                 if "minItems" in sub_prop:
-                    sub_field_kwargs["min_items"] = sub_prop["minItems"]
+                    # v3.3.7：min_items/max_items 是 pydantic V2 废弃别名（每次转换刷
+                    # DeprecationWarning，V3 将移除），改用等效的 min_length/max_length，校验行为一致
+                    sub_field_kwargs["min_length"] = sub_prop["minItems"]
                 if "maxItems" in sub_prop:
-                    sub_field_kwargs["max_items"] = sub_prop["maxItems"]
+                    sub_field_kwargs["max_length"] = sub_prop["maxItems"]
                 # 处理默认值和必填性：修正布尔/0/空字符串等falsy默认值被误判的问题
                 if sub_name in sub_required:
                     sub_field_info = Field(**sub_field_kwargs)
@@ -148,9 +153,10 @@ def _schema_to_pydantic(schema: Dict[str, Any]) -> type:
         if "pattern" in pdef:
             field_kwargs["pattern"] = pdef["pattern"]
         if "minItems" in pdef:
-            field_kwargs["min_items"] = pdef["minItems"]
+            # v3.3.7：同上，废弃别名 min_items/max_items 换为等效的 min_length/max_length
+            field_kwargs["min_length"] = pdef["minItems"]
         if "maxItems" in pdef:
-            field_kwargs["max_items"] = pdef["maxItems"]
+            field_kwargs["max_length"] = pdef["maxItems"]
         # 必填/非必填/默认值处理：修正布尔/0/空字符串等合法默认值被误判为None的问题
         if pname in required:
             field_info = Field(**field_kwargs)
@@ -264,6 +270,13 @@ class MCPServerTool(ToolBase):
             f"list_prompts/get_prompt（提示模板）。"
         )
         super().__init__(name=name, description=description)
+
+    def update_tools(self, tools: List[ToolInfo]) -> None:
+        """v3.3.6：刷新内部工具快照与索引（MCPRegistry 收到 tools/list_changed 时调用）。
+
+        此前粗粒度门脸只存注册时的旧快照，服务器新增子工具后永远报「不存在」。"""
+        self._tools_list = list(tools)
+        self._tools_index = {t.name: t for t in self._tools_list}
 
     def _list_tools_text(self) -> str:
         if not self._tools_list:

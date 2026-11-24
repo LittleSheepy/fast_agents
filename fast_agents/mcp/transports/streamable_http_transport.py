@@ -348,6 +348,12 @@ class StreamableHTTPTransport(TransportBase):
                     continue
                 return None
             if not isinstance(msg, dict) or not msg.get("_event"):
+                # v3.3.6 修复：响应被消费后清掉 JSON 直返登记的 id 标记，
+                # 此前 _json_resolved 只增不清，长驻进程会慢速泄漏（close() 时整表 clear 兜底）。
+                msg_id = msg.get("id") if isinstance(msg, dict) else None
+                if msg_id is not None and ("result" in msg or "error" in msg):
+                    with self._resolve_lock:
+                        self._json_resolved.discard(msg_id)
                 return msg
             if msg.get("_event") == "disconnected":
                 raise MCPConnectionError(msg.get("error", "Streamable HTTP 连接已断开"))
