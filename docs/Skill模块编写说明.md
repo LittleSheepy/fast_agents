@@ -836,7 +836,11 @@ print(agent.run("帮我写一段社群欢迎语"))
 
 ```powershell
 # 测试目录已改名为 tests/，按脚本直接执行，不要用 -m
-python tests\skills\test_skills.py
+# 技能测试已按组件拆为四个入口（合计 84 项）
+python tests\skills\test_skills.py            # 基类与模型层 11 项
+python tests\skills\test_skills_loader.py     # 加载器 18 项
+python tests\skills\test_skills_middleware.py # 中间件 13 项
+python tests\skills\test_skills_registry.py   # 注册器 42 项
 python tests\agents\test_react_agent.py
 ```
 
@@ -1105,13 +1109,19 @@ Windows 默认单条路径上限 260 字符。技能目录如果嵌得很深（`
 
 ### 11.1 现状
 
-技能模块的主测试是 `tests/skills/test_skills.py`，覆盖模型校验、三级加载、启用禁用、依赖检查、脚本沙箱、热重载等。
+技能模块的测试已按组件拆为四个入口（合计 84 项），基类与模型层留在 `tests/skills/test_skills.py`，扫描/加载、中间件、注册器各自的用例分到同目录三个文件。
 
 | 测试文件 | 结果 | 说明 |
 |---------|------|------|
-| `tests/skills/test_skills.py` | ✅ 84/84 | 技能模块主测试；覆盖模型校验、三级加载、启用禁用、依赖检查、脚本沙箱、热重载、静态资产、同名冲突消解等。早期 4 项 C14 热重用例的写法问题已随 `registry` 补 `scan_skills()` / `is_skill_loaded()` / `list_skills_metadata()` 便捷方法与 `middleware` 保留线程引用后全部修复 |
+| `tests/skills/test_skills.py` | ✅ 11/11 | 基类与模型层：`BaseSkill` 元数据校验、`@skill` 装饰器、`SkillMetadata` 字段格式（含 C12 `requires`、C18 字段瘦身）、`ScriptParam` / `ScriptSchema` 模型级校验 |
+| `tests/skills/test_skills_loader.py` | ✅ 18/18 | 加载器：目录扫描、frontmatter 与 `scripts/*.schema.json` 解析及容错（C18）、脚本/参考文档/资产路径穿越防护与扩展名校验、C14 热重载的变更检测（mtime 快照 / `detect_changes` / `reload_skill` / `rescan_incremental`）、C17 索引缓存与 1+N 扫描治理 |
+| `tests/skills/test_skills_middleware.py` | ✅ 13/13 | 中间件：索引注入 System Prompt、已加载技能 LRU 缓存与每轮自动卸载、C10 `allowed_tools` 工具白名单、C14 热重载线程启停与手动重载 |
+| `tests/skills/test_skills_registry.py` | ✅ 42/42 | 注册器：代码型技能注册/反注册、便捷方法与 13 件工具工厂、C11 启用禁用、C12 依赖预检与版本比较、C6-2 沙箱运行时校验、C15 `read_asset`、C8 同名冲突消解 |
 | `tests/agents/test_react_agent.py` | ✅ 全过 | 含技能启用 / 禁用两条用例 |
 | `tests/mcp/test_mcp.py` | ✅ 全过 | MCP 专项 |
+
+> 早期 4 项 C14 热重用例的写法问题已随 `registry` 补 `scan_skills()` / `is_skill_loaded()` / `list_skills_metadata()` 便捷方法与 `middleware` 保留线程引用后全部修复。
+> 拆分只做了用例搬家：用例体与断言逐字节不变，`_make_skill_dir` / `_make_script_skill` / `_make_asset_skill` / `_make_conflict_skill_dir` 四个辅助函数因跨组件复用，在各文件保留同源副本，以保证每个文件可单独运行。
 
 > 测试目录已从 `test/` 改名为 `tests/`（避开与 Python 标准库 `test` 包同名），按脚本直接执行、不要用 `-m`；`tests/_runner.py` 是零依赖运行器。每个测试文件各自在开头写 `sys.path.insert(0, 父目录)` 来保证能 import 到 `fast_agents`。
 
@@ -1206,7 +1216,7 @@ print(r.run_script('你的技能名', 'hello.py', {'name': 'x'}))
 - `fast_agents/skills/agent_integration_example.py`、`fast_agents/skills/code_skill_example.py`
 - `fast_agents/agents/react_agent/react_agent.py`、`fast_agents/agents/react_agent/prompt.py`
 - `docs/演进路线图.md`（C 系列条目）
-- `tests/skills/test_skills.py`、`tests/agents/test_react_agent.py`
+- `tests/skills/`（`test_skills.py` 基类与模型层 / `test_skills_loader.py` 加载器 / `test_skills_middleware.py` 中间件 / `test_skills_registry.py` 注册器）、`tests/agents/test_react_agent.py`
 - `examples/skills/`（`code_skill_demo.py` / `file_skill_demo.py` / `middleware_demo.py` / `enable_disable_demo.py` / `dependency_demo.py` / `file_skill_dependency_demo.py` / `script_sandbox_demo.py` / `hot_reload_demo.py` 等）
 
 **外部**
@@ -1223,7 +1233,7 @@ print(r.run_script('你的技能名', 'hello.py', {'name': 'x'}))
 改动 `fast_agents/skills/` 之后，逐条打勾：
 
 - [ ] `python -c "from fast_agents.skills import SkillRegistry, SkillLoader, SkillMiddleware, BaseSkill, skill, ScriptParam, ScriptSchema, SkillError, AssetNotFoundError, SkillConflictError"` 无报错；
-- [ ] `python tests/skills/test_skills.py` 全过；`python tests/agents/test_react_agent.py` 全过（含两条技能用例）；
+- [ ] `tests/skills/` 下四个入口全过（`test_skills.py` 11 / `test_skills_loader.py` 18 / `test_skills_middleware.py` 13 / `test_skills_registry.py` 42）；`python tests/agents/test_react_agent.py` 全过（含两条技能用例）；
 - [ ] 新增 / 修改的技能包能被 `scan()` 发现，且 `name` 没被强制改写（没打印告警）；
 - [ ] `get_index_prompt()` 的输出格式没被意外破坏（标题、`[代码]`/`[文件]` 标签、使用方法段落）；
 - [ ] `full_prompt` 的五个段落（`# Skill:` / `## 技能说明` / `## 执行指令` / `## 可用脚本` / `## 参考文档`）顺序与内容正确；

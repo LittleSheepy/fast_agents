@@ -2,9 +2,9 @@
 
 本文档面向 fast_agents Guardrails 安全护栏系统，参考 **LangChain Guardrails**、**OpenAI Agents SDK Guardrails**、**LlamaIndex Guardrails**、**Anthropic Claude Guardrails**、**Microsoft MCP 安全规范** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.0.3 · 2026-11-23 · P1 缺陷修复：`@guardrail_creator` 新增 `guardrail_type` 参数（input/output/tool_call，默认 input），函数式护栏按类型真正参与中间件与 use_global 分派（此前被 isinstance 过滤静默忽略）；装饰类恢复 passthrough；非法类型值创建时即抛 `GuardrailConfigError`
-> 适用版本：`fast_agents.guardrails` v1.0.3
-> 配套代码：`fast_agents/guardrails/`（9 个核心文件 + 3 个预设护栏）+ `tests/guardrails/`（10 个文件共 113 项测试全绿：51 主用例 + 19 真实 ReActAgent 端到端 + 16 模拟 Agent 链路 + 27 分项）+ `examples/guardrails/guardrails_basic_demo.py`（无API Key可运行示例），均已实测通过。
+> 版本：v1.0.10 · 2026-11-24 · 跨模块行为登记：输出护栏与 Agent 取值的时序说清（agents 域 A2 已由路线图 v2.74.0 修掉，`guardrails/` 本体代码零改动）
+> 适用版本：`fast_agents.guardrails` v1.0.10
+> 配套代码：`fast_agents/guardrails/`（9 个核心文件 + 3 个预设护栏）+ `tests/guardrails/`（11 个文件共 125 项测试全绿：45 主用例 + 12 中间件 + 19 真实 ReActAgent 端到端 + 16 模拟 Agent 链路 + 33 分项）+ `examples/guardrails/guardrails_basic_demo.py`（无API Key可运行示例），均已实测通过。
 > 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：零新增依赖，完全复用现有核心抽象。
 
 ## 目录
@@ -30,6 +30,13 @@
 
 | 版本 | 日期 | 变更内容 | 破坏性 |
 |------|------|----------|--------|
+| v1.0.10 | 2026-11-24 | **输出护栏与 Agent 取值的时序说清（本轮 `guardrails/` 源码零改动，属跨模块行为登记）**：第三轮架构评审的 **agents 域 A2**（与本文档 v1.0.5 那个 guardrails 域 A2 不同编号空间）已于路线图 v2.74.0 修掉：`ReActAgent.run` / `arun` 旧写法优先拼接流式 `text` 增量，而输出护栏在正文产出之后才跑，导致脱敏（modify）与拦截（reject）两种结果**都只能改写 `end` 事件、非流式返回值依旧拿到原文**（同步 / 异步两条链路同病，本文档旧版 §5.3 所称「Agent 最终结果返回给用户前」实际仅对 `end` 事件成立）。现 `run` / `arun` 改取护栏后正文；**剩下的只是流式侧物理限制**：`text` 分片已发出收不回，需强护栏语义请用 `run` / `arun`，或累加到 `end` 再展示 | 低：护栏本体行为逐字节不变；行为变化在 Agent 侧（`run` 返回值不再含工具轮次过渡语），详 §5.3 与 §10.2 第 12 条 |
+| v1.0.9 | 2026-11-24 | **B4 修复（注入护栏误拦正常文本）**：RC1 跨句粘连——`_SENTENCE_SPLIT_RE` 按英文句末终止符 + 后跟空白（`chapters. Instructions`）或中文 `。！？` 切分句子，逐句匹配而非整段匹配，防止带间隙模式把无关子句粘连成注入特征；RC2 词融合——`jailbreak(?:mode|prompt|now)?` 改用非空格压缩视图（`_squeeze_text_nonspace`，仅去分隔符保留空格），防止 `jail  break the habit` 被误融合为 `jailbreak` 而误拦；`test_s4_tool_registry_injection.py` 顺带修复：B3 的 `extra="forbid"` 暴露出该文件两处 `ToolCallInfo(arguments=...)` 字段名拼错（应为 `tool_args=`）。**doanythingnow 保留完整压缩视图**：现有测试 L7 断言 `do anything now` 应拦截（DAN 攻击签名），R1 不变更 | **行为变化（正向安全加固）**：跨句正常叙述文本不再误拦；jailbreak 纯空格分隔误拦消除；各类绕过样本（含换行/加符号/全角）全部仍拦截；test_s4 调用处字段名拼错改为正确值 |
+| v1.0.8 | 2026-11-24 | **B1/B3 修复**：`BasicPermissionGuardrail` 构造器的集合参数改用 `is not None` 判断，避免空集合被 `or` 运算符替换为默认值（修复前传 `blocked_tool_names=set()` 想关闭拦截时，默认危险工具名照样生效）；`models.py` 三个安全关键模型（`GuardrailResult` / `ToolCallInfo` / `ToolResultInfo`）的 `extra` 配置从 `"allow"` 改为 `"forbid"`，防止拼错字段名（如 `alowd=True` / `tool_ars={...}`）被静默接受而导致检查逻辑被绕过 | **行为变化（正向安全加固）**：B1 影响传空集合的场景用户（此前被默认值覆盖，现保留空集合）；B3 影响传拼错字段名的代码（此前静默接受，现立即抛 `ValidationError`）。正确用法不受影响 |
+| v1.0.7 | 2026-11-24 | **B2 修复**：`BasicPermissionGuardrail` 第 5 步的敏感路径参数扫描改为**逐层展开**。修复前只遍历 `tool_args.items()` 的**顶层 str 值**，路径换个位置就绕开：`{"payload": {"path": "/etc/passwd"}}`、`{"paths": ["/etc/shadow"]}`、`{"a": {"b": [{"c": "/proc/self/environ"}]}}`、路径写在字典键上 `{"files": {"/etc/passwd": "r"}}`、传 `Path` 对象——探针实测 6 种嵌套形态**全部 ALLOWED**；且仓库此前没有任何测试喂过敏感路径参数（只测工具名拦截），故长期存活。现按先序展开 dict（**键与值都扫**）/ list / tuple / set / frozenset / `os.PathLike`；用**显式栈而非递归**（护栏自己抛 RecursionError 会按 fail_open 把业务打成放行或全拦），**不设深度上限**（深度上限等于新递一个「藏到第 N+1 层就过关」的绕过口）；自引用参数按「当前分支已访问容器 id」剪枝，不死循环；`tool_args` 为非 dict（list / str / None / int / set）时不再因 `.items()` 抛 `AttributeError`。**测试口径修正**：v1.0.6 行及其之前所写「116 项 / 28 分项」为漏计——`test_tool_call_guardrail.py`（3 项）从未计入分项、`test_s5_reject_preserves_results.py` 实为 5 项（记成 3），按 `run_all` 执行计数 v1.0.6 真实为 **121 项**；历史行不做追溯篡改，自本行起以执行计数为准 | **行为变化（正向安全修复）**：嵌套参数里的敏感路径此前放行、现在拦截。顶层命中的 `reason` 文案与 `metadata["arg_name"]`（直接是参数名）逐字节不变；`check_sensitive_paths=False` 语义不变（彻底不扫） |
+| v1.0.6 | 2026-11-24 | **B5 修复**：`BasicOutputSafetyGuardrail` 的缓和语境豁免改为**只在命中片段所处子句内取证**。修复前 `_has_mitigating_context` 只取「命中片段前后 `mitigation_window`（默认 30）字符」，30 字符足以横跨整句、上一句甚至下一个括号，于是最常见的绕过形态——「免责声明单独成句 + 大段可执行危害步骤」——被一句轻描淡写整体放行（实测：`"请勿模仿：以下是制造毒品的具体步骤\n第一步……"`、`"……具体步骤：1. 备料……（本内容违法）"` 均 ALLOWED）。现在取证范围 = 子句边界 ∩ [start-window, end+window]，子句边界为句末标点/冒号分号/换行/括号，**逗号顿号故意不当边界**（正常科普正是用逗号把警示语挂在同句），`mitigation_window` 保留原参数与默认值、语义改为上限 | **行为变化（正向安全修复）**：跨句/跨括号免责声明不再豁免危害输出；同句内自带警示语的科普、拒答逐字节不变。代价：同子句内无表内缓和词的新闻/司法通报体（「已被依法刑事拘留」）转为误拦，本次有意不扩充词表（扩词同时放大绕过面） |
+| v1.0.5 | 2026-11-24 | **A2 修复**：`add_guardrail()` 挂载时补注入 `tool_registry`。修复前广播只写在 `tool_registry` 的 setter 里，仅覆盖「赋值那一瞬间已挂载」的实例；先注入 registry、后 `add_guardrail(BasicPermissionGuardrail(...))` 时，新副本的 `tool_registry` 永远是 None → 读 `metadata["requires_approval"]` 的单一事实源分支从不执行，高危工具静默放行（S4 同一条死角在「先注入、后挂载」方向上的延伸）。现仅当实例自己没带 registry 时才注入（不把用户显式配置的 registry 覆盖掉），`self._tool_registry` 为 None 时不执行也不 import preset 包；setter 的无条件广播语义逐字节不变 | **行为变化（正向修复）**：仅影响「已有 tool_registry 后晚挂载权限护栏」这一种时序；无该时序时行为逐字节一致 |
+| v1.0.4 | 2026-11-24 | **A1 修复**：`GuardrailMiddleware(guardrails=[...])` 显式传入的护栏与自动加载的预设**同名**时，不再被预设静默替换。修复前加载顺序为「先挂显式、后加载预设」，`_load_presets` 内部经 `add_guardrail(..., skip_exist_check=True)` 的同名替换逻辑把用户实例 `pop` 掉，又因 `skip_exist_check=True` 连 warning 都不打——用户自定义同名护栏（尤其是覆盖 `prompt_injection` 这类预设名的场景）**完全不生效且无任何线索**；修复后确立「**显式优先**」：同名预设让位（跳过加载）并打一条 info 日志留痕，其余预设照常加载；构造完成后走公开 `add_guardrail()` 的显式注册语义不变（后注册覆盖先注册、仍打 warning） | **行为变化（正向修复）**：仅影响「构造器显式护栏与预设同名」这一种配置，此前被静默丢弃的用户规则恢复生效；无参冲突时行为逐字节一致 |
 | v1.0.3 | 2026-11-23 | P1 修复：`@guardrail_creator` 新增 `guardrail_type` 参数（`input` 默认 / `output` / `tool_call`），生成的护栏按类型继承对应基类、真正参与 `GuardrailMiddleware` 阶段分派与 `use_global=True` 扫描（此前「注册成功却永不执行」）；`tool_call` 型沿用 before/after 分发且后置受 `check_result` 约束；装饰 GuardrailBase 子类恢复原样返回（此前被误包装、检查即报配置错误）；非法 `guardrail_type` 创建时即抛 `GuardrailConfigError` | **行为变化（正向修复）**：此前静默不执行的函数式护栏现在会在对应阶段真正执行 |
 | v1.0.2 | 2026-11-23 | 四个统计/观测层缺陷修复（均不改放行/拦截控制流）：**P2**（观测）护栏 fail-closed 崩溃在 `except XxxGuardrailReject` 补记循环里被 `_record_result` 计一次、又由 `_record_guardrail_error` 计一次，同一次崩溃产生 `{name:1, name__error:1}` 双计数并发两个 span——补记循环对 `is_error` 的拒绝项改为 `continue`，交由 `_record_guardrail_error` 单记（C1 对规则命中路径的去重逻辑保留不变）；**P3**（统计）禁用护栏仍被 invoke，命中 `if not self.enabled: return allow()` 早退分支不写 `guardrail_name`，导致 `stats["pass"][""] += 1` 空名污染 pass_count——`_get_guardrails_by_type` 增加 `and g.enabled` 过滤，禁用护栏彻底不参与执行；**P4**（观测）fail-open 护栏崩溃 `allowed=True, is_error=True` 被当成完全健康的通过静默放行、运维无感知——`_record_result` 对任何 `is_error` 结果按 `{name}__error` 补记一条独立 error 计数（放行判定不变）；**P5**（语义）`GuardrailConfigError`（如 `allow_modify=False` 却调用 `modify()`）继承自 `GuardrailError`，被 invoke 的 `except GuardrailError` 当作普通内容拦截（`reason_kind="rule"`），把配置 bug 伪装成安全拦截——拆出独立 `except GuardrailConfigError` 分支按组件故障观测（`is_error=True` + 尊重 fail_open 姿态）。同步补 4 个行为回归测试到 `main_of_new_add`。P1（`@guardrail_creator` 装饰器护栏因不属三类子类，被 `_get_guardrails_by_type`/`run_*` 的 `isinstance` 过滤静默忽略，等于挂载即失效）属真实功能行为变更且装饰器分类方案需先定，本轮缓做、登记演进路线图 | 低：P2/P3/P4/P5 只改统计与观测维度，放行/拦截决策与钩子返回值语义逐字节不变；既有断言多用 `>= 1`（C1/N4/test_L6 等）不受影响 |
 | v1.0.1 | 2026-11-23 | 六个缺陷修复：**Bug1**（安全）`GuardrailBase.invoke/ainvoke` 改用 `to_scan_text` 全量扁平化，含 `content` 键的 dict 不再只扫描 content 值而绕过其余字段（`ToolCallGuardrail` 靠 `_normalize_input=False` 保留原始 pydantic 对象）；**Bug2**（可观测）`log_guardrail_event` 仅在真实拦截时置 span ERROR，fail-open 放行不再因空 `error=""` 被误标为错误；**Bug3**（并发正确性）`before_tool_call` 拦截时返回 `ToolDecision(False, 原因)` 二元组，拦截原因随返回值携带，不再依赖实例共享属性 `_last_tool_reject_reason`；**Bug4**（死代码）删除 `invoke/ainvoke` 写入但从未被读取的控制流标记 `metadata["_raise_reject"]`，并修正声称它驱动聚合层的误导性注释；**Bug5**（文档与行为不一致）`run_input_guardrails` 等聚合函数 docstring 声称「返回所有结果 / 经过所有护栏处理后的最终输出」，而实现是 **fail-fast**（命中第一条 allowed=False 即 raise、剩余护栏不跑）——逐个修正 8 个执行函数（含 4 个异步版）与两个护栏基类的 docstring；**Bug6**（字段契约不对称）`tags`/`metadata` 是 `GuardrailBase` 上唯一没在类体声明默认值的元数据字段，`__init__` 只能靠 `hasattr(type(self), ...)` 探测子类——子类覆盖 `__init__` 且漏调 `super()` 时 `to_dict()`/`clone()` 直接 `AttributeError`（已实跑复现），且发 `py.typed` 后静态检查看不到字段契约；改为类体声明 `tags: List[str] = []` / `metadata: Dict[str, Any] = {}` 并删掉 hasattr 分支（类值仅作兜底、`__init__` 依旧逐实例拷贝）；附带修正文档里“基类有 `unregister()`”的不存在 API 描述 | 低：钩子返回值语义扩展，旧式 `bool` 实现与主循环 `if not ret:` 判定均仍兼容（`ToolDecision` 重写 `__bool__`）；仅直接断言 `is False` 的测试需改为 `not ret`；Bug4 只移除私有键，Bug5 只改注释/docstring，Bug6 只补齐原本就等价的类默认值（无子类声明 tags 时新旧结果完全相同），三者公开行为逐字节不变 |
@@ -128,6 +135,12 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
 - 执行时机：Agent最终结果返回给用户前
 - 作用：过滤敏感信息、违规内容，支持内容自动脱敏/修改
 - 典型场景：手机号/身份证自动脱敏、违规内容拦截、输出格式校验
+- ⚠ **它在主循环的哪个位置生效**（路线图 v2.74.0 实测说清，agents 域 A2）：护栏跑在本轮正文已产出**之后**，
+  改写结果落在 `run_stream` / `arun_stream` 的 `end` 事件与 `run` / `arun` 的返回值上；
+  记忆沉淀（`_remember`）、trace span、`🎉 最终答案` 打印一直用的都是护栏后正文。
+  已确认拦住的两条绕过口子：①`return_direct` 工具直返结果同样过护栏（C3）；②护栏钩子自身抛异常按
+  fail-closed 兜底替为拦截文案（S1），不把模型原始输出透给用户。
+  仍保留的限制只有流式：`text` 增量为了打字机效果在护栏之前 `yield`，收不回，详见 §10.2 第 12 条
 
 ---
 
@@ -270,6 +283,10 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
     `ReActAgent._apply_output_guardrails()` 单一方法，两条路径共用，新增产出路径时只需调该方法。
 - 功能特性：
   - `auto_register_presets`：初始化时自动加载三个预设护栏
+  - **tool_registry 全时序注入（A2）**：无论 `tool_registry` 是先还是后于 `add_guardrail()` 设置，
+    权限护栏副本都能读到它；实例自己显式带了 registry 时不覆盖，`remove_guardrail()` 后重挂同样生效
+  - **显式优先（A1）**：构造器 `guardrails` 中与预设**同名**的护栏胜出，对应预设跳过加载并打 info 日志；
+    仅约束构造期，构造完成后用公开 `add_guardrail()` 注册同名护栏仍会替换预设副本并打 warning
   - `fail_open`：护栏执行出错时是否放行，默认True（容错优先）
   - 动态管理：`add_guardrail()`/`remove_guardrail()`/`enable_guardrail()`/`disable_guardrail()`
   - 自定义回调：`on_input_reject`/`on_output_reject`/`on_tool_reject`，支持自定义拦截返回内容
@@ -281,9 +298,9 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
 - 所有护栏通过/拦截事件自动上报，可在Trace链路中查询审计
 
 ### 7.7 preset/ 预设护栏
-- `safety_guardrail.py`：基础内容安全检查。输入侧（`DEFAULT_BLOCKED_PATTERNS`）识别用户「索取」违法/危险信息的请求；输出侧改用独立模式表（`DEFAULT_OUTPUT_BLOCKED_PATTERNS`），只拦截「确实在产出」可执行危害信息的表述，并叠加缓和语境豁免（命中附近出现「违法/禁止/抱歉/无法提供」等否定、警示、拒答词则放行），避免模型正常解释「如何制造毒品是违法的」被误拦。属高召回确定性基线，非高精度分类器。C2 修复后，非 str 的结构化输入（如 `{"query": "如何制造炸弹"}`）不再直接放行，而是经 `to_scan_text` 递归展开后照常扫描。
+- `safety_guardrail.py`：基础内容安全检查。输入侧（`DEFAULT_BLOCKED_PATTERNS`）识别用户「索取」违法/危险信息的请求；输出侧改用独立模式表（`DEFAULT_OUTPUT_BLOCKED_PATTERNS`），只拦截「确实在产出」可执行危害信息的表述，并叠加缓和语境豁免（**命中片段所处子句内**出现「违法/禁止/抱歉/无法提供」等否定、警示、拒答词则放行；v1.0.6 / B5 后豁免不跨子句外溢，「请勿模仿：」这类单独成句 / 成括号的免责声明挡不住整段危害步骤，逗号 / 顿号故意不算边界以保住同句科普），避免模型正常解释「如何制造毒品是违法的」被误拦。属高召回确定性基线，非高精度分类器。C2 修复后，非 str 的结构化输入（如 `{"query": "如何制造炸弹"}`）不再直接放行，而是经 `to_scan_text` 递归展开后照常扫描。
 - `injection_guardrail.py`：Prompt注入检测。中英双语规则表（中文「忽略之前的指令」「越狱」等，英文 `ignore previous instructions` / `do anything now` / `jailbreak` 等），匹配前先做 NFKC 归一化 + 转小写 + 去零宽字符，并在「去空白/分隔符」的压缩串上二次匹配，可对抗大小写、全角同形字与加空格绕过；C2 修复后同样覆盖 dict/list 结构化载荷（先 `to_scan_text` 展开再进入双视图匹配）。
-- `permission_guardrail.py`：高危工具权限控制，优先读 `ToolRegistry` 的 `requires_approval` 元数据（单一事实源），默认拦截 shell 执行、敏感路径写入、危险命令等高危操作。
+- `permission_guardrail.py`：高危工具权限控制，优先读 `ToolRegistry` 的 `requires_approval` 元数据（单一事实源），默认拦截 shell 执行、敏感路径写入、危险命令等高危操作。敏感路径扫查（第 5 步）自 v1.0.7 / B2 起不再只看顶层字符串参数，而是按先序**逐层展开** `tool_args`：dict 的键与值都扫、list / tuple / set / frozenset 逐元素扫、`os.PathLike` 经 `os.fspath` 扫；实现用**显式栈 + 分支 id 元组剪枝**（不用递归、不设深度上限），避免护栏自身抛 `RecursionError` / 死循环把主流程打挂；命中时 `metadata["arg_name"]` 给出定位路径（顶层仍为裸参数名，嵌套形如 `payload.path` / `paths[0]`）。
 
 ### 7.8 errors.py
 统一异常体系，每个模块独立异常类，对齐项目现有errors.py规范。
@@ -395,8 +412,8 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
 ### GuardrailMiddleware 中间件
 | 方法/参数 | 说明 |
 |-----------|------|
-| `__init__(auto_register_presets=True, fail_open=True, tracer=None)` | 构造函数 |
-| `add_guardrail(guardrail)` | 动态添加护栏 |
+| `__init__(auto_register_presets=True, fail_open=True, tracer=None)` | 构造函数；`guardrails` 显式传入的护栏与预设同名时，显式优先、预设让位（A1） |
+| `add_guardrail(guardrail)` | 动态添加护栏；middleware 已有 `tool_registry` 时，新挂载且自身未带 registry 的权限护栏副本会补拿到它（A2） |
 | `remove_guardrail(name)` | 移除护栏 |
 | `enable_guardrail(name)` | 启用护栏 |
 | `disable_guardrail(name)` | 禁用护栏 |
@@ -462,18 +479,67 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
      需要「跑完全部再汇总」时请自己逐个 `g.invoke(...)` 收集
    - 同理，把“后置脱敏/改写护栏”的 `priority` 排在“拦截护栏”之后，一旦拦截就不会脱敏——顺序要按意图设计
 
+8. **别把自定义护栏起名成预设同名，否则你以为在“覆盖预设”（v1.0.4 / A1 已修正为显式优先）**
+   - 现行为：`GuardrailMiddleware(guardrails=[我的护栏])` 中若 `我的护栏.name == "prompt_injection"`，
+     内置同名预设**不会加载**，你的规则说了算（有 info 日志可查）；其余预设照常生效
+   - 想要“预设 + 自定义”共存时，给自定义护栏取另一个名字（建议 `模块_功能` 格式）；
+     想要完全接管某一预设的行为时，才复用它的名
+   - 注意区分：构造**完成后**调 `add_guardrail()` 属显式替换，会顶掉已挂载的同名预设并打 warning
+
+9. **`tool_registry` 与 `add_guardrail()` 的先后次序不再影响拦截（v1.0.5 / A2）**
+   - 修复前：`tool_registry` 只在被赋值的**那一刻**广播；已经赋值之后再 `add_guardrail` 进来的
+     `BasicPermissionGuardrail` 副本永远拿不到 registry，`requires_approval=True` 的工具直接放行
+   - 现行为：两种时序都生效；注入只作用于 clone 副本，绝不回写你传入的原型实例
+   - 想要护栏用自己的 registry（而非 middleware 的）：在构造护栏时显式传 `tool_registry=...`，
+     `add_guardrail()` 不会覆盖它；但后续给 `middleware.tool_registry` 赋值仍会无条件广播覆盖（setter 旧语义）
+
+10. **别指望靠一句免责声明放行危害输出（v1.0.6 / B5）**
+   - 豁免词只在**命中片段所处的那个子句**内生效：「请勿模仿：」「（本内容违法）」「免责声明：本文仅供学术参考。」
+     这类单独成句 / 成括号的话只修饰它自己，不再把后面的整段步骤一并洗白
+   - 确实要保留旧的跨句豁免（如接入的是自带全文声明的第三方内容）：自己的护栏类覆写
+     `_has_mitigating_context` 即可，不要改预设
+   - 收紧的另一面是误拦：同子句内没有表内缓和词的新闻 / 司法通报体（「已被依法刑事拘留」）会被拦。
+     词表刻意保持现状——扩词会同时放大绕过面；真要兼顾，叠一层模型判定类护栏而不是改词表
+   - `mitigation_window` 仍然是「前后各 N 字符」，但现在只是**上限**：调大它不能退回跨句豁免，
+     设 0 则只看命中片段自身
+
+11. **不要把路径藏进嵌套参数就以为看不见（v1.0.7 / B2）**
+   - 敏感路径扫描会逐层展开：`{"payload": {"path": "/etc/passwd"}}`、`{"paths": ["/etc/shadow"]}`、
+     路径写在**字典键**上 `{"files": {"/etc/passwd": "r"}}`、传 `Path` 对象，如今都拦得住
+   - 但它是**子串表**不是路径解析器，仍有漏检面（本版不处理）：变形写法（`/etc//passwd`、
+     `/etc/./passwd`、URL 编码、八进制/符号链）、拼接后才出现的路径、非字符串载体（bytes / base64）
+     扫不到；要堵这些需接入真实文件系统做 `realpath` 判定，超出护栏层职责
+   - ⚠ **已知未修缺陷（分隔符归一化）**：表内 unix 条目全是正斜杠，而 Windows 上
+     `os.fspath(Path("/etc/shadow"))` 会被展开为 `\etc\shadow`，与表内条目对不上而漏拦；
+     顶层字符串写成 `"\\etc\\shadow"` 同样漏——这是修复前后**都存在**的老问题，不属 B2（嵌套）范畴，
+     且归一化会把 `/sys` 这类短条目的子串误伤面放大，因此单列而不并入本次
+   - 关闭扫描请用 `check_sensitive_paths=False`，语义不变（彻底不扫，不是只关嵌套）
+
+12. **别以为挂了输出护栏就能拦回已经流出去的正文（路线图 v2.74.0 / agents 域 A2）**
+    - 护栏能改的只有两处：`run` / `arun` 的**返回值**、`run_stream` / `arun_stream` 的 **`end` 事件正文**；
+      `text` 增量在护栏之前就已 `yield`，物理上收不回（同步与异步两条链路逐字一致）
+    - 旧版除了流式这一条，还多一个真正的漏洞：`run` / `arun` 优先拼接 `text` 增量，于是非流式调用方
+      拿到的就是脱敏 / 拦截前的原文——modify 与 reject 两种语义均实测泄露过，现 v2.74.0 已修
+    - 调用方对策：需要强护栏语义请用 `run` / `arun`；要保留打字机效果又必须脱敏，则累加 `text` 到
+      `end` 事件后一次性展示；拦得住的场景可凭 `end.finish_reason == "guardrail_block"` 清空已展示内容，
+      而**脱敏（modify）场景没有任何事件级标记**（`StreamChunk` 无 `metadata` 字段可挂）
+    - 自定义 `AgentBase` 子类时注意：护栏策略只落在 `ReActAgent`，基类默认的 `arun` 仍是“聚合 `text`
+      增量”的原始语义（基类不知道护栏的存在）——自己写了主循环又挂护栏的，请像 `ReActAgent.arun`
+      那样覆盖并取护栏后正文
+
 ### 10.3 跨平台注意事项
-- 所有路径判断统一使用os.path处理，Windows反斜杠路径自动兼容
+- 敏感路径判定是**关键词子串匹配**，不做 `os.path` 归一化也不做 `realpath`：表内 unix 条目为正斜杠
+  字面量，Windows 上反斜杠写法与 `Path` 对象展开结果对不上→会漏拦（见 §10.2 第 11 条，尚未修复）
 - 正则表达式默认开启re.IGNORECASE，大小写不敏感匹配
-- 无平台特定依赖，Windows/macOS/Linux全平台支持
+- 代码本身无平台特定依赖，Windows/macOS/Linux 均可运行；但权限护栏的路径表需按目标平台自行补齐
 
 ---
 
 ## 十一、测试与验证
 
 ### 11.1 测试覆盖范围
-单元测试共 **113 项**（`tests/guardrails/` 下 10 个文件：51 主用例 + 19 真实 ReActAgent 端到端
-+ 16 模拟 Agent 链路 + 27 分项），覆盖：
+单元测试共 **125 项**（`tests/guardrails/` 下 11 个文件：45 主用例 + 12 中间件 + 19 真实 ReActAgent 端到端
++ 16 模拟 Agent 链路 + 33 分项），覆盖：
 - 基类功能：GuardrailResult结构体、装饰器注册、优先级排序、序列化
 - 三类护栏：输入/输出/工具护栏的放行/拦截/修改逻辑
 - 预设护栏：注册、Prompt注入检测、高危工具拦截、正常内容放行
@@ -499,6 +565,49 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
     即抛 `GuardrailConfigError`；装饰类原样返回不被误包装。同步翻转 `test_guardrails_sim_agent.py` S15
     （「现状记录 not_dispatched」→ dispatched），修正 `test_tool_call_guardrail.py::test_tool_call_allow`
     空转断言为显式注册 + 真实执行
+- 缺陷回归（v1.0.4）：
+  - **A1** `test_A1_explicit_guardrail_wins_over_same_name_preset`：故意不关预设、只传一个与
+    `prompt_injection` 同名的自定义输入护栏，断言：挂载的是用户实例副本（非预设类）、共 4 个护栏
+    （其余预设照常）、自定义规则真正拦截、内置英文注入规则因让位而不再拦截、让位必有 info 日志；
+    显式 `presets=[...]` 名单同样让位；构造后公开 `add_guardrail()` 仍替换同名预设并打 warning（R1 守护）
+- 缺陷回归（v1.0.5）：
+  - **A2** `test_s4_6_add_guardrail_after_late_injection_still_gets_registry`（`test_s4_tool_registry_injection.py`）：
+    故意不挂 `basic_permission` 预设、走「建 middleware → 注入 registry → 后 `add_guardrail` 权限护栏」时序，
+    断言副本 `tool_registry is registry`、`requires_approval=True` 工具真正被拦且原因来自单一事实源、
+    不回写原型；并守护：实例自带 registry 不被 `add_guardrail` 覆盖、setter 的无条件广播不变、
+    middleware 无 registry 时不凭空注入且精确名单兜底照旧、非权限护栏不被塞私有字段
+- 缺陷回归（v1.0.6）：
+  - **B5** `test_B5_output_mitigation_does_not_leak_across_clauses`：以「建护栏 → 逐句判定」的行为断言驱动，
+    断言 3 条修复前实测 ALLOWED 的跨子句豁免样本（前缀「请勿模仿：」、后缀「（本内容违法）」、
+    感叹号另起一句的「警告：这是违法行为」）全部转为拦截，并保留一条修复前后都拦得住的对照样本；
+    同时守护同子句科普 / 拒答的 4 条放行样本不回退、`mitigation_window=100000` 不能退回跨句豁免、
+    `mitigation_window=0` 只看命中片段自身、走 `GuardrailMiddleware.after_agent_run` 的预设链路同样拦得住；
+    并把「同子句无表内缓和词的新闻体被误拦」作为**已知代价**钉进断言，防止无声漂移
+- 缺陷回归（v1.0.7）：
+  - **B2** `test_B2_nested_tool_args_sensitive_path_still_blocked`：一个函数内 10 个子块——
+    6 种修复前实测 ALLOWED 的嵌套形态（内嵌 dict / list 元素 / 多层混合 / 路径写在字典键上 /
+    先序取首个命中 / `Path` 对象）全部转为拦截并校验 `arg_name` 定位路径；同时守住契约不回退：
+    顶层命中的 `arg_name` 仍为裸参数名且 `reason` 文案逐字节一致、正常嵌套参数（`system` /
+    `path_style` / `--syslog` / 标量）不误伤、12 层与 40 层深嵌套仍拦得住（无深度上限）、
+    自引用参数 `cyc["self"] = cyc` 不崩且正常放行、`tool_args` 为非 dict（list / str / None / int / set）
+    不再抛 `AttributeError`、`check_sensitive_paths=False` 仍彻底不扫、`clone()` 副本保留新能力、
+    走 `GuardrailMiddleware.before_tool_call` 的预设链路同样拦得住（`ToolDecision` 为假且原因含「敏感路径」）
+
+    > 口径说明：本项不断言「正斜杠 `Path` 在 Windows 上能命中」——`os.fspath` 会把它展开为反斜杠而与
+    > 表内条目对不上，属修复前后都存在的分隔符缺陷（§10.2 第 11 条），**不把它固化成期望行为**
+- 缺陷回归（v1.0.8）：
+  - **B1** `test_B1_empty_set_not_replaced_by_default`：传空集合时不被 `or` 运算符替换为默认值
+    （修复前 `blocked_tool_names or DEFAULT_DANGEROUS_TOOL_NAMES` 使空集合被当未传，用户显式传 `set()`
+    想关闭拦截拦截时，默认危险工具名照样生效）；同时守护传 `None` 时使用默认值、传非空集合时保留用户值
+  - **B3** `test_B3_extra_fields_forbidden_in_models`：三个安全关键模型（`GuardrailResult` / `ToolCallInfo` /
+    `ToolResultInfo`）使用 `extra="forbid"`，拼错字段名（如 `alowd=True` / `tool_ars={...}` / `sucess=True`）
+    立即抛 `ValidationError`；同时守护正确字段名能正常构造
+- 缺陷回归（v1.0.9）：
+  - **B4-RC1** `test_B4_injection_false_positive_fixed`：跨句误拦样本（如「Don\'t forget the previous chapters. Instructions
+    for installation are below.」）应转放行——句子切分后逐句匹配不再粘连无关子句
+  - **B4-RC2**：词融合误拦样本（如「jail  break the habit」）应转放行——`jailbreak` 模式改用非空格压缩视图
+  - **安全守护**：18 条绕过样本（含换行绕过/全角绕过/分隔符绕过/中文绕过/jail-break-mode）全部仍拦截
+  - **test_s4 字段名拼错修复**：`ToolCallInfo(arguments=...)` 改为 `ToolCallInfo(tool_args=...)` （B3 的 `extra="forbid"` 暴露出该拼写缺陷）
 
 ### 11.2 运行测试命令
 本仓库测试不依赖 pytest，逐文件直接运行即可：

@@ -29,6 +29,11 @@
 
 | 版本 | 日期 | 变更 | 作者 |
 |------|------|------|------|
+| 3.3.6 | 2026-11-24 | **P4 轻微问题批量打磨（审计编号 5–10 一次修完，零新增依赖、默认行为不变）**：①`GetPromptResult.as_messages(role_prefix)` 是**死参数**（从未被读取）——现让它生效（`True` 时 content 前缀 `[role] `），默认值由 `True` 改为 `False`，因参数此前无效，**无参调用输出与旧版逐字节一致**；②`client.py` 顶层 `MCPProtocolError` 死 import 删除；③`MCPRegistry._closed` **只写不读**——现 `close_all()` 之后 `connect()` 直接抛 `MCPError`（`connect_all` / `connect_and_expand` 走既有异常兜底，降级为 warning / 友好失败）；④`_unregister_one` 的兜底前缀扫描**硬编码 `"__"`**，自定义 `prefix_sep` 注册的历史残留清不掉——改用该 server 上次展开记录的 `prefix_sep`；⑤`StreamableHTTPTransport._json_resolved` **只增不清**（长驻进程慢速泄漏）——响应被 `recv()` 消费即 `discard` 该 id，`close()` 整表 clear 兜底；⑥`list_changed` 刷新后已注册的粗粒度 `MCPServerTool._tools_index` **永久停在旧快照**，新增子工具永远报「不存在」——新增 `MCPServerTool.update_tools()`，registry 用 `_coarse_tools` 留引用并在刷新时同步；⑦**顺带挖出的根因**：`list_changed` 处理器由客户端读线程同步回调，而刷新自身要再发请求、响应只有读线程消费 → **自死锁直到超时，v3.2 的自动刷新从未在任何传输上生效过**（探针实证），现由 `_schedule_refresh` 甩独立 daemon 线程。新增回归用例 `test_polish_p1`–`test_polish_p5`，tests/mcp 全量 65/65 全绿 | — |
+| 3.3.5 | 2026-11-24 | **缺陷修复（声明式配置 env 静默丢弃，零新增依赖、仅纯新增可选参数）**：`MCPRegistry.add_config` 走 stdio `command_str` 分支时此前调 `add_stdio_cmd(name, command_str, cwd)` 把 `config.env` 丢弃——`StdioTransport` 本身支持 env，缺的是中间透传环节，声明式写法的环境变量从未生效（探针 P-D 实证）；现 `make_stdio_transport` / `add_stdio_cmd` / `MCPConfig.stdio_cmd` 三层增加可选参数 `env=None` 并透传，`add_config` 传入 `config.env`；默认 `None` 行为逐字节不变。新增回归用例 `test_registry_r1`，tests/mcp 全量 60/60 全绿 | — |
+| 3.3.4 | 2026-11-24 | **缺陷修复（Schema 转换缓存键，零新增依赖、零签名变更）**：`_schema_to_pydantic` 嵌套对象缓存键原为 `str(prop["properties"])`，不含同级 `required` 与对象自身约束——同一 schema 里两个 properties 完全一致、必填集合不同的嵌套对象会复用同一模型，必填字段被静默降级为可选（校验绕过）或可选字段被误强制必填（合法调用被拒），双向错乱（探针 P-C 实证）；缓存键改为整个 prop 的规范化序列化（`json.dumps(sort_keys=True)`），结构等价 ⇔ 键等价，完全相同结构的缓存复用仍生效。新增回归用例 `test_schema_c12`，tests/mcp 全量 59/59 全绿 | — |
+| 3.3.3 | 2026-11-24 | **缺陷修复（资源模板方法名，零新增依赖、零破坏性变更）**：`MCPClient.list_resource_templates()` 此前误复用 `resources/list`——合规服务器不会在该响应里返回 `resourceTemplates`，导致本方法恒为空（此前仓内示例 server 同样不规范地把模板混在 `resources/list` 里返回，两边联合掩盖问题，`test_d2`/`test_d8` 一直绿）；现改走规范方法 `resources/templates/list`，并对「声明了 resources 能力但未实现本方法（JSON-RPC -32601）」的服务器降级返回空列表，不打断 `registry.connect` 等上层流程；`MCPCallError` 新增可选 `error_code` 参数（默认 `None`，既有单参构造不变）供调用方区分错误码；`examples/mcp/resources_prompts_server.py` 同步修正为模板独立方法返回。新增回归用例 `test_d11`，tests/mcp 全量 58/58 全绿 | — |
+| 3.3.2 | 2026-11-24 | **缺陷修复（stdio 传输层，零新增依赖、零签名变更）**：Windows 上 `make_stdio_transport` 的 `shlex.split(posix=False)` 会把引号字符残留在 token 里，`'"exe" "script"'` 形式的命令串（含空格路径的标准写法）启动时程序名带字面引号交给 `CreateProcess`，必然 `FileNotFoundError`（`test_8_dynamic_connect_and_close` 此前因此确定性红灯）；现在切分后剥离 token 首尾成对双引号并还原 `\"`，空 / 纯引号命令提前抛 `MCPConnectionError`；非 Windows 走 `posix=True` 路径行为不变（引号本就被 shlex 剥离）。新增回归用例 `test_transport_t8` | — |
 | 3.2.1 | 2026-11-18 | **传输层拆分为包（纯结构调整，零依赖变更）**：`fast_agents/mcp/transports.py`（453 行）拆成 `transports/` 包——`transport_base.py`（抽象基类）、`stdio_transport.py`（`StdioTransport` + 工厂）、`sse_transport.py`（`SSETransport`），`fast_agents.mcp.transports` 导入路径不变；按仓库 `*_base` 命名约定，`Transport` → `TransportBase`、`make_stdio` → `make_stdio_transport`（`fast_agents` 与 `fast_agents.mcp` 两处顶层同名导出随之更名，属破坏性重命名，旧名不保留）。测试 48/48 不变 | — |
 | 3.2.0 | 2026-11-17 | **新增 `resources` / `prompts` 支持**：`MCPClient` 增加 `list_resources()` / `list_resource_templates()` / `read_resource(uri)` / `list_prompts()` / `get_prompt(name, arguments)` 五个方法（服务器未声明对应能力时自动返回空列表、不发请求）；`models.py` 增加 `ResourceInfo` / `ResourceTemplateInfo` / `ReadResourceResult` / `TextResourceContents` / `BlobResourceContents` / `PromptInfo` / `PromptArgument` / `PromptMessage` / `GetPromptResult` 九个模型；`MCPRegistry` 在 `connect()` 时缓存 resources / templates / prompts 并注册 `notifications/*/list_changed` 自动刷新处理器，新增对应查询与转发方法；粗粒度 `MCPServerTool` 的 `action` 从 2 个扩展到 6 个（新增 `list_resources` / `read_resource` / `list_prompts` / `get_prompt`）；`CallResult` 新增 `images()` 提取图片内容。测试 38 → 48 | — |
 | 3.1.0 | 2026-11-17 | **稳定性版本（对外 API、签名、既有测试断言均不变）**：①`MCPClient` 内部升级——`threading.Event` 唤醒替代 10ms 忙等轮询；引入状态机（`disconnected/connecting/connected/closing/closed`）使 `connect()` / `close()` 幂等且线程安全；新增只读属性 `state` 与 `on_notification()`——服务器推送的 notification 不再被丢弃，改由注册的 handler 分发；`close()` 会唤醒在途请求并等待读线程优雅退出；删除死代码 `_event`。②传输层健壮性——`StdioTransport` 新增 stderr 后台读线程 + `get_last_stderr()`、子进程异常退出主动抛错、`send()` 检查进程存活、`close()` 优雅退出；`SSETransport` 修复 `recv()` 递归隐患（改循环）、队列满丢最旧不阻塞读线程、流断开投递 disconnected 哨兵、POST 错误分级（5xx → 连接错 / 4xx → 协议错）、SSE 事件去缓冲（`chunk_size=1` + `Accept-Encoding: identity`）。③`_schema_to_pydantic` 增强——支持 array `items`、嵌套 `object` 递归、`enum`、`default`（含 falsy 值修正）、`minimum` / `maximum` / `minLength` / `maxLength` / `pattern` / `minItems` / `maxItems`、`anyOf` / `oneOf` 含 `null` 转 `Optional`。同时修复测试里示例服务器路径 bug（`parents[1]`→`parents[2]`，该 bug 曾使 10 个 MCP 用例整体失败）。测试 10 → 38 | — |
@@ -471,7 +476,7 @@ class InitializeResult(BaseModel):
 ```python
 MCPConfig.stdio(name, command, args=None, env=None, cwd=None)
 MCPConfig.sse(name, url, headers=None, timeout=30.0)
-MCPConfig.stdio_cmd(name, command_str, cwd=None)
+MCPConfig.stdio_cmd(name, command_str, cwd=None, env=None)
 ```
 
 字段：
@@ -499,7 +504,7 @@ MCPConfig.stdio_cmd(name, command_str, cwd=None)
 | `PromptArgument` | `prompts/list` | `name` / `description` / `required` |
 | `PromptInfo` | `prompts/list` | `name` / `description` / `arguments` |
 | `PromptMessage` | `prompts/get` | `role` / `content`，`as_text()` 渲染 |
-| `GetPromptResult` | `prompts/get` | `description` / `messages`，`as_messages()` 转 `{role, content}` |
+| `GetPromptResult` | `prompts/get` | `description` / `messages`，`as_messages()` 转 `{role, content}`；`as_messages(role_prefix=True)` 在 content 前附 `[role] ` 前缀（该参数 v3.3.6 起真正生效，默认 `False` 保持标准消息） |
 
 ### 6.6 `TransportBase`（`transports/transport_base.py`，抽象基类）
 
@@ -566,6 +571,7 @@ __all__ = [
 | `transport_base.py` | `TransportBase` 抽象基类（原 `Transport`，按仓库 `*_base` 命名约定更名） |
 | `stdio_transport.py` | `StdioTransport` + `make_stdio_transport` 工厂 |
 | `sse_transport.py` | `SSETransport` |
+| `streamable_http_transport.py` | `StreamableHTTPTransport` + `make_streamable_http_transport` 工厂（v3.3.0 随 D6 交付：MCP 2025 规范单端点 HTTP，响应 Content-Type 分流 JSON 直返 / SSE 流，`Mcp-Session-Id` 会话 + `close()` 发 DELETE） |
 
 > 原单文件 `transports.py`（453 行）拆成包后，`fast_agents.mcp.transports` 导入路径与 `from fast_agents.mcp import StdioTransport` 等用法不变；仅抽象基类与工厂函数更名——`Transport` → `TransportBase`、`make_stdio` → `make_stdio_transport`。
 
@@ -605,17 +611,39 @@ SSETransport(url, headers=None, timeout=30.0)
 
 > **概念澄清**：这里的「SSE」其实是一个**混用**——下行用 SSE 长连接，上行用普通 HTTP POST。这是 MCP 早期 SSE 传输的规范做法（后来被 `streamable-http` 取代）。
 
+#### `StreamableHTTPTransport`（`streamable_http_transport.py`，v3.3.0）
+
+```python
+StreamableHTTPTransport(url, headers=None, timeout=30.0)
+```
+
+- `connect()` **不发请求**，只校验 URL + 建 session（真正握手由上层 `initialize` 触发，那时才能拿到 `Mcp-Session-Id`）；`requests` 延迟 import，未安装时首次使用抛 `MCPConnectionError`；
+- `send()` POST 同一端点，按响应 `Content-Type` 分流：`application/json` 直接当本次响应入队（**不建后台线程**）；`text/event-stream` 才起读线程持续解析并入队；
+- **`_json_resolved` 记账**：JSON 直返已处理过的请求 id 登记在此，避免同一响应被 SSE 读线程重复分发；**v3.3.6 修正**：该集合此前只增不清（长驻进程慢速泄漏），现在响应被 `recv()` 消费即 `discard(msg_id)`（取 `_resolve_lock`），`close()` 整表 clear 兜底；
+- 流断开时读线程用 `Last-Event-ID` 续传重连，多次失败后投递 `disconnected` 哨兵，与 `SSETransport` 行为一致。
+
 #### `make_stdio_transport`（`stdio_transport.py`）
 
 ```python
-def make_stdio_transport(command_str: str, cwd: Optional[str] = None) -> StdioTransport:
-    parts = shlex.split(command_str, posix=(sys.platform != "win32"))
-    if not parts:
+def _unquote_token(token: str) -> str:
+    if len(token) >= 2 and token[0] == token[-1] == '"':
+        # posix=False 保留引号；剥首尾成对双引号并还原内部的 \"
+        return token[1:-1].replace('\\"', '"')
+    return token
+
+def make_stdio_transport(command_str: str, cwd: Optional[str] = None,
+                         env: Optional[Dict[str, str]] = None) -> StdioTransport:
+    parts = [_unquote_token(p) for p in shlex.split(command_str, posix=(sys.platform != "win32"))]
+    if not parts or not parts[0]:
         raise MCPConnectionError("命令不能为空")
-    return StdioTransport(command=parts[0], args=parts[1:], cwd=cwd)
+    return StdioTransport(command=parts[0], args=parts[1:], cwd=cwd, env=env)
 ```
 
 > **`posix=(sys.platform != "win32")`** 这一行是 Windows 兼容的关键。`posix=True`（Unix 默认）会把反斜杠当转义符，Windows 路径 `D:\code` 会被吃掉；所以 Windows 上必须用 `posix=False`。
+>
+> **v3.3.2 补充**：`posix=False` 的代价是引号字符会残留在 token 里（posix 模式才会剥离），带字面引号的程序名交给 `Popen` 直接 `FileNotFoundError`——所以切分后要用 `_unquote_token` 剥离首尾成对双引号。
+>
+> **v3.3.5 补充**：新增可选 `env` 参数透传 `StdioTransport`（合并进 `os.environ` 后再覆盖），补齐 `command_str` 形态此前没有 env 入口的缺口，见 [10.15](#1015-坑声明式配置-command_str-形态的-env-被静默丢弃v335-已修复)。
 
 ### 7.5 `client.py`
 
@@ -648,7 +676,7 @@ PROTOCOL_VERSION = "2024-11-05"
 | 方法 | 说明 |
 |------|------|
 | `list_resources(timeout=10.0)` | 列出资源；服务器未声明 `resources` 能力时直接返回 `[]`（不发请求） |
-| `list_resource_templates(timeout=10.0)` | 列出参数化资源模板（`resourceTemplates`） |
+| `list_resource_templates(timeout=10.0)` | 列出参数化资源模板（`resourceTemplates`）；走规范方法 `resources/templates/list`（v3.3.3），服务器未实现该方法（-32601）时降级返回 `[]` |
 | `read_resource(uri, timeout=30.0)` | 按 URI 读取资源 → `ReadResourceResult`（文本 / 二进制 blob 均支持） |
 | `list_prompts(timeout=10.0)` | 列出提示模板；服务器未声明 `prompts` 能力时直接返回 `[]` |
 | `get_prompt(name, arguments=None, timeout=30.0)` | 渲染提示模板 → `GetPromptResult`（`as_messages()` 可直接注入对话） |
@@ -671,7 +699,7 @@ PROTOCOL_VERSION = "2024-11-05"
 | `add_config(config)` | 按 `MCPConfig` 分派到下面两个；stdio 时 `command_str` 优先 |
 | `add_configs(configs)` | 循环 `add_config` |
 | `add_stdio(name, command, args, env, cwd)` | 存一个 **factory**（闭包），不立即连接 |
-| `add_stdio_cmd(name, command_str, cwd)` | 用 `make_stdio_transport` 建好 transport，再包成 factory |
+| `add_stdio_cmd(name, command_str, cwd, env)` | 用 `make_stdio_transport` 建好 transport，再包成 factory（`env` 为 v3.3.5 新增可选参数） |
 | `add_sse(name, url, headers, timeout)` | 同上 |
 
 > 关键设计：**注册只存 factory，不连接**。连接是 `connect()` 的事。这让「注册很多 server 但只连其中几个」变得自然。
@@ -680,10 +708,10 @@ PROTOCOL_VERSION = "2024-11-05"
 
 | 方法 | 说明 |
 |------|------|
-| `connect(name, timeout=10.0)` | **幂等**：已在 `_clients` 里直接返回；否则 factory 造 client → `connect()` → `list_tools()` / `list_resources()` / `list_resource_templates()` / `list_prompts()` → 注册 `notifications/*/list_changed` 自动刷新处理器 → 记日志 |
+| `connect(name, timeout=10.0)` | **幂等**：已在 `_clients` 里直接返回；否则 factory 造 client → `connect()` → `list_tools()` / `list_resources()` / `list_resource_templates()` / `list_prompts()` → 注册 `notifications/*/list_changed` 自动刷新处理器 → 记日志；`close_all()` 之后调用抛 `MCPError`（v3.3.6，`_closed` 从只写不读变为真正拦截） |
 | `connect_all(timeout=10.0)` | 遍历 factories；**单个失败只 `logger.warning`，不中断** |
-| `close(name)` | 关 client + 清 `_tools` / `_resources` / `_resource_templates` / `_prompts` / `_registered_names` / `_expand_mode` / `_prefix_sep` |
-| `close_all()` | 遍历 `close()`，置 `_closed = True` |
+| `close(name)` | 关 client + 清 `_tools` / `_resources` / `_resource_templates` / `_prompts` / `_registered_names` / `_expand_mode` / `_prefix_sep` / `_coarse_tools` |
+| `close_all()` | 遍历 `close()`，置 `_closed = True`（v3.3.6 起 `connect()` 会检查它，关闭后拒绝再连） |
 
 **查询**：
 
@@ -695,13 +723,15 @@ PROTOCOL_VERSION = "2024-11-05"
 
 **list_changed 自动刷新（v3.2 新增）**：`connect()` 时若服务器声明 `listChanged`，为工具 / 资源 / 提示分别注册 `notifications/tools|resources|prompts/list_changed` 处理器，收到推送即重拉对应列表刷新本地缓存（只刷缓存、不自动重注册工具，避免打断正在执行的调用）。
 
+> **v3.3.6 两处修正**：①**根因**——处理器由客户端读线程同步回调，而 `_refresh_*` 内部要再发一次请求，响应只有读线程自己能消费，同步执行就是**自死锁直到 5s 超时**（探针实证：v3.2 起这条自动刷新链路从未真正生效过）；现统一走 `_schedule_refresh()`，把刷新甩到独立 daemon 线程，处理器立即返回。②刷新时同步已注册**粗粒度门脸**的工具索引（`_coarse_tools` → `MCPServerTool.update_tools()`），否则门脸永远只认注册那一刻的子工具列表。
+
 **展开**：
 
 | 方法 | 说明 |
 |------|------|
 | `register_into(registry, prefix_sep="__", expand="fine")` | 遍历已连接 server；**先 `_unregister_one` 卸旧的**（避免重复注册）→ `_expand_one` → 记录 `_registered_names` / `_expand_mode` / `_prefix_sep` |
 | `unregister_from(registry, server_name=None)` | 卸载（**不关连接**）。不传 `server_name` 卸载全部 |
-| `_unregister_one(registry, server_name)` | 先按 `_registered_names` 精确卸；**再扫前缀兜底**（`{server}__` 和 `mcp__{server}`），清理「用过别的模式注册」的残留 |
+| `_unregister_one(registry, server_name)` | 先按 `_registered_names` 精确卸；**再扫前缀兜底**（`{server}{sep}` 和 `mcp{sep}{server}`），清理「用过别的模式注册」的残留；`sep` 取该 server 上次展开记录的 `_prefix_sep`（默认 `"__"`，v3.3.6 前硬编码） |
 | `connect_and_expand(name, registry, expand="fine", prefix_sep="__", timeout=10.0)` | 连接 + 立即展开，返回工具名列表。供 `connect_mcp_server` 用 |
 | `close_and_remove(name, registry)` | 卸载 + 关连接 |
 
@@ -729,7 +759,7 @@ PROTOCOL_VERSION = "2024-11-05"
 2. **不在 `required` 里** → 包成 `Optional`，`default` 取 schema 里的值（**含 `False` / `0` / `""` / `[]` 等 falsy 值，不再被误判为 `None`**），没有就 `None`；
 3. **有 `enum`** → 覆盖成 `Literal[tuple(enum)]`；
 4. **`array`**：有 `items` 则递归转成 `list[元素类型]`（支持对象数组）；
-5. **嵌套 `object`**：递归生成子模型（同名结构走缓存，避免重复建类）；
+5. **嵌套 `object`**：递归生成子模型（整个 prop 的规范化序列化等价才走缓存复用；v3.3.4 前键只含 `str(properties)`，同构不同必填会串模型，见 [10.5](#105-坑schema_to_pydantic-只展开一层v31-已修复)）；
 6. **校验约束**：`minimum`/`maximum`/`exclusiveMinimum`/`exclusiveMaximum` → `ge`/`le`/`gt`/`lt`；`minLength`/`maxLength`/`pattern` → `min_length`/`max_length`/`pattern`；`minItems`/`maxItems` → `min_items`/`max_items`；
 7. **`anyOf`/`oneOf` 含 `null`** → `Optional[T]`。
 
@@ -755,6 +785,8 @@ return ToolResult.ok(text, artifact={"content": [c for c in result.content if c.
 #### `MCPServerTool`
 
 见 [5.3](#53-粗粒度mcpservertoola1-方案)。
+
+**`update_tools(tools)`（v3.3.6 新增）**：原地刷新门脸内部的 `_tools_list` / `_tools_index` 快照。`MCPRegistry` 收到 `tools/list_changed` 时**不会**重注册工具（避免打断在途调用），但会把新列表喂给已注册的门脸，使服务器新增的子工具立刻可通过 `action=call_tool` 调用——修复「门脸只认注册那一刻的旧列表」的索引过期问题。
 
 ### 7.8 `tools/builtin/mcp_tool.py`
 
@@ -1000,6 +1032,7 @@ content = c.read_resource("file:///a.txt")      # ReadResourceResult
 prompts = c.list_prompts()                      # List[PromptInfo]
 rendered = c.get_prompt("code_review", {"lang": "python"})   # GetPromptResult
 rendered.as_messages()                          # [{"role": ..., "content": ...}]
+rendered.as_messages(role_prefix=True)          # content 前缀 "[role] "（v3.3.6 起参数真正生效）
 c.close()                          # 幂等：重复调用、多线程并发调用都安全
 ```
 
@@ -1140,6 +1173,8 @@ v3.0 里嵌套 `object` 只会变成 `dict`、`array` 只变成裸 `list`，不�
 
 **v3.1 已增强**：支持嵌套 `object` 递归展开、`array` 的 `items`（含对象数组）、`enum`、`default`（含 falsy 值）、数值 / 字符串 / 数组校验，并以 `test_schema_c1`–`c11` 锁定。
 
+**v3.3.4 补记（同一函数的另一个坑）**：嵌套模型的缓存键此前只含 `str(properties)`，不含同级 `required`——同 schema 里两个同构但必填集合不同的嵌套对象会串用同一模型，双向都错（必填被降级放行 / 可选被强制拦截，探针 P-C 实证）；现键改为整个 prop 的规范化序列化，以 `test_schema_c12` 锁定。
+
 > 仍存的一点边界：粗粒度模式下 `_list_tools_text()` 只列一层参数，嵌套字段的细节不会出现在文本描述里——此时优先看 server 自己给的 `description`。
 
 ### 10.6 坑：`artifact` 只留 text，图片不传（部分缓解）
@@ -1193,6 +1228,8 @@ v3.0 里 `ServerCapabilities` 解析了 `resources` / `prompts` 但代码从不�
 
 **v3.2 已补齐**：`MCPClient` 新增 `list_resources` / `list_resource_templates` / `read_resource` / `list_prompts` / `get_prompt`；服务器未声明对应能力时这些方法自动返回空列表（不发请求），不会报错。粗粒度 `MCPServerTool` 也补了对应 action。
 
+**v3.3.3 修正**：`list_resource_templates` 此前误调 `resources/list`，对合规服务器恒为空；现改调规范的 `resources/templates/list`，服务器返回 -32601 时降级空列表。接真实 server 时模板能拿到的前提从此成立。
+
 > 仍未做：`logging` / `sampling` / `roots`。接 server 前可先看它 `capabilities` 里声明了哪几类。
 
 ### 10.12 跨平台注意事项（Windows 专项）
@@ -1221,10 +1258,12 @@ Windows 简体中文环境的默认代码页是 GBK。如果子进程是 Python 
 **③ `shlex.split` 用 `posix=False`**
 
 ```python
-parts = shlex.split(command_str, posix=(sys.platform != "win32"))
+parts = [_unquote_token(p) for p in shlex.split(command_str, posix=(sys.platform != "win32"))]
 ```
 
 Windows 路径里的反斜杠在 `posix=True` 下会被当转义符吃掉。所以 Windows 必须 `posix=False`。
+
+但 `posix=False` 会把**引号字符保留在 token 里**——修复前 `'"D:/Program Files/node.exe" server.js'` 切分出的程序名是带字面引号的 `"D:/Program Files/node.exe"`，`Popen` 必然 `FileNotFoundError`（v3.3.2 修复：切分后用 `_unquote_token` 剥离 token 首尾成对双引号并还原 `\"`，`test_transport_t8` 已锁定）。
 
 **④ 路径写法**
 
@@ -1268,11 +1307,11 @@ JSON-RPC 消息用 `\n` 分隔，`_read_loop` 里按 `b"\n"` 切分。Windows �
 
 `echo_server.py` / `notify_server.py` 是纯标准库、零依赖、无第三方包的示例 server，`tests/mcp/test_mcp.py` 在 Windows 上可直接 `python tests\mcp\test_mcp.py` 跑通，不需要额外配置。
 
-### 10.13 坑：`MCPRegistry._closed` 只写不读
+### 10.13 坑：`MCPRegistry._closed` 只写不读（v3.3.6 已修复）
 
 `close_all()` 里 `self._closed = True`，但**没有任何地方检查过它**。所以 `close_all()` 之后再 `connect()` 一个新 server，仍然能成功——`_closed` 更像是个语义标记。
 
-**建议**：如果要在关闭后禁止再连，需要在 `add_*` / `connect` 里加 `if self._closed: raise ...`。
+**v3.3.6 已修复**：`connect()` 开头检查 `if self._closed: raise MCPError(...)`，关闭后拒绝再连并提示“请新建 MCPRegistry 实例”；`connect_all()` 的单服失败降级（`logger.warning`）与 `connect_mcp_server` 工具的 `try/except` 均沿用现有入口，不会把主流程打挂。以 `test_polish_p2` 锁定（含反向对照：**未** `close_all()` 时单个 `close()` 后重连仍然合法）。
 
 ### 10.14 坑：调用超时是固定 60 秒
 
@@ -1280,13 +1319,48 @@ JSON-RPC 消息用 `\n` 分隔，`_read_loop` 里按 `b"\n"` 切分。Windows �
 
 **建议**：目前只能改源码或用 `MCPToolAdapter` 时自己调 `client.call_tool(..., timeout=xxx)`。如果这是常见需求，考虑把超时提成 `MCPConfig` 的字段。
 
+### 10.15 坑：声明式配置 `command_str` 形态的 env 被静默丢弃（v3.3.5 已修复）
+
+`MCPConfig` 有 `env` 字段、`StdioTransport` 也支持 env，但 `add_config` 的 stdio `command_str` 分支此前只传 `name / command_str / cwd`，`config.env` 在中间层被丢弃——不报错、不日志，声明式配的环境变量永远到不了子进程（命令式 `command` 分支反而正常，因此更容易误判为“都支持”）。探针 P-D 实证。
+
+**v3.3.5 已修复**：`make_stdio_transport` / `add_stdio_cmd` / `MCPConfig.stdio_cmd` 三层增加可选 `env=None` 并透传，以 `test_registry_r1` 锁定。
+
+### 10.16 坑：`list_changed` 刷新 handler 在读线程里同步执行 → 自死锁（v3.3.6 已修复）
+
+这类 bug 隐蔽在“功能看起来已实现”之下：`connect()` 确实注册了 `notifications/*/list_changed` 处理器，代码路径也完整，但：
+
+```text
+读线程 recv() → 发现 notification → 同步回调 handler
+                                          ↓
+                              client.list_tools(timeout=5.0)
+                                          ↓
+                    新请求的响应必须经读线程消费，而读线程正阻塞在 handler 里
+                                          ↓
+                              白等到 5s 超时 → “刷新工具列表失败”
+```
+
+探针实证：修复前刷新永远报「请求 tools/list 超时」，**v3.2 写的自动刷新功能在任何传输上从未生效过**（包括单测能跑通的内存假传输）。修法很简单也很关键：handler 只做“派活”，刷新 body 丢给独立 daemon 线程（`_schedule_refresh`）。
+
+> **可复用的教训**：在“回调运行在唯一消费者线程”的架构里，回调内部**绝不能再走同一条需要该线程参与的同步请求链路**，否则不是慢而是必然超时；且这类失败只记 warning，不抓探针很容易当作“已实现”。对应回归用例见 §11.1 的 `test_polish_p5`。
+
+### 10.17 其余四处小坑（v3.3.6 一并打磨）
+
+| 位置 | 坑 | 修复 |
+|------|----|------|
+| `models.py::GetPromptResult.as_messages(role_prefix=True)` | 参数**从未被读取**，调用方以为生效 | 让 `True` 真正拼上 `[role] ` 前缀；默认值 `True`→`False`（因原本无效，无参输出逐字节不变），`test_polish_p1` |
+| `client.py` 顶层 `from .errors import ... MCPProtocolError` | 全文件未使用的**死 import** | 删引（`errors.py` 仍定义并对外导出该类，其它传输层在用） |
+| `registry.py::_unregister_one` 兜底扫描 | 前缀硬编码 `"__"`，自定义 `prefix_sep` 的残留清不掉 | 改用 `_prefix_sep` 记录的该 server 实际分隔符，`test_polish_p3` |
+| `transports/streamable_http_transport.py::_json_resolved` | 只增不清，长驻进程慢速泄漏（每响应 id 一条） | `recv()` 消费到响应时 `discard(msg_id)`（取 `_resolve_lock`），`close()` 整表 clear 兜底，`test_polish_p4` |
+
+这四项都不影响正确性（死参数 / 死代码 / 极端路径 / 微泄漏），但属于“读到就会误判”的坑，故一并清掉并用 `test_polish_p*` 锁定。
+
 ---
 
 ## 十一、测试与验证
 
 ### 11.1 现状
 
-`tests/mcp/test_mcp.py` **48 个用例，全部通过**：前 10 个走子进程 + 零依赖的 `echo_server.py`；`b1`–`b10` 走**内存假传输** `FakeTransport`，覆盖 v3.1 客户端内部机制；`t1`–`t7` 覆盖传输层健壮性（stderr / SSE）；`c1`–`c11` 覆盖复杂 Schema 转换；`d1`–`d10` 覆盖 v3.2 的 Resources / Prompts。
+`tests/mcp/test_mcp.py` **65 项用例，全部通过**（v3.3.6）：前 10 个走子进程 + 零依赖的 `echo_server.py`；`b1`–`b10` 走**内存假传输** `FakeTransport`，覆盖 v3.1 客户端内部机制；`t1`–`t8` 覆盖传输层健壮性（stderr / SSE / 引号剥离）；`c1`–`c12` 覆盖复杂 Schema 转换；`d1`–`d11` 覆盖 v3.2 的 Resources / Prompts；`r1` 覆盖 Registry 声明式配置 env 透传；`p1`–`p5` 覆盖 v3.3.6 的 P4 打磨与 `list_changed` 刷新根因。
 
 原有 10 项（子进程 + `echo_server.py`）：
 
@@ -1318,7 +1392,7 @@ v3.1 新增 10 项（内存假传输，不起子进程）：
 | b9 | `test_client_b9_handshake_timeout_rolls_back` | 握手超时 → 状态回滚 + 报「超时」 |
 | b10 | `test_client_b10_handler_exception_isolated` | handler 抛异常不打断读线程，后续请求照常 |
 
-v3.1 传输层新增 7 项（`t1`–`t7`）：
+v3.1 传输层新增 8 项（`t1`–`t8`，t8 为 v3.3.2 缺陷回归）：
 
 | # | 用例 | 验证点 |
 |---|------|--------|
@@ -1329,8 +1403,9 @@ v3.1 传输层新增 7 项（`t1`–`t7`）：
 | t5 | `test_transport_t5_sse_disconnect_wakes_pending` | SSE 断连后等待中的请求被唤醒报错 |
 | t6 | `test_transport_t6_sse_connect_bad_url_fails_fast` | 坏 URL 快速失败 |
 | t7 | `test_transport_t7_stdio_close_idempotent_and_no_zombie` | `close()` 幂等且无僵尸进程 |
+| t8 | `test_transport_t8_make_stdio_transport_strips_wrapping_quotes` | Windows 残留引号剥离（v3.3.2 修复回归）：token 逐字节等于原路径 + 真实拉起握手 + 空命令友好报错 |
 
-v3.1 Schema 新增 11 项（`c1`–`c11`）：
+v3.1 Schema 新增 11 项（`c1`–`c11`）+ v3.3.4 回归 1 项（`c12`）：
 
 | # | 用例 | 验证点 |
 |---|------|--------|
@@ -1345,8 +1420,25 @@ v3.1 Schema 新增 11 项（`c1`–`c11`）：
 | c9 | `test_schema_c9_unknown_type_fallback_to_any` | 未知类型降级为 `Any` |
 | c10 | `test_schema_c10_array_of_nested_objects` | 对象数组递归 |
 | c11 | `test_schema_c11_empty_schema_compatibility` | 空 schema 兼容 |
+| c12 | `test_schema_c12_nested_objects_same_shape_different_required` | 嵌套对象缓存键含 `required` 等全量语义；双向错乱回归 + 同构缓存仍复用（v3.3.4） |
 
-v3.2 新增 10 项（`d1`–`d10`，Resources / Prompts）：
+v3.3.5 Registry env 透传 1 项（`r1`）：
+
+| # | 用例 | 验证点 |
+|---|------|--------|
+| r1 | `test_registry_r1_command_str_env_transparent_to_subprocess` | `add_stdio_cmd(env=)` / `MCPConfig.stdio_cmd(env=)` → `add_config` 透传到 transport；不传 env 行为不变；带 env 真实拉起握手成功 |
+
+v3.3.6 P4 批量打磨 5 项（`p1`–`p5`）：
+
+| # | 用例 | 验证点 |
+|---|------|--------|
+| p1 | `test_polish_p1_as_messages_role_prefix_takes_effect` | `as_messages()` 无参输出与旧版一致；`role_prefix=True` 时 content 带 `[role] ` 前缀而 role 字段仍独立 |
+| p2 | `test_polish_p2_closed_registry_blocks_connect` | `close_all()` 后 `connect()` 抛 `MCPError`、`connect_all()` 只降级 warning 不产生新连接；反向对照：单个 `close()` 后重连仍合法 |
+| p3 | `test_polish_p3_unregister_fallback_honors_custom_prefix_sep` | 抹掉 `_registered_names` 记账只走兜底扫描，验证 `prefix_sep="_"` 注册的残留能被清 |
+| p4 | `test_polish_p4_json_resolved_pruned_on_recv` | 响应被 `recv()` 消费后 `_json_resolved` 里对应 id 立即移除（不起真服务，直接推队列） |
+| p5 | `test_polish_p5_list_changed_refresh_works_and_updates_coarse_gate` | **两层**：① `list_changed` 刷新不再在读线程自死锁（缓存真的拉到新列表）；②粗粒度门脸索引同步，新增子工具可直接 `call_tool` |
+
+v3.2 新增 10 项（`d1`–`d10`，Resources / Prompts）+ v3.3.3 回归 1 项（`d11`）：
 
 | # | 用例 | 验证点 |
 |---|------|--------|
@@ -1360,6 +1452,7 @@ v3.2 新增 10 项（`d1`–`d10`，Resources / Prompts）：
 | d8 | `test_d8_registry_caches_resources_prompts_on_connect` | Registry 连接时缓存资源 / 提示 |
 | d9 | `test_d9_coarse_tool_supports_resource_prompt_actions` | 粗粒度工具支持 4 个新 action |
 | d10 | `test_d10_unsupported_server_returns_empty_lists` | 无能力服务器返回空列表 |
+| d11 | `test_d11_list_resource_templates_uses_spec_method` | 模板走规范方法 `resources/templates/list`；-32601 降级空列表；`MCPCallError.error_code`（v3.3.3） |
 
 > 说明：测试目录下暂无「ReActAgent + MCP」的自动化集成用例（`tests/trace/test_trace.py` 仅以 `enable_mcp=False` 构造 Agent）。Agent 侧的 MCP 接入（`enable_mcp` / `mcp_expand_mode` / 动态 connect）目前由 `examples/mcp/mcp_react_agent_demo.py` 手工演示覆盖——这是一处可补的覆盖缺口。
 
@@ -1429,20 +1522,20 @@ python examples\mcp\mcp_resources_prompts_demo.py
 | ✅ **D2** | MCP tool → `ToolBase` 适配器 | v3.0.0 | `tool.py`：`MCPToolAdapter`（细粒度）+ `MCPServerTool`（粗粒度） |
 | ✅ **D4** | `.mcp.json` 配置加载 | v3.0.0 | `MCPConfig` 声明式配置 + `MCPRegistry` |
 | ✅ **D10** | `stderr` 消费 | v3.1.0 | `aa79b44` 交付：stderr 后台读线程 + `get_last_stderr()`，不再阻塞子进程 |
-| ✅ **D7** | `resources` / `prompts` 支持 | v3.2.0 | `bff658e` 交付：`MCPClient` 五个资源 / 提示方法 + Registry 连接缓存与 `list_changed` 自动刷新 + 粗粒度 4 个新 action |
+| ✅ **D7** | `resources` / `prompts` 支持 | v3.2.0 | `bff658e` 交付：`MCPClient` 五个资源 / 提示方法 + Registry 连接缓存与 `list_changed` 自动刷新 + 粗粒度 4 个新 action（刷新链路的读线程自死锁 v3.3.6 修完，见 [10.16](#1016-坑list_changed-刷新-handler-在读线程里同步执行--自死锁v336-已修复)） |
+| ✅ **D12** | `close_all()` 后用 `_closed` 拦截再连接 | v3.3.6 | `registry.connect()` 开头检查 `_closed`，`test_polish_p2` 锁定（见 [10.13](#1013-坑mcpregistry_closed-只写不读v336-已修复)） |
+| ✅ **D6** | `streamable-http` 传输 | v3.3.0 | `transports/streamable_http_transport.py`：`StreamableHTTPTransport` + `MCPRegistry.add_streamable_http()` + `MCPConfig.streamable_http()` + 测试 `test_streamable_http_e1~e4`（见 [7.4](#74-transports传输层包)） |
 
 ### 12.2 待办（按优先级）
 
 | 编号 | 任务 | 优先级 | 依赖 | 一句话说明 |
 |------|------|--------|------|-----------|
-| **D6** | `streamable-http` 传输 | **P1** | — | MCP 新标准传输，替代 / 补充 SSE（目前只有 `stdio` + `sse`） |
 | **D8** | 图片内容透传（多模态） | P2 | — | `CallResult.images()` 已能取出图片，仍需接入多模态链路（[10.6](#106-坑artifact-只留-text图片不传)） |
 | **D9** | 连接自动重连 / 心跳保活 | P2 | — | 生命周期已有（挂成 Agent 成员 + `atexit` 兜底），断线后单次调用失败可恢复的自动重连未做 |
 | **D11** | 超时可配置 | P2 | — | 当前调用超时固定 60 秒，提到 `MCPConfig` 上（[10.14](#1014-坑调用超时是固定-60-秒)） |
-| **D12** | `close_all()` 后用 `_closed` 真正拦截再连接 | P2 | — | `_closed` 目前只写不读（[10.13](#1013-坑mcpregistry_closed-只写不读)） |
 | **D13** | 按 server 分别指定展开模式 | P2 | — | 细粒度 / 粗粒度目前全局统一（[5.4](#54-怎么选)） |
 
-> v3.1 已完成 `stderr` 独立读取线程与 `_schema_to_pydantic` 嵌套展开，v3.2 已完成 `resources` / `prompts`，故已从待办表中移除。
+> v3.1 已完成 `stderr` 独立读取线程与 `_schema_to_pydantic` 嵌套展开，v3.2 已完成 `resources` / `prompts`，v3.3.0 已完成 D6（`streamable-http`），v3.3.6 已完成 D12（`_closed` 拦截），故已从待办表中移除。
 
 ---
 
