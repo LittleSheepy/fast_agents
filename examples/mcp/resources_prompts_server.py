@@ -208,8 +208,14 @@ def main():
                 "id": msg_id,
                 "result": {
                     "resources": resources_list,
-                    "resourceTemplates": RESOURCE_TEMPLATES,
                 }
+            })
+        elif method == "resources/templates/list":
+            # 规范要求：资源模板由独立方法返回，不混在 resources/list 里（v3.3.3 同步修正）
+            send_json({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"resourceTemplates": RESOURCE_TEMPLATES},
             })
         elif method == "resources/read":
             uri = params.get("uri", "")
