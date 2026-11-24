@@ -71,7 +71,7 @@ README 讲**「怎么用」**；下面这些文档讲**「怎么实现的、怎�
 | 🧠 **LLM 客户端** | 对 OpenAI SDK 的轻封装，支持 `invoke` / `stream_invoke`，兼容任意 OpenAI 格式的第三方服务（只需改 `base_url`） |
 | 💬 **消息系统** | `Message` / `Messages` 双层结构，原生支持 function calling（`tool_calls` / `tool_call_id`），可一键转 OpenAI 格式 |
 | 🔧 **工具系统** | `ToolBase` 抽象基类 + `StructuredTool` / `@tool` 装饰器 + `ToolRegistry` 注册表，四种定义方式，schema 自动生成 |
-| 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关 |
+| 🤖 **ReAct Agent** | 经典「推理 → 行动 → 观察」循环，支持多步工具调用，自动管理工具链消息；记忆与技能可独立开关；**同步 / 异步入口成对**（`run` / `run_stream` / `arun` / `arun_stream`，E10） |
 | 🧩 **记忆系统** | 短期（滑动窗口 + 滚动摘要，**可选 SQLite 落盘**）+ 长期（SQLite 持久化，跨会话）+ 偏好无条件召回 + **可选语义检索**（`SemanticMemoryStore`）+ **可选 Chroma 向量后端**（`ChromaMemoryStore`，阶段 2 已真实接入 `ChromaClient`）+ **结构化用户画像**（`ProfileStore`）+ **记忆自动瘦身**（`compact()` 低重要度自动归档/相似合并，B5）+ **记忆 TTL 到期回收**（B12，`remember(ttl=...)` 到期自动退出检索并回收）+ **增量抽取**（B10，只抽新增消息段、无新消息不调 LLM）+ **冲突检测与消解**（B13，写入前向量近邻查重、`newest_wins` 去重、词法 Jaccard 与向量通道始终叠加）+ **显式冲突上报**（B13，`remember(raise_on_conflict=True)` 命中有效重复时抛 `MemoryConflictError`；只读 `check_conflict()` 先探测）+ **统一北京时间 CST（UTC+8）时间基准**（B8），支持 Agent 主动读写 |
 | 🎯 **技能系统** | 遵循 Anthropic 开放的 `SKILL.md` 标准，**三级渐进式加载**（索引 → 指令 → 资源），上下文成本极低；**脚本沙箱**（C6-2 参数 Schema 校验 + 注入防护 + 默认断网）、**技能依赖与前置检查**（C12）、**运行时启用 / 禁用**（C11）、**`allowed_tools` 工具白名单**（C10）、**技能热重载**（C14，默认关闭） |
 | 🔌 **MCP 接入** | 零依赖实现 MCP 协议（stdio / SSE），支持细粒度 / 粗粒度两种工具展开，工具清单自动发现；`tools` / `resources` / `prompts` 三类能力齐备（D7） |
@@ -288,8 +288,10 @@ fast_agents/
 │   │   └── tool.py               #    MCPToolAdapter（细粒度）/ MCPServerTool（粗粒度）
 │   ├── agents/                   # ⑦ 智能体
 │   │   ├── __init__.py
-│   │   ├── agent_base.py         #    AgentBase 抽象基类
+│   │   ├── agent_base.py         #    AgentBase 抽象基类（run / run_stream 抽象 + arun / arun_stream 非抽象默认）
+│   │   ├── middleware.py         #    AgentMiddleware 五个钩子（同步 / 异步成对）
 │   │   └── react_agent/
+│   │       ├── __init__.py       #    子包出口：re-export ReActAgent
 │   │       ├── react_agent.py    #    ReActAgent 主实现
 │   │       └── prompt.py         #    DEFAULT_REACT_PROMPT
 │   ├── context/                  # ⑧ 上下文工程
@@ -640,6 +642,32 @@ print(answer)
 agent.add_tool(some_new_tool)     # 运行中动态加工具
 agent.clear_history()             # 清空历史
 ```
+
+**四个运行入口（两两成对，E10 · v2.73.0）**：
+
+| 入口 | 形态 | 说明 |
+|------|------|------|
+| `run(user_input)` | 同步 · 一次性 | 返回**最终答案**（以 `end` 事件正文为准，已过输出护栏，A2 · v2.74.0） |
+| `run_stream(user_input)` | 同步 · 生成器 | 逐步 yield `StreamChunk`（`text` 正文增量 / `tool_call` 工具分片 / `end` 聚合结果） |
+| `arun(user_input)` | 异步 · 一次性 | 与 `run` 结果逐字一致（同样返回护栏后正文），全程 `await`、不占线程 |
+| `arun_stream(user_input)` | 异步 · 异步生成器 | 事件流契约与 `run_stream` 逐字一致，用 `async for` 消费 |
+
+```python
+# 异步用法（与同步输出逐字对齐）
+answer = await agent.arun("帮我查一下今天的天气，再算一下 25*4")
+
+async for chunk in agent.arun_stream("同上"):
+    if chunk.type == "text":
+        print(chunk.text, end="", flush=True)
+```
+
+> **异步链路打通了什么**：`arun` / `arun_stream` 让 LLM / Tools / Guardrails / Middleware 四层早已存在的 `a*` 异步代码真正可达 —— 中间件走 `abefore_* / aafter_*`（五个钩子全部同步 / 异步成对），工具走 `ToolRegistry.ainvoke_tool`（原生 `async def` 工具直接 `await`，纯同步工具降级 `asyncio.to_thread`），护栏走 `arun_*_guardrails`。
+> **默认路径零影响**：E10 只新增异步入口，同步推理主循环未动；只实现同步接口的 `AgentBase` 子类、只写同步钩子的中间件行为逐字节不变（`arun` / `arun_stream` 是**非抽象**默认实现，不会让存量子类实例化报错）。
+
+> **输出护栏与流式的时序（A2 · v2.74.0）**：输出护栏（`after_agent_run` / `aafter_agent_run`）在正文增量产出**之后**才跑，它改的是 `end` 事件的最终答案，收不回已经发给调用方的 `text` 分片。因此：
+> - `run()` / `arun()` 的返回值已改为取护栏后正文——**非流式路径不会再绕过输出护栏**（旧写法拼 `text` 增量，会把脱敏 / 拦截前的原文交给调用方）；副作用是多轮工具时只返「最终答案」，不再把「我先查一下」这类过渡语拼进去；
+> - 直渲 `text` 分片的界面要保证脱敏生效，要么累加到 `end` 事件再一次性展示（牺牲打字机手感），要么靠 `end.finish_reason == "guardrail_block"` 判定并清空已展示内容（拦截场景有标记，脱敏场景无标记）；
+> - 记忆沉淀 / trace span / `🎉 最终答案` 打印一直用的都是护栏后正文，未受本项影响。
 
 **`run()` 内部做了什么**：
 
@@ -1289,6 +1317,9 @@ python tests\tools\test_file_tool.py
 python tests\memory\test_memory.py
 python tests\memory\test_memory_chroma_store.py
 python tests\skills\test_skills.py
+python tests\skills\test_skills_loader.py
+python tests\skills\test_skills_middleware.py
+python tests\skills\test_skills_registry.py
 python tests\context\test_context.py
 python tests\mcp\test_mcp.py
 python tests\database\test_database.py
@@ -1315,7 +1346,7 @@ python tests\trace\test_trace_cost.py
 | `tests/memory/test_memory_chroma_store.py` | ✅ 8/8 | ChromaMemoryStore 专项（含 2 项需真实 `chromadb`，未安装时自动跳过）：阶段 1 纯词法降级 CRUD/search、B5 方法代理、Manager 集成零感知、v1.8.3 集合名归一化与真实 `ChromaClient` 语义通道、B13 ANN 近邻冲突检测、stale 向量 `status` 过滤、update 内容变更 delete-then-add |
 | `tests/tools/test_file_tool.py` | ✅ 13/13 | 乐观锁命中 / 未命中、`overwrite=False` 拦截、原子写入无 tmp、备份命名、批量回滚、`dry_run`、路径越权 |
 | `tests/context/test_context.py` | ✅ 17/17 | token 计数与预算、分层顺序、tool 配对校验、卸载与回读、三级压缩、builder 端到端、文件工具单一来源无重名（A14） |
-| `tests/skills/test_skills.py` | ⚠️ 60/64 | 技能系统专项（三级加载 / 基础三件套 / 启用禁用 / 依赖预检 / 脚本沙箱 / 中间件）；热重载 C14 有 4 项用例为已知待修（`reload_skill` 返回类型、`scan_skills`、`is_skill_loaded`、enable-disable 热重载） |
+| `tests/skills/test_skills.py` | ✅ 84/84（四文件合计） | 技能系统专项，已按组件拆为四个入口：`test_skills.py` 11 项（基类与模型层：BaseSkill / `@skill` / `SkillMetadata` / `ScriptParam` / `ScriptSchema`）、`test_skills_loader.py` 18 项（目录扫描 / frontmatter 与 schema.json 解析 / 脚本与参考文档路径穿越防护 / C14 变更检测 / C17 索引缓存）、`test_skills_middleware.py` 13 项（索引注入 / LRU 缓存 / C10 `allowed_tools` 白名单 / C14 热重载线程）、`test_skills_registry.py` 42 项（注册与工具工厂 / C11 启用禁用 / C12 依赖预检 / C6-2 沙箱运行时 / C15 资产读取 / C8 同名冲突）。早期 4 项 C14 热重用例的写法问题已全部修复 |
 | `tests/mcp/test_mcp.py` | ✅ 48/48 | 连接 / 列举 / 调用、细粒度与粗粒度展开、动态连接与关闭、配置导出（10 项）；客户端状态机专项 10 项（连接 / 关闭幂等、notification 分发、并发按 id 分发、close 唤醒在途请求、握手超时回滚、handler 异常隔离）；transports 专项 7 项（stdio `stderr` 捕获、SSE 断线唤醒、close 幂等无僵尸）；schema→pydantic 转换专项 11 项；`resources` / `prompts` 专项 10 项（D7） |
 | `tests/database/test_database.py` | ✅ 94/94 | 三种声明式建表、索引、migrate 补列、CRUD、事务、9 种谓词下推、`count` / `batch_insert` / `upsert`、参数化防注入、统一异常体系；另有 `test_database_sqlite.py` 24 项、`test_database_mysql.py` 34 项（33 离线 + 1 真实 MySQL）、`test_database_chroma.py` 32 项（需 `pip install fast-agents[chroma]`），模块合计 184 项 |
 | `tests/trace/test_trace.py` | ✅ 81/81 | Span 模型、TraceLogger、LLM/Agent 打点、token 元数据、tool 真实耗时、生命周期与查询回放、预览截断可配置、replay/build_tree 树形聚合、error_type 自动分类、单调时钟耗时（抗墙钟跳变）、内存后端生命周期（close 不清空 / clear 主动清空）；同目录另有 `test_trace_jsonl_store.py` 12 项、`test_trace_sqlite_store.py` 11 项（老库自动迁移）、`test_trace_eval.py` 33 项（K3 评估）、`test_trace_cost.py` 19 项（K3 成本日报），模块合计 **156 项** |
@@ -1357,11 +1388,11 @@ python tests\trace\test_trace_cost.py
 
 | 模块 | 状态 | 下一步重点 |
 |------|------|-----------|
-| 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A15 测试护栏、A16 并发语义加固、A17 装饰器透出 `metadata`、A18 `return_direct`、A20 计算器 AST 迁移、A26 主循环多 `tool_calls` 并发入口、A33 入参解析统一） | **P1**：RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：异步 `arun`、跨平台 Shell、`ToolRegistry` 清理与 `global_registry` 隔离（A22 / A34）、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
+| 🔧 **tools** | ✅ 已实现（A14 文件工具单一来源、A15 测试护栏、A16 并发语义加固、A17 装饰器透出 `metadata`、A18 `return_direct`、A20 计算器 AST 迁移、A26 主循环多 `tool_calls` 并发入口、A33 入参解析统一；**E10 v2.73.0 补异步执行入口 `ainvoke_tool` / `ainvoke_tools_concurrent`**） | **P1**：RAG 工具（A7，I1/B2 已就位）、Tavily 打磨（A11）；**P2**：跨平台 Shell、`ToolRegistry` 清理与 `global_registry` 隔离（A22 / A34）、`builtin` 延迟导入、成本权限审计、工具组合 pipeline |
 | 🧩 **skill** | ✅ 已实现并完成多轮增强（C7 扫描路径统一、C6-2 脚本沙箱、C10 `allowed_tools`、C11 启用 / 禁用、C12 依赖与前置检查、C14 热重载；共 12 个内置工具） | 技能多版本共存与冲突消解（C8）、技能市场 / 远程安装（C9）、索引文本与 `assets/` 治理（C15） |
 | 🔌 **mcp** | ✅ 已实现（D2 适配器、D4 声明式配置、D6 `streamable-http` 传输（v3.3.0）、D7 `resources` / `prompts`、D10 `stderr` 消费均已落地） | 图片 / 二进制透传（D8）、断线自动重连（D9）、调用超时可配置（D11）、`close_all()` 后真正拦截（D12）、按 server 分别指定展开模式（D13） |
 | 🧠 **memory** | ✅ 已实现 | **B 系列只剩多租户（B6）**：短期落盘（B1）/ 打分统一（B7）/ 语义检索（B2）/ 用户画像（B3）/ 双通道注入（B4）/ **记忆衰减合并（B5）**均已落地；「**记忆 v2**」已全部收口：B8 时间统一为北京时间 CST、B9 SQLite WAL 与并发安全、B10 `auto_extract` 增量水位线（v1.8.2 修复窗口写满停摆）、B11 `revise()` 转发、B12 记忆 TTL 与到期回收、B13 冲突检测与消解（v1.9.0，v1.9.1 补过期场景、v1.9.2 接显式冲突上报）均已落地；另 B14 `ChromaMemoryStore` 阶段 1（v1.8.0）/ 阶段 2（v1.8.3 真实接入 `ChromaClient`）已完成 |
-| 🤖 **agents** | ✅ 已实现 | `PlanExecuteAgent`、`ReflectionAgent`、子代理、多智能体协作 |
+| 🤖 **agents** | ✅ 已实现（E7 流式 / 事件 API、E9 Structured Output、**E10 异步主循环 `arun` / `arun_stream`（v2.73.0，打通四层异步链路）**、**A2 修复：`run` / `arun` 返回输出护栏后正文（v2.74.0）**） | `PlanExecuteAgent`（E1）、`ReflectionAgent`（E2）、子代理（E3）、多智能体协作（E4）；遗留：流式 `text` 增量仍在护栏前发出、A4 会话 / 用户维度、A5 流式 usage |
 | 🪟 **context** | ✅ 已实现（F1–F3、F5 已交付；v1.4 A14 文件工具单一来源治理） | 摘要中间件化（F4）、Run 内逐步预算守卫（F6）、工具 schema 计入预算（F7）、summary 层跨 run 回流（F8）、`validate()` 接入 `build()`（F9）、流式截断（F13）、卸载文件生命周期管理（F14） |
 | 🗄 **database** | ✅ v1.1.0（关系型双后端 + 统一异常体系 + 向量后端；J3 memory / trace 后端已迁入） | 连接池 / 线程安全（J2）、Postgres 后端（J4 续）、`Query.filters` 支持 OR / 嵌套条件组（J7） |
 | 🛠 **trace** | ✅ K1 已实现并完成收尾（TraceLogger v1.0.0，含 InMemory / Jsonl / SQLite 三后端 + 预览截断可配置 / 树形回放 / error_type 分类 / 单调时钟耗时）、K3 基础统计 + CSV 明细 + Token 成本日报已落地；其余 ⏳ 规划中 | 异步并发（K2）、K3 高阶（LLM Judge / Win Rate / 批量回归）、Web UI 可视化（K4）、外部上报 OTLP / Langfuse（K5）|
