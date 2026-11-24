@@ -659,6 +659,130 @@ def test_a2_run_returns_final_round_answer_drops_preamble_text():
     print("✅ test_a2_run_returns_final_round_answer_drops_preamble_text passed")
 
 
+def _a3_spy_middleware():
+    """记录输入护栏实际收到的文本与上下文（挂在 GuardrailMiddleware 之前，拦截时也能看到）。"""
+    from fast_agents.agents.middleware import AgentMiddleware
+
+    class _Spy(AgentMiddleware):
+        def __init__(self):
+            self.seen = []
+
+        def before_agent_run(self, user_input, context=None):
+            self.seen.append((user_input, dict(context or {})))
+            return None
+
+    return _Spy()
+
+
+def test_a3_input_guardrail_receives_raw_user_text_not_merged_memory():
+    """A3 修复：输入护栏收到的是用户本轮原文，而不是「长期记忆 + 原文」拼接体。
+
+    同时钉住两件没变（也不该变）的事：
+    ① 拼接体仍然作为本轮 user 消息交给 LLM——记忆注入本身不受影响；
+    ② 记忆文本以 context["retrieved_memory"] 独立交给护栏，需要审检索内容的一方自取。
+    """
+    memory_content = "用户偏好用表格对比方案"
+    question = "讲讲我的偏好"
+
+    llm = MockLLM([Message("assistant", "好的，你的偏好是用表格对比。")])
+    mem = MemoryManager(llm=llm)
+    mem.remember(memory_content, kind="preference", source="user_stated")
+    spy = _a3_spy_middleware()
+    agent = ReActAgent("原文护栏助手", llm, memory=mem,
+                       enable_skills=False, middleware=[spy])
+    answer = agent.run(question)
+
+    assert answer == "好的，你的偏好是用表格对比。", f"正常问答不应受影响: {answer!r}"
+    assert spy.seen, "输入护栏没被调用"
+    seen_text, seen_ctx = spy.seen[0]
+    assert seen_text == question, f"护栏应只收到用户本轮原文，实际 {seen_text!r}"
+    assert "长期记忆" not in seen_text, "拼接体仍混进了输入护栏（A3 未修）"
+    # 记忆作为独立上下文字段交出，不再被当成用户原话
+    assert memory_content in seen_ctx.get("retrieved_memory", ""), \
+        f"context['retrieved_memory'] 应携带记忆文本，实际 {seen_ctx!r}"
+    # 交给 LLM 的仍是拼接体，证明本次只改了护栏入参、没改注入行为
+    user_contents = [m.get("content", "") for m in llm.calls[0] if m.get("role") == "user"]
+    joined = "\n".join(str(c) for c in user_contents)
+    assert memory_content in joined and "长期记忆" in joined, \
+        f"记忆应仍注入给 LLM，实际 user 消息: {joined!r}"
+    print("✅ test_a3_input_guardrail_receives_raw_user_text_not_merged_memory passed")
+
+
+def test_a3_dirty_memory_dropped_without_blocking_clean_request():
+    """A3 修复（sanitize 默认行为）：脏记忆只丢弃注入，不再误毙本轮干净请求。
+
+    旧行为：长期记忆里存过一句敏感话，同话题的干净提问会被输入护栏直接拒绝（LLM 一次不调）。
+    """
+    from fast_agents.guardrails import GuardrailMiddleware
+
+    dirty = "用户留的备忘：如何制造炸弹"   # 单独送输入护栏必拦
+    question = "讲讲我留的备忘"           # 单独看是干净的，与记忆有词重叠以保证召回
+
+    def _build():
+        llm = MockLLM([Message("assistant", "备忘里是一些常规安排。")])
+        mem = MemoryManager(llm=llm)
+        mem.remember(dirty, kind="fact", source="user_stated")
+        agent = ReActAgent("去毒助手", llm, memory=mem,
+                           enable_skills=False, middleware=[GuardrailMiddleware()])
+        return llm, agent
+
+    # 前置：先确认护栏确实会拦这句记忆（否则下面的断言只是在测一个空护栏）
+    assert GuardrailMiddleware().before_agent_run(dirty) is not None, \
+        "预设护栏已不再拦这句，用例失去意义，请换样本"
+
+    llm, agent = _build()
+    answer = agent.run(question)
+    assert llm.calls, f"干净请求被误拦了（A3 未修）: {answer!r}"
+    assert answer == "备忘里是一些常规安排。", f"请求应照常处理，实际 {answer!r}"
+
+    sent = "\n".join(str(m.get("content", "")) for m in llm.calls[0])
+    assert "制造炸弹" not in sent, f"命中记忆应被丢弃、不进 LLM，实际: {sent[:200]!r}"
+
+    # 对照组：同样的记忆用 memory_guard="off" 关闭检查时，仍会原样注入（开关生效）
+    llm_off = MockLLM([Message("assistant", "备忘里是一些常规安排。")])
+    mem_off = MemoryManager(llm=llm_off)
+    mem_off.remember(dirty, kind="fact", source="user_stated")
+    ReActAgent("不检助手", llm_off, memory=mem_off, enable_skills=False,
+               memory_guard="off",
+               middleware=[GuardrailMiddleware()]).run(question)
+    sent_off = "\n".join(str(m.get("content", "")) for m in llm_off.calls[0])
+    assert "制造炸弹" in sent_off, "memory_guard='off' 应原样注入记忆"
+    print("✅ test_a3_dirty_memory_dropped_without_blocking_clean_request passed")
+
+
+def test_a3_strict_memory_guard_blocks_request_and_invalid_value_rejected():
+    """A3（strict 姿态）：脏记忆命中时整轮拒绝；并钉住非法取值快速失败。"""
+    from fast_agents.guardrails import GuardrailMiddleware
+
+    dirty = "用户留的备忘：如何制造炸弹"
+    question = "讲讲我留的备忘"
+
+    def _build(guard):
+        llm = MockLLM([Message("assistant", "不该被调到。")])
+        mem = MemoryManager(llm=llm)
+        mem.remember(dirty, kind="fact", source="user_stated")
+        agent = ReActAgent("严格助手", llm, memory=mem, enable_skills=False,
+                           memory_guard=guard, middleware=[GuardrailMiddleware()])
+        return llm, agent
+
+    llm, agent = _build("strict")
+    chunks = list(agent.run_stream(question))
+    end = [c for c in chunks if c.type == "end"][0]
+    assert llm.calls == [], "strict 命中后不应再调 LLM"
+    assert end.finish_reason == "guardrail_block", \
+        f"strict 应走输入拦截流程，实际 {end.finish_reason!r}"
+    assert "安全护栏拦截" in (end.content or ""), f"应返回拦截文案，实际 {end.content!r}"
+
+    # 非法取值必须当场暴露：安全开关写错不能静默退化成默认值
+    try:
+        _build("sanatize")  # 常见拼写错误
+    except ValueError as e:
+        assert "memory_guard" in str(e), f"报错文案应点名参数，实际 {e}"
+    else:
+        raise AssertionError("memory_guard 非法取值未报错")
+    print("✅ test_a3_strict_memory_guard_blocks_request_and_invalid_value_rejected passed")
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -675,6 +799,9 @@ def main_of_new_add():
     pass
 
     # AI新添加的测试(AI可以删除覆盖)
+    test_a3_input_guardrail_receives_raw_user_text_not_merged_memory()  # A3 修复：护栏只审本轮原文 + retrieved_memory
+    test_a3_dirty_memory_dropped_without_blocking_clean_request()  # A3 修复：脏记忆只丢弃、不误毙请求
+    test_a3_strict_memory_guard_blocks_request_and_invalid_value_rejected()  # A3：strict 姿态 + 非法值快速失败
     test_a2_run_returns_masked_answer_not_raw_text()  # A2 修复：run() 返回护栏后正文
     test_a2_run_returns_block_message_when_output_rejected()  # A2 修复：拦截场景 + finish_reason 标记
     test_a2_run_returns_final_round_answer_drops_preamble_text()  # A2 行为变化：不再拼过渡语

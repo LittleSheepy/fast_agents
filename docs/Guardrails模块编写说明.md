@@ -2,8 +2,8 @@
 
 本文档面向 fast_agents Guardrails 安全护栏系统，参考 **LangChain Guardrails**、**OpenAI Agents SDK Guardrails**、**LlamaIndex Guardrails**、**Anthropic Claude Guardrails**、**Microsoft MCP 安全规范** 等框架的共性设计，给出本模块的完整说明、源码解析与自定义教程。
 
-> 版本：v1.0.10 · 2026-11-24 · 跨模块行为登记：输出护栏与 Agent 取值的时序说清（agents 域 A2 已由路线图 v2.74.0 修掉，`guardrails/` 本体代码零改动）
-> 适用版本：`fast_agents.guardrails` v1.0.10
+> 版本：v1.0.11 · 2026-11-24 · 跨模块行为登记：输入护栏的检查对象说清（agents 域 A3 已由路线图 v2.75.0 修掉，`guardrails/` 本体代码零改动）
+> 适用版本：`fast_agents.guardrails` v1.0.11
 > 配套代码：`fast_agents/guardrails/`（9 个核心文件 + 3 个预设护栏）+ `tests/guardrails/`（11 个文件共 125 项测试全绿：45 主用例 + 12 中间件 + 19 真实 ReActAgent 端到端 + 16 模拟 Agent 链路 + 33 分项）+ `examples/guardrails/guardrails_basic_demo.py`（无API Key可运行示例），均已实测通过。
 > 运行环境：Python 3.10+，Windows / macOS / Linux；依赖：零新增依赖，完全复用现有核心抽象。
 
@@ -30,6 +30,7 @@
 
 | 版本 | 日期 | 变更内容 | 破坏性 |
 |------|------|----------|--------|
+| v1.0.11 | 2026-11-24 | **输入护栏的检查对象说清（本轮 `guardrails/` 源码零改动，属跨模块行为登记）**：第三轮架构评审的 **agents 域 A3**（与本文档历史行里的 guardrails 域编号不同空间）已于路线图 v2.75.0 修掉：`ReActAgent.run_stream` / `arun_stream` 旧写法先做 `user_input = self._merge_memory(input_text, memory_text)`，再把**拼接体**整体送 `before_agent_run` / `abefore_agent_run`，于是长期记忆里的敏感串被当成「用户说的话」：① 误拦——历史存过一句违规话就能毙掉本轮干净输入（实测 LLM 一次不调）；② 语义错位——输入护栏本该只审用户意图，混入不可信检索来源后间接注入面与真实意图无法区分。现护栏只收 `input_text`，本轮实际注入的记忆文本改从 `hook_context["retrieved_memory"]` 取；记忆注入前单独过一遍已挂的输入护栏（`ReActAgent(memory_guard=...)`：`sanitize` 默认只丢弃该块记忆 / `strict` 按输入拦截拒本轮 / `off` 不检查），该去毒检查**直连** `run_input_guardrails` / `arun_input_guardrails` 而不复用钩子，因此不计入 `input_check` 统计与 span | 低：护栏本体行为逐字节不变；行为变化在 Agent 侧（违规记忆从「毙整轮」变为「只丢记忆」），详 §5.1 与 §10.2 第 13 条 |
 | v1.0.10 | 2026-11-24 | **输出护栏与 Agent 取值的时序说清（本轮 `guardrails/` 源码零改动，属跨模块行为登记）**：第三轮架构评审的 **agents 域 A2**（与本文档 v1.0.5 那个 guardrails 域 A2 不同编号空间）已于路线图 v2.74.0 修掉：`ReActAgent.run` / `arun` 旧写法优先拼接流式 `text` 增量，而输出护栏在正文产出之后才跑，导致脱敏（modify）与拦截（reject）两种结果**都只能改写 `end` 事件、非流式返回值依旧拿到原文**（同步 / 异步两条链路同病，本文档旧版 §5.3 所称「Agent 最终结果返回给用户前」实际仅对 `end` 事件成立）。现 `run` / `arun` 改取护栏后正文；**剩下的只是流式侧物理限制**：`text` 分片已发出收不回，需强护栏语义请用 `run` / `arun`，或累加到 `end` 再展示 | 低：护栏本体行为逐字节不变；行为变化在 Agent 侧（`run` 返回值不再含工具轮次过渡语），详 §5.3 与 §10.2 第 12 条 |
 | v1.0.9 | 2026-11-24 | **B4 修复（注入护栏误拦正常文本）**：RC1 跨句粘连——`_SENTENCE_SPLIT_RE` 按英文句末终止符 + 后跟空白（`chapters. Instructions`）或中文 `。！？` 切分句子，逐句匹配而非整段匹配，防止带间隙模式把无关子句粘连成注入特征；RC2 词融合——`jailbreak(?:mode|prompt|now)?` 改用非空格压缩视图（`_squeeze_text_nonspace`，仅去分隔符保留空格），防止 `jail  break the habit` 被误融合为 `jailbreak` 而误拦；`test_s4_tool_registry_injection.py` 顺带修复：B3 的 `extra="forbid"` 暴露出该文件两处 `ToolCallInfo(arguments=...)` 字段名拼错（应为 `tool_args=`）。**doanythingnow 保留完整压缩视图**：现有测试 L7 断言 `do anything now` 应拦截（DAN 攻击签名），R1 不变更 | **行为变化（正向安全加固）**：跨句正常叙述文本不再误拦；jailbreak 纯空格分隔误拦消除；各类绕过样本（含换行/加符号/全角）全部仍拦截；test_s4 调用处字段名拼错改为正确值 |
 | v1.0.8 | 2026-11-24 | **B1/B3 修复**：`BasicPermissionGuardrail` 构造器的集合参数改用 `is not None` 判断，避免空集合被 `or` 运算符替换为默认值（修复前传 `blocked_tool_names=set()` 想关闭拦截时，默认危险工具名照样生效）；`models.py` 三个安全关键模型（`GuardrailResult` / `ToolCallInfo` / `ToolResultInfo`）的 `extra` 配置从 `"allow"` 改为 `"forbid"`，防止拼错字段名（如 `alowd=True` / `tool_ars={...}`）被静默接受而导致检查逻辑被绕过 | **行为变化（正向安全加固）**：B1 影响传空集合的场景用户（此前被默认值覆盖，现保留空集合）；B3 影响传拼错字段名的代码（此前静默接受，现立即抛 `ValidationError`）。正确用法不受影响 |
@@ -124,6 +125,10 @@ Guardrails采用三层防护架构，覆盖Agent执行全流程的每个风险�
 - 执行时机：用户输入进入LLM推理前
 - 作用：拦截Prompt注入、违规内容、恶意请求，提前阻断不浪费LLM调用成本
 - 典型场景：注入攻击检测、敏感词过滤、请求长度限制、身份权限校验
+- ⚠ **它审的是什么**（路线图 v2.75.0 实测说清，agents 域 A3）：`before_agent_run` / `abefore_agent_run`
+  收到的是**用户本轮原文**，不是「长期记忆 + 原文」的拼接体；需要审计检索内容（记忆 / RAG /
+  网页抓取）的护栏，从 `hook_context["retrieved_memory"]` 自取本轮实际注入的记忆文本，
+  不要把它当用户原话；长期记忆注入前的单独去毒走 `ReActAgent(memory_guard=...)`，详 §10.2 第 13 条
 
 ### 5.2 工具调用护栏（ToolCallGuardrail）
 - 执行时机：工具调用前（前置检查）+ 工具返回结果后（后置检查）
@@ -417,7 +422,7 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
 | `remove_guardrail(name)` | 移除护栏 |
 | `enable_guardrail(name)` | 启用护栏 |
 | `disable_guardrail(name)` | 禁用护栏 |
-| `before_agent_run(user_input, context=None)` | 输入检查，返回处理后的输入 |
+| `before_agent_run(user_input, context=None)` | 输入检查，返回处理后的输入（挂到 `ReActAgent` 上时 `user_input` 是**本轮用户原文**，不含检索记忆，A3；记忆文本见 `context["retrieved_memory"]`） |
 | `before_tool_call(tool_name, tool_args, context=None)` | 工具前置检查；放行返回 `True`，拦截返回 `ToolDecision(False, 原因)`（旧式 `bool` 实现仍兼容）；拦截时主循环为整批 tool_call 补齐响应消息 |
 | `after_tool_call(tool_name, success, output="", error="", context=None, **kwargs)` | 工具后置检查；`str` 替换 observation，`None` 表示未修改、保持原结果 |
 | `after_agent_run(agent_output, context=None)` | 输出检查，返回处理后的输出 |
@@ -527,6 +532,19 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
       增量”的原始语义（基类不知道护栏的存在）——自己写了主循环又挂护栏的，请像 `ReActAgent.arun`
       那样覆盖并取护栏后正文
 
+13. **别把长期记忆当用户原话送进输入护栏（路线图 v2.75.0 / agents 域 A3）**
+    - 护栏收到的是本轮 `input_text` 原文；旧写法喂的是 `_merge_memory` 后的拼接体，历史记忆里存过
+      一句违规话就能直接毙掉本轮干净输入（误拦），且间接注入面与真实意图无法区分
+    - 要审计检索内容：自定义输入护栏从 `context["retrieved_memory"]` 取本轮实际注入的记忆文本；
+      框架不替你判定「这句话是记忆还是用户说的」，但这个口子已经交出
+    - 记忆去毒默认 `memory_guard="sanitize"`：命中只**丢弃这块记忆**、请求照常处理，因此护栏的
+      `input_check` 统计与 span **不会**计入这次检查（直连 `run_input_guardrails`，刻意不复用钩子）；
+      需旧式保守语义（命中即拒本轮）传 `"strict"`，想完全关掉去毒传 `"off"`（注意：`off` 只修误拦、不带去毒）
+    - ⚠ 新开口子提醒：把记忆摘出输入护栏后，「记忆投毒→后续轮命中用户输入」的路径靠 `sanitize` 那一遍
+      单独检查兜住；但去毒只跑**已挂的输入护栏**——没挂输入护栏时行为与改动前一致（不做检查）
+    - `memory_guard` 非法取值直接 `ValueError`（安全开关写错不得静默退化）；去毒环节自身异常按
+      fail-safe 丢弃记忆 + error 日志，不打挂主流程（R6）
+
 ### 10.3 跨平台注意事项
 - 敏感路径判定是**关键词子串匹配**，不做 `os.path` 归一化也不做 `realpath`：表内 unix 条目为正斜杠
   字面量，Windows 上反斜杠写法与 `Path` 对象展开结果对不上→会漏拦（见 §10.2 第 11 条，尚未修复）
@@ -609,6 +627,13 @@ class FileDeleteProtectGuardrail(ToolCallGuardrail):
   - **安全守护**：18 条绕过样本（含换行绕过/全角绕过/分隔符绕过/中文绕过/jail-break-mode）全部仍拦截
   - **test_s4 字段名拼错修复**：`ToolCallInfo(arguments=...)` 改为 `ToolCallInfo(tool_args=...)` （B3 的 `extra="forbid"` 暴露出该拼写缺陷）
 
+- 跨模块回归（v1.0.11，护栏本体用例数不变）：
+  - agents 域 **A3** 的回归用例落在 `tests/agents/`（不在本目录）：`test_react_agent.py` **22 → 25**
+    （护栏只收原文 + `retrieved_memory` 可取 / 脏记忆只丢弃不误毙请求 + `off` 对照 / `strict` 整轮拒绝
+    + 非法值 `ValueError`）、`test_react_agent_async.py` **25 → 26**（异步侧三姿态，含 `run` / `arun`
+    拦截文案逐字相等、`end.finish_reason == "guardrail_block"` 钉住）；`tests/guardrails/` 11 个文件
+    改前改后逐格一致（本目录用例不受影响：它们直接调 `middleware.before_agent_run`，不经 Agent）
+
 ### 11.2 运行测试命令
 本仓库测试不依赖 pytest，逐文件直接运行即可：
 ```powershell
@@ -637,6 +662,11 @@ Guardrails模块采用分阶段迭代，L1初版已完成，后续规划：
 - **L7** 攻击样本库自动更新：对抗新型注入攻击，持续更新检测规则
 - **L8** 多租户护栏隔离：不同租户/用户组使用不同安全策略
 - **L9** 护栏效果统计与误报反馈闭环：自动统计误报率，支持用户反馈优化规则准确率
+
+> **与 agents 域 A3 的关系（路线图 v2.75.0）**：长期记忆现在靠**已挂的输入护栏**做注入前去毒（`memory_guard`），
+> 而不是新增第四类护栏位——目前只有长期记忆一个真实上下文源（R3 抽象克制）。等出现 RAG / 网页抓取 /
+> MCP 资源等多上下文源后，按来源分位审计的 `ContextGuardrail` 再上，已挂路线图 §八 **E11**（P2）；
+> 它与本节 **L5**（上下文风险检测 / 间接注入识别）是同一方向的两块拼图
 
 ---
 

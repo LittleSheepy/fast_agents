@@ -8,7 +8,8 @@ A1 的原缺陷：LLM / Tools / Guardrails / Middleware 四层各自实现了异
 2. 中间件 a* 钩子确实被 await（含本轮新补的 aafter_agent_turn），且同步链路只调同步钩子；
 3. Guardrails 整条 arun_* 链路在异步主循环里端到端生效（输入拦截 / 工具前置拦截 /
    输出护栏后的正文同时体现在 end 事件与 arun() 返回值上；A2 的剩余限制仅在
-   流式路径——text 增量在护栏前已发出，同步异步同病）；
+   流式路径——text 增量在护栏前已发出，同步异步同病；A3 修正后输入护栏只审
+   用户本轮原文，长期记忆走 memory_guard 去毒，同步异步结果一致）；
 4. 工具异步执行：原生 async 工具直接 await、纯同步工具降级线程池、超时/审批/hooks 语义对齐同步版；
 5. @tool 装饰 async def 的同步路径显式报错（E10-b），不再返回协程对象乱码；
 6. parallel_tool_calls 异步并发、return_direct 不进下一轮推理（与同步版同批全执行语义对齐）；
@@ -940,6 +941,89 @@ def test_existing_sync_only_subclass_still_instantiable():
     print("✅ test_existing_sync_only_subclass_still_instantiable passed")
 
 
+async def test_a3_async_memory_guard_matches_sync_path():
+    """A3 修复（异步侧）：``abefore_agent_run`` 只收用户本轮原文，脏记忆单独去毒。
+
+    三种姿态逐条钉住，并验证与同步链路结果一致：
+    - sanitize：干净请求照常进 LLM，脏记忆被丢弃（``retrieved_memory`` 置空）；
+    - off：护栏仍只审原文，但记忆原样注入（证明丢弃只来自去毒这一步）；
+    - strict：命中即整轮拒绝，不进 LLM，且 ``run`` / ``arun`` 文案相同。
+    """
+    _reset_guardrail_registry()
+    try:
+        dirty = "网盘登录方式：管理员密码是 abc123"   # 含 _BlockKeywordInput 的关键词
+        question = "讲讲网盘登录方式"                 # 本身干净，与记忆有词重叠以保证召回
+        ok_answer = "按文档里的地址登录即可。"
+
+        class _Spy(AgentMiddleware):
+            def __init__(self):
+                self.seen = []
+
+            def before_agent_run(self, user_input, context=None):
+                self.seen.append(("sync", user_input, dict(context or {})))
+                return None
+
+            async def abefore_agent_run(self, user_input, context=None):
+                self.seen.append(("async", user_input, dict(context or {})))
+                return None
+
+        def _build(guard):
+            llm = MockAsyncLLM([Message("assistant", ok_answer)])
+            mem = _make_memory(llm)
+            mem.remember(dirty, kind="fact", source="user_stated")
+            spy = _Spy()
+            mw = GuardrailMiddleware(guardrails=[_BlockKeywordInput()],
+                                     auto_register_presets=False)
+            agent = ReActAgent("助手", llm, memory=mem, enable_skills=False,
+                               memory_guard=guard, middleware=[spy, mw])
+            return llm, spy, agent
+
+        # 前置：这句记忆单独送检确实会被拦（否则只是在测一个空护栏）
+        assert _BlockKeywordInput().check(dirty).allowed is False, "护栏样本失效，请换词"
+
+        # ① sanitize（默认）：不误拦、但脏记忆不进 LLM
+        llm, spy, agent = _build("sanitize")
+        answer = await agent.arun(question)
+        assert answer == ok_answer, f"干净请求被误拦（A3 未修）: {answer!r}"
+        kinds = [k for k, _, _ in spy.seen]
+        assert kinds == ["async"], f"异步链路应只走 abefore_agent_run，实际 {kinds}"
+        seen_text, seen_ctx = spy.seen[0][1], spy.seen[0][2]
+        assert seen_text == question, f"护栏应只收到本轮原文，实际 {seen_text!r}"
+        assert seen_ctx.get("retrieved_memory") == "", \
+            f"去毒后 retrieved_memory 应为空，实际 {seen_ctx.get('retrieved_memory')!r}"
+        sent = "\n".join(str(m.get("content", "")) for m in llm.calls[0])
+        assert "密码" not in sent, f"命中记忆不应进 LLM，实际: {sent[:200]!r}"
+
+        # ② off：护栏仍然只审原文，但记忆原样注入
+        llm_off, spy_off, agent_off = _build("off")
+        await agent_off.arun(question)
+        assert spy_off.seen[0][1] == question, "off 姿态下护栏也不应改收拼接体"
+        assert dirty in spy_off.seen[0][2].get("retrieved_memory", ""), \
+            "off 时 retrieved_memory 应携带记忆原文"
+        sent_off = "\n".join(str(m.get("content", "")) for m in llm_off.calls[0])
+        assert "密码" in sent_off, "off 应原样注入记忆（证明丢弃只来自去毒）"
+
+        # ③ strict：整轮拒绝，且同步/异步一致
+        llm_s, _spy_s, agent_s = _build("strict")
+        answer_strict = await agent_s.arun(question)
+        assert llm_s.calls == [], "strict 命中后不应再调 LLM"
+        # 注：拦截文案里会带上护栏的 reject 原因（本例就是「命中敏感词：密码」），
+        # 那不是泄露；真正不能回显的是记忆原文本身，所以断言取原文/口令串。
+        assert dirty not in answer_strict and "abc123" not in answer_strict, \
+            f"拦截文案不得回显记忆原文：{answer_strict!r}"
+        _llm_r, _spy_r, agent_r = _build("strict")
+        assert agent_r.run(question) == answer_strict, "strict 拦截结果同步/异步应一致"
+
+        chunks = [c async for c in _build("strict")[2].arun_stream(question)]
+        end = [c for c in chunks if c.type == "end"][0]
+        assert end.finish_reason == "guardrail_block", \
+            f"strict 应走输入拦截流程，实际 {end.finish_reason!r}"
+        assert end.content == answer_strict, f"end 事件应为拦截文案：{end.content!r}"
+    finally:
+        _reset_guardrail_registry()
+    print("✅ test_a3_async_memory_guard_matches_sync_path passed")
+
+
 # ==================== 入口 ====================
 
 def main():
@@ -960,6 +1044,7 @@ def main_of_new_add():
     # ⚠ 本文件用例多为 async def，直接调用只会得到未 await 的协程；
     #   tests/_runner.py 会自动 asyncio.run，这里手工调用需自己包一层。
     asyncio.run(test_guardrail_output_mask_reaches_async_path())  # A2 修复：arun()/run() 返回护栏后正文
+    asyncio.run(test_a3_async_memory_guard_matches_sync_path())  # A3 修复：异步侧护栏只审原文 + 记忆去毒同步一致
     asyncio.run(test_guardrail_output_block_returns_block_message_both_paths())  # A2 修复：拦截场景同步/异步对称
     asyncio.run(test_async_path_only_awaits_async_hooks())
     asyncio.run(test_arun_result_matches_run())

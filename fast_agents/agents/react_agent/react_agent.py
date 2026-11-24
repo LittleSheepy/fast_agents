@@ -51,7 +51,13 @@ from ...tools.builtin.mcp_tool import build_mcp_tools
 from ...tools.structured_tool import StructuredTool
 from ...tools.tool_base import ToolBase
 from ..middleware import AgentMiddleware
-from ...guardrails import GuardrailBlocked, GuardrailModified, GuardrailMiddleware
+from ...guardrails import (
+    GuardrailBlocked, GuardrailModified, GuardrailMiddleware,
+    # A3：长期记忆注入前的「去毒」要复用输入护栏的判定逻辑。这里直接调 run_input_guardrails
+    # 而不是复用 before_agent_run 钩子 —— 钩子会把「其实只是丢弃记忆、请求照样放行」的检查
+    # 结果记进 input_check 统计与 span，污染拦截率；直连 runner 只借判定、不记账。
+    InputGuardrail, run_input_guardrails, arun_input_guardrails, InputGuardrailReject,
+)
 from ...tools.tool_registry import ToolRegistry
 from ...tools.tool_result import ToolStatus
 from ...trace import TraceLogger  # G1 tracer（可选依赖，默认 None 不引入任何开销）
@@ -146,6 +152,7 @@ class ReActAgent(AgentBase):
             tracer: Optional["TraceLogger"] = None,
             parallel_tool_calls: bool = False,
             middleware: Optional[List] = None,
+            memory_guard: str = "sanitize",
     ):
         """
         初始化ReActAgent
@@ -182,6 +189,14 @@ class ReActAgent(AgentBase):
                   并给 llm 打 llm.invoke 点（若 llm.tracer 尚未设置）；
                   run() 会额外生成 ``agent.run`` / ``decision.step`` 两类 Span；
                 - 默认 None，行为与改动前逐字节一致、零开销。
+            memory_guard: A3 —— 长期记忆注入前的「去毒」姿态，仅当 enable_memory=True
+                且本轮真的检索到长期记忆时才起作用：
+                - ``"sanitize"``（默认）：用已挂载的输入护栏单独检查记忆文本，命中就
+                  **丢弃这块记忆**（本轮不注入），用户问题照常处理；
+                - ``"strict"``：命中即按输入拦截流程拒掉整轮请求（保守用法）；
+                - ``"off"``：不做检查，检索到什么就注入什么。
+                无论哪种姿态，输入护栏都**不再**拿「记忆 + 原文」的拼接体做判定，
+                以免历史记忆里的敏感串误毙本轮干净输入（详见 :meth:`run_stream` 的 A3 说明）。
         """
         super().__init__(name, llm, system_prompt)
         self.tool_registry = tool_registry or ToolRegistry()
@@ -216,6 +231,12 @@ class ReActAgent(AgentBase):
             (memory or MemoryManager(llm=llm)) if enable_memory else None
         )
         self.memory_limit = memory_limit
+        # A3: 记忆去毒姿态。这是安全相关开关，写错必须当场暴露，不静默退化成默认值。
+        if memory_guard not in ("sanitize", "strict", "off"):
+            raise ValueError(
+                f"memory_guard 只支持 'sanitize' / 'strict' / 'off'，收到 {memory_guard!r}"
+            )
+        self.memory_guard = memory_guard
 
         # 上下文工程：默认关闭，打开后才按 token 预算拼装 / 卸载超长结果。
         # 放在记忆之后就位，因为 build_context 要用到 memory 的短期历史与长期记忆。
@@ -452,7 +473,11 @@ class ReActAgent(AgentBase):
 
     @staticmethod
     def _merge_memory(input_text: str, memory_text: str) -> str:
-        """把长期记忆参考块拼进本轮用户输入；没有记忆时原样返回"""
+        """把长期记忆参考块拼进本轮用户输入；没有记忆时原样返回
+
+        ⚠ A3：拼接结果**只用于交给 LLM 的上下文**（append_user），不再喂给输入护栏；
+        护栏只审用户本轮原文，记忆本身由 :meth:`_guard_memory_text` 单独去毒。
+        """
         if not memory_text:
             return input_text
         return (
@@ -460,6 +485,119 @@ class ReActAgent(AgentBase):
             "（以上为长期记忆，仅供参考；如与本次问题冲突，一律以本次问题为准。）\n\n"
             f"【本次问题】\n{input_text}"
         )
+
+    def _collect_input_guardrails(self) -> Tuple[List[InputGuardrail], Optional[bool]]:
+        """A3: 把已挂载中间件里的**输入护栏**捞出来，供记忆去毒复用。
+
+        只从 :class:`GuardrailMiddleware` 取（它是护栏与 Agent 之间的唯一适配层），
+        不回退扫全局注册表 —— 与 ``run_input_guardrails(use_global=False)`` 的隔离语义一致，
+        避免跨 Agent/跨测试串护栏。
+
+        Returns:
+            (输入护栏列表, fail_open 覆盖值)。列表为空时调用方直接跳过检查。
+            fail_open 按**从严**合并：只要有一个中间件不是 fail-open，就传 None
+            （即用各护栏自身设置，默认 fail-closed），绝不因为旁边一个宽松实例而整体放宽。
+        """
+        collected: List[InputGuardrail] = []
+        all_open = True
+        has_mw = False
+        for _mw in self._middleware_list:
+            if not isinstance(_mw, GuardrailMiddleware):
+                continue
+            has_mw = True
+            collected.extend(
+                g for g in _mw.get_guardrails() if isinstance(g, InputGuardrail)
+            )
+            if not getattr(_mw, "fail_open", False):
+                all_open = False
+        return collected, (True if (has_mw and all_open) else None)
+
+    def _apply_memory_guard_hit(
+            self,
+            hit: Optional[InputGuardrailReject],
+    ) -> Tuple[str, Optional[GuardrailBlocked]]:
+        """A3: 记忆去毒命中后的统一处置（同步/异步共用尾部逻辑）。
+
+        - ``strict``：丢弃记忆 + 返回 phase="input" 的拦截信号，由主循环按输入拦截流程处理；
+        - ``sanitize``（默认）：只丢弃这块记忆，请求照常处理；
+        文案对齐 GuardrailMiddleware 的输入侧口径（「请求被安全护栏拦截：{原因}」）。
+        """
+        _logger = logging.getLogger(__name__)
+        _logger.warning(
+            "长期记忆命中输入护栏（memory_guard=%s），本轮已丢弃该块记忆注入：%s",
+            self.memory_guard, hit,
+        )
+        if self.memory_guard == "strict":
+            return "", GuardrailBlocked(
+                phase="input",
+                message=f"请求被安全护栏拦截：{hit}",
+                reason_kind="rule",
+                detail=str(hit),
+            )
+        return "", None
+
+    def _guard_memory_text(
+            self,
+            memory_text: str,
+            hook_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Optional[GuardrailBlocked]]:
+        """A3: 长期记忆注入前的去毒检查（同步版，见 :meth:`_a_guard_memory_text`）。
+
+        Returns:
+            (保留下来的记忆文本, 需整轮拒绝时的 GuardrailBlocked)
+        """
+        if not memory_text or self.memory_guard == "off":
+            return memory_text, None
+        _guardrails, _fail_open = self._collect_input_guardrails()
+        if not _guardrails:
+            # 没挂输入护栏：没什么可查的，原样注入（与改动前行为一致）
+            return memory_text, None
+        _ctx = dict(hook_context or {})
+        # 供护栏/观测侧区分检查对象：这轮送检的是检索内容，不是用户原话
+        _ctx["input_source"] = "long_term_memory"
+        try:
+            run_input_guardrails(
+                memory_text, _ctx, guardrails=_guardrails, fail_open=_fail_open,
+            )
+        except InputGuardrailReject as e:
+            return self._apply_memory_guard_hit(e)
+        except Exception as e:  # noqa: BLE001
+            # 去毒环节自身出错：fail-safe 丢弃记忆 + error 日志，
+            # 既不把主流程打挂（R6），也不静默退回「未检就注入」的敞口。
+            logging.getLogger(__name__).error(
+                "长期记忆去毒检查异常（本轮不注入记忆）: %s", e
+            )
+            return "", None
+        return memory_text, None
+
+    async def _a_guard_memory_text(
+            self,
+            memory_text: str,
+            hook_context: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Optional[GuardrailBlocked]]:
+        """A3: :meth:`_guard_memory_text` 的异步镜像（走 arun_input_guardrails）。
+
+        判定与处置与同步版逐字一致，保证 ``run`` / ``arun`` 两条链路结果相同。
+        """
+        if not memory_text or self.memory_guard == "off":
+            return memory_text, None
+        _guardrails, _fail_open = self._collect_input_guardrails()
+        if not _guardrails:
+            return memory_text, None
+        _ctx = dict(hook_context or {})
+        _ctx["input_source"] = "long_term_memory"
+        try:
+            await arun_input_guardrails(
+                memory_text, _ctx, guardrails=_guardrails, fail_open=_fail_open,
+            )
+        except InputGuardrailReject as e:
+            return self._apply_memory_guard_hit(e)
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger(__name__).error(
+                "长期记忆去毒检查异常（本轮不注入记忆）: %s", e
+            )
+            return "", None
+        return memory_text, None
 
     def _remember(self, user_input: str, assistant_output: str) -> None:
         """写回记忆：把本轮 user/ai 沉淀进 buffer；auto_extract 打开时同时抽取长期记忆"""
@@ -868,6 +1006,13 @@ class ReActAgent(AgentBase):
         - 拦截场景可用 ``end.finish_reason == "guardrail_block"`` 判定并清空已展示内容；
           脱敏（modify）场景目前无事件级标记，需要该能力请取 ``run`` / ``arun`` 的返回值
           （已改为护栏后正文）。
+
+        ⚠ 输入护栏的检查对象（A3 修正，v2.75.0）：
+        ``before_agent_run`` 收到的是**用户本轮原文** ``input_text``，不再是「长期记忆 +
+        原文」拼接体。拼接体仍然会作为本轮 user 消息交给 LLM（非 context 路径），但不再
+        参与输入判定；检索到的记忆另走 :meth:`_guard_memory_text` 单独去毒（姿态由
+        ``memory_guard`` 控制，默认 ``sanitize``：命中只丢弃这块记忆、请求照常）。
+        同时护栏可从 ``context["retrieved_memory"]`` 取到本轮实际注入的记忆文本，自行决定是否审计。
         """
         current_step = 0
         final_finish_reason: str = "stop"  # 初始默认值，避免输入拦截分支未赋值
@@ -906,18 +1051,34 @@ class ReActAgent(AgentBase):
 
             # 本轮只检索一次长期记忆，拼进本轮用户输入
             memory_text = self._retrieve_long_term_memory(input_text)
+            # A3：长期记忆属**不可信检索来源**，先单独去毒再注入。旧写法把「记忆 + 原文」
+            # 整体送输入护栏，导致历史里存过的一句敏感话能直接毙掉本轮干净输入（误拦），
+            # 且把检索内容当成用户意图审计（语义错位）。现在：记忆命中默认只丢弃这块记忆。
+            memory_blocked: Optional[GuardrailBlocked] = None
+            if memory_text:
+                memory_text, memory_blocked = self._guard_memory_text(memory_text, hook_context)
             if memory_text:
                 print(f"🧠 已注入长期记忆:\n{memory_text}")
             user_input = self._merge_memory(input_text, memory_text)
+            # 记忆文本以独立字段交给中间件/护栏自选：需要审检索内容的护栏可以从
+            # ``context["retrieved_memory"]`` 取用，而不是被动把它当成用户原话
+            hook_context["retrieved_memory"] = memory_text
 
             # 调用所有中间件的before_agent_run钩子（输入检查）
             # L5：AgentMiddleware 协议基类保证钩子签名统一，不再用 hasattr 鸭子分发。
             # 结构化判定：before_agent_run 返回 GuardrailBlocked 才视为拦截，
             # None 表示放行；不再用中文字符串子串匹配，彻底消除假阳性/假阴性。
+            # A3：送检对象是**用户本轮原文 input_text**，不再是拼接后的 user_input。
             input_blocked = False
+            if memory_blocked is not None:
+                # 仅 memory_guard="strict" 会走到这里：记忆命中即按输入拦截流程拒掉整轮
+                final_answer = memory_blocked.message
+                final_finish_reason = "guardrail_block"
+                yield StreamChunk(type="text", text=final_answer)
+                input_blocked = True
             for _mw in self._middleware_list:
                 try:
-                    _hook_result = _mw.before_agent_run(user_input, context=hook_context)
+                    _hook_result = _mw.before_agent_run(input_text, context=hook_context)
                     if isinstance(_hook_result, GuardrailBlocked) and _hook_result.phase == "input":
                         final_answer = _hook_result.message
                         final_finish_reason = "guardrail_block"
@@ -1328,6 +1489,9 @@ class ReActAgent(AgentBase):
         A4（run 级无 session_id / user_id 维度）、A5（流式无 usage）、
         K2（tracer 仍是同步 API，span 落盘为本地 I/O）。
 
+        A3（输入护栏检查对象）在本条已**同步修正**：``abefore_agent_run`` 同样只收
+        用户本轮原文，记忆走 ``_a_guard_memory_text`` 去毒，同步/异步结果一致。
+
         Args:
             input_text: 用户问题
             **kwargs: 其他参数（会透传给 llm.astream_invoke）
@@ -1375,15 +1539,29 @@ class ReActAgent(AgentBase):
 
             # 本轮只检索一次长期记忆，拼进本轮用户输入
             memory_text = self._retrieve_long_term_memory(input_text)
+            # A3：与同步版同构——记忆先单独去毒再注入，输入护栏只审用户本轮原文。
+            memory_blocked: Optional[GuardrailBlocked] = None
+            if memory_text:
+                memory_text, memory_blocked = await self._a_guard_memory_text(
+                    memory_text, hook_context
+                )
             if memory_text:
                 print(f"🧠 已注入长期记忆:\n{memory_text}")
             user_input = self._merge_memory(input_text, memory_text)
+            hook_context["retrieved_memory"] = memory_text
 
             # 输入护栏：await abefore_agent_run（与同步版同一套结构化判定 + fail-closed）
+            # A3：送检对象为 ``input_text``（用户本轮原文），不是拼接后的 user_input。
             input_blocked = False
+            if memory_blocked is not None:
+                # 仅 memory_guard="strict" 会走到这里（与同步版一致）
+                final_answer = memory_blocked.message
+                final_finish_reason = "guardrail_block"
+                yield StreamChunk(type="text", text=final_answer)
+                input_blocked = True
             for _mw in self._middleware_list:
                 try:
-                    _hook_result = await _mw.abefore_agent_run(user_input, context=hook_context)
+                    _hook_result = await _mw.abefore_agent_run(input_text, context=hook_context)
                     if isinstance(_hook_result, GuardrailBlocked) and _hook_result.phase == "input":
                         final_answer = _hook_result.message
                         final_finish_reason = "guardrail_block"
