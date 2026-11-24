@@ -367,6 +367,25 @@ class SkillLoader:
                 result[stem] = schema
         return result
     
+    @staticmethod
+    def _as_str_list(raw: Any) -> List[str]:
+        """【Bug4修复】把 YAML 标量字符串/列表统一归一为 list[str]。
+
+        SKILL.md 中 allowed-tools / tags 允许写成 YAML 列表或逗号分隔字符串（Anthropic 惯例）；
+        若直接拿裸字符串，下游 set(str) 会退化为单字符集合，导致工具白名单误拦/标签批量开关失效。
+        注：条目按逗号/分号切分，工具名与本框架标识符一致不含空格，故不在条目内拆分。
+        """
+        if raw is None:
+            return []
+        if isinstance(raw, (list, tuple, set)):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        if isinstance(raw, str):
+            s = raw.strip()
+            if not s:
+                return []
+            return [t.strip() for t in re.split(r'[,;]+', s) if t.strip()]
+        return [str(raw)]
+
     def _parse_skill_metadata(
         self, skill_file: Path, skill_dir: Path, source: str
     ) -> Optional[SkillMetadata]:
@@ -426,8 +445,8 @@ class SkillLoader:
             author=meta_dict.get("author"),
             license=meta_dict.get("license"),
             compatibility=meta_dict.get("compatibility"),
-            allowed_tools=meta_dict.get("allowed-tools", meta_dict.get("allowed_tools", [])),
-            tags=meta_dict.get("tags", []),
+            allowed_tools=self._as_str_list(meta_dict.get("allowed-tools", meta_dict.get("allowed_tools", []))),
+            tags=self._as_str_list(meta_dict.get("tags", [])),
             requires=requires,
             requires_tools=requires_tools,
             min_fast_agents_version=min_ver,
@@ -660,9 +679,11 @@ class SkillLoader:
             skill_dir = skill_result.metadata.skill_path
             refs_base_dir = (skill_dir / self.REFERENCES_DIR).resolve()
             
-            # 安全：路径穿越防护
+            # 安全：路径穿越防护（用 relative_to 严格判定归属，避免同前缀兄弟目录如 references_evil 绕过 startswith 检查）
             ref_path = (refs_base_dir / ref_name).resolve()
-            if not str(ref_path).startswith(str(refs_base_dir)):
+            try:
+                ref_path.relative_to(refs_base_dir)
+            except ValueError:
                 error_msg = "非法参考文档路径：禁止访问references目录外的文件"
                 if span:
                     try:
@@ -898,8 +919,47 @@ class SkillLoader:
             allow_list.append(default_tmp)
         return allow_list
     
+    @staticmethod
+    def _iter_arg_strings(value: Any, prefix: str = ""):
+        """【Bug7修复】显式栈把嵌套参数逐层展开为 (定位路径, 字符串) 对。
+
+        与 guardrails 模块 B2 修复模式对齐：dict 键与值都展开，list/tuple/set/frozenset 逐元素展开，
+        os.PathLike 经 os.fspath 转字符串，其余标量跳过；
+        用显式栈而非递归（无 RecursionError 风险，绝不打挂主流程）；
+        不设深度上限（避免制造「藏到第 N+1 层就过关」的新绕过口）；
+        环保护用「当前分支祖先 id 元组」剪枝（不用全局 visited，兄弟分支合法复用同一对象不会被误剪）。
+        """
+        stack: List[Tuple[Any, str, Tuple[int, ...]]] = [(value, prefix, ())]
+        while stack:
+            cur, path, anc_ids = stack.pop()
+            if id(cur) in anc_ids:
+                continue  # 环保护：当前分支祖先链已含同一对象则不再进入
+            if isinstance(cur, str):
+                yield path, cur
+            elif isinstance(cur, os.PathLike):
+                try:
+                    yield path, os.fspath(cur)
+                except Exception:
+                    pass
+            elif isinstance(cur, dict):
+                branch_ids = anc_ids + (id(cur),)
+                for k, v in cur.items():
+                    key_path = f"{path}.{k}" if path else str(k)
+                    if isinstance(k, str):
+                        stack.append((k, key_path, branch_ids))
+                    stack.append((v, key_path, branch_ids))
+            elif isinstance(cur, (list, tuple, set, frozenset)):
+                branch_ids = anc_ids + (id(cur),)
+                for i, item in enumerate(cur):
+                    stack.append((item, f"{path}[{i}]", branch_ids))
+            # 其余标量（int / float / bool / None 等）跳过
+
     def _check_sensitive_path_access(self, args: Dict[str, Any], skill_dir: Path) -> Optional[str]:
-        """【C6-2】【C18重构】检查参数中是否包含敏感路径，返回错误信息或None，使用全局白名单+技能tmp目录"""
+        """【C6-2】【C18重构】检查参数中是否包含敏感路径，返回错误信息或None，使用全局白名单+技能tmp目录
+        【Bug7修复】顶层-only 扫描改为经 _iter_arg_strings 逐层展开嵌套结构，
+        堵住 {"payload": {"path": "C:/Windows/System32/..."}} 这类参数绕过；
+        判定逻辑本身不变（归一化后对敏感前缀 startswith + 写入白名单豁免），顶层命中的错误文案逐字节一致
+        """
         allow_list = [p.lower().replace("\\", "/") for p in self._get_allow_write_paths(skill_dir)]
         # 敏感路径统一为小写正斜杠形式匹配
         sensitive_prefixes = [p.lower().replace("\\", "/") for p in self.SENSITIVE_PATH_PREFIXES]
@@ -908,17 +968,15 @@ class SkillLoader:
             "c:/windows/system32", "c:/windows/syswow64", "c:/users",
         ]
         sensitive_prefixes.extend(extra_sensitive)
-        
-        for k, v in args.items():
-            if not isinstance(v, (str, Path)):
-                continue
+
+        for arg_path, v in self._iter_arg_strings(args):
             s = str(v).lower().replace("\\", "/")
             # 检查是否命中敏感路径
             for prefix in sensitive_prefixes:
                 if s.startswith(prefix):
                     in_allow = any(s.startswith(allowed) for allowed in allow_list)
                     if not in_allow:
-                        return f"参数 '{k}' 指向敏感路径 '{v}'，不在写入白名单内（沙箱拦截）"
+                        return f"参数 '{arg_path}' 指向敏感路径 '{v}'，不在写入白名单内（沙箱拦截）"
         return None
     
     def run_script(
@@ -926,13 +984,17 @@ class SkillLoader:
         skill_name: str,
         script_name: str,
         args: Optional[Dict[str, Any]] = None,
-        timeout: int = DEFAULT_SCRIPT_TIMEOUT,
+        timeout: Optional[int] = None,
     ) -> str:
         """
         执行Skill脚本（Level 3: 按需执行）
         安全加固（已有）：路径穿越防护、扩展名白名单、输出截断
         【C6-2】新增：参数Schema校验+类型转换、命令注入防护、敏感路径拦截、网络白名单、可写路径白名单
+        timeout=None 时取实例配置 self.DEFAULT_SCRIPT_TIMEOUT（旧写法默认值在类定义期绑死为类常量30，导致构造参数 default_script_timeout 失效）
         """
+        # 【Bug3修复】运行期解析默认超时，让构造传入的 default_script_timeout 真正生效；显式传入 timeout 时行为与改动前一致
+        if timeout is None:
+            timeout = self.DEFAULT_SCRIPT_TIMEOUT
         span = None
         try:
             # Trace打点开始
@@ -961,9 +1023,11 @@ class SkillLoader:
             skill_dir = metadata.skill_path
             scripts_base_dir = (skill_dir / self.SCRIPTS_DIR).resolve()
             
-            # 安全：路径穿越防护
+            # 安全：路径穿越防护（用 relative_to 严格判定归属，避免同前缀兄弟目录如 scripts_evil 绕过 startswith 检查）
             script_path = (scripts_base_dir / script_name).resolve()
-            if not str(script_path).startswith(str(scripts_base_dir)):
+            try:
+                script_path.relative_to(scripts_base_dir)
+            except ValueError:
                 error_msg = "非法脚本路径：禁止访问scripts目录外的文件"
                 if span:
                     try:
@@ -1182,11 +1246,15 @@ class SkillLoader:
         return max_mtime
 
     def _build_dir_mtime_map(self) -> Dict[str, float]:
-        """【C14】构建当前所有已发现技能目录的mtime快照：skill_name -> max_mtime"""
+        """【C14】构建当前所有已发现技能目录的mtime快照：skill_name -> max_mtime
+        【Bug6修复】无条件先调 scan_skills()（非 force）：索引非空且根目录 mtime 未变时直接命中缓存返回
+        （仅对扫描根目录 stat，零遍历开销）；新增/删除/重命名技能目录使根 mtime 变化时自动重建索引。
+        修复原「索引为空才扫描」导致热重载轮询线程永远发现不了新增技能的问题
+        （new_mtime_map 基于旧索引构建，新增目录不可见，与 enable_hot_reload 的承诺不符）。
+        """
         mtime_map: Dict[str, float] = {}
-        # 先确保索引已构建
-        if not self._skill_index:
-            self.scan_skills()
+        # 确保索引为最新（根目录mtime未变时命中缓存直接返回）
+        self.scan_skills()
         for name, meta in self._skill_index.items():
             skill_dir = getattr(meta, 'skill_path', None)
             if skill_dir and Path(skill_dir).exists():

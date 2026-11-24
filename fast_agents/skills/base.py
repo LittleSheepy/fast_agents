@@ -63,9 +63,11 @@ class BaseSkill:
             author=self.author,
             license=self.license,
             compatibility=self.compatibility,
-            allowed_tools=self.allowed_tools,
-            tags=self.tags,
-            metadata=self.extra_metadata,
+            # 【Bug5修复】浅拷贝：子类未覆盖类级默认值时，多个实例共享同一个 list/dict 对象，
+            # 任一实例改动 metadata.tags/allowed_tools 会污染所有技能甚至 BaseSkill 类属性本身
+            allowed_tools=list(self.allowed_tools),
+            tags=list(self.tags),
+            metadata=dict(self.extra_metadata),
             skill_type="code",
             source="code",
         )
@@ -162,6 +164,13 @@ def skill(
                 return self._instructions
             
             def execute(self, **kwargs) -> Any:
+                # 【Bug8修复】@skill 装饰 async 函数时，同步入口返回未 await 的协程对象是静默陷阱；
+                # 改为显式报错，与 tools 层 StructuredTool.run 的 E10-b 行为对齐
+                if inspect.iscoroutinefunction(self._func):
+                    raise TypeError(
+                        f"技能 '{self.name}' 的实现是 async 函数，不能在同步路径执行。"
+                        f"请改用 aexecute()/registry.aexecute_skill()，或走 agent.arun()/arun_stream()。"
+                    )
                 return self._func(**kwargs)
             
             async def aexecute(self, **kwargs) -> Any:
