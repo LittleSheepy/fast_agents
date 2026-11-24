@@ -67,6 +67,14 @@ class DatabaseClientBase(ABC):
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> dict[str, Any]:
         """执行写 SQL（INSERT/UPDATE/DELETE/CREATE/DROP）。"""
 
+    @abstractmethod
+    def query(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = (), fetch_one: bool = False) -> list[dict[str, Any]] | dict[str, Any] | None:
+        """执行读 SQL（SELECT / SHOW / PRAGMA），fetch_one=True 时返回单行 dict 或 None，否则返回 list[dict]。"""
+
+    @abstractmethod
+    def executemany(self, sql: str, params_list: list[tuple | dict]) -> dict[str, Any]:
+        """批量执行写 SQL，返回 {"lastrowid": ..., "rowcount": ...}。"""
+
     # ---------- 谓词下推：Query / Filter → 参数化 SQL（通用骨架，方言由 _quote_ident / _placeholder 承担） ----------
     def _compile_filter(self, f: Filter, idx: int) -> tuple[str, dict[str, Any]]:
         """把单个 Filter 编译成 (SQL 片段, 命名参数字典)。
@@ -322,7 +330,7 @@ class DatabaseClientBase(ABC):
             if n < 0:
                 raise DatabaseValidationError(f"limit 不能为负数: {n}")
             sql += f" LIMIT {n}"
-        return self.query(sql, params)  # type: ignore
+        return self.query(sql, params)  # type: ignore[return-value]
 
     def update(self, table: str, data: dict[str, Any], where: dict[str, Any]) -> int:
         """更新行，返回影响行数；where 值为 None 时编译为 IS NULL。"""
@@ -356,11 +364,6 @@ class DatabaseClientBase(ABC):
         placeholders = ", ".join(self._placeholder(k) for k in data.keys())
         sql = f"INSERT INTO {self._quote_ident(table)} ({columns}) VALUES ({placeholders})"
         return self.execute(sql, data)["lastrowid"]
-
-    @abstractmethod
-    def batch_insert(self, table: str, rows: list[dict]) -> int:
-        """批量插入多行，返回插入行数；空列表直接返回0。"""
-
 
     def select_one(
         self,
@@ -440,11 +443,6 @@ class DatabaseClientBase(ABC):
         where_sql, params = self._compile_filters(query.filters)
         sql = f"DELETE FROM {self._quote_ident(table)} WHERE {where_sql}"
         return self.execute(sql, params)["rowcount"]
-
-    @abstractmethod
-    def count(self, table: str, where: dict | None = None) -> int:
-        """按等值条件统计行数，where=None 返回表总行数。"""
-
 
     def delete(self, table: str, where: dict[str, Any]) -> int:
         """删除行，返回影响行数；where 值为 None 时编译为 IS NULL。"""
